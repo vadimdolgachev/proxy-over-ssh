@@ -1,0 +1,36 @@
+[Unit]
+Description=SSH SOCKS5 Proxy (proxy_over_ssh)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+
+ExecStart=proxy_over_ssh \
+  --ssh-user ${USER} \
+  --ssh-host ${IP_ADDRESS} \
+  --ssh-port 22 \
+  --ssh-private-key ${SSH_PRIVATE_KEY} \
+  --listen-port ${LISTEN_PORT}
+
+# Graceful shutdown via SIGTERM
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# Restart policy
+Restart=on-failure
+RestartSec=3
+
+# Security hardening (safe defaults)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+RestrictRealtime=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

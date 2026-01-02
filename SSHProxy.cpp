@@ -4,8 +4,6 @@
 
 #include "SSHProxy.h"
 
-#include <algorithm>
-#include <atomic>
 #include <iostream>
 #include <unistd.h>
 #include <cstring>
@@ -14,6 +12,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <ranges>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -62,12 +61,12 @@ namespace Socks5 {
 
 class EPollManager final {
 public:
-    constexpr static int EPOLL_ET = EPOLLET;
-    constexpr static int EPOLL_IN = EPOLLIN;
-    constexpr static int EPOLL_OUT = EPOLLOUT;
-    constexpr static int EPOLL_IO = EPOLLIN | EPOLLOUT;
-    constexpr static int EPOLL_ERR = EPOLLERR | EPOLLHUP | EPOLLRDHUP;
-    constexpr static int EPOLL_IO_ERR = EPOLL_IO | EPOLL_ERR;
+    constexpr static std::uint32_t EPOLL_ET = EPOLLET;
+    constexpr static std::uint32_t EPOLL_IN = EPOLLIN;
+    constexpr static std::uint32_t EPOLL_OUT = EPOLLOUT;
+    constexpr static std::uint32_t EPOLL_IO = EPOLLIN | EPOLLOUT;
+    constexpr static std::uint32_t EPOLL_ERR = EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+    constexpr static std::uint32_t EPOLL_IO_ERR = EPOLL_IO | EPOLL_ERR;
 
     explicit EPollManager(const size_t maxEvents = 128) :
         epollEvents(maxEvents),
@@ -290,7 +289,8 @@ private:
     bool hasChannelError = false;
 };
 
-std::unique_ptr<SSH2Session> createSshSession(const int fd, std::queue<std::unique_ptr<SSH2Session>> &sessionObjectPool) {
+std::unique_ptr<SSH2Session>
+createSshSession(const int fd, std::queue<std::unique_ptr<SSH2Session>> &sessionObjectPool) {
     if (!sessionObjectPool.empty()) {
         log_v("Ssh session object pool size: {}\n", sessionObjectPool.size());
         auto session = std::move(sessionObjectPool.front());
@@ -300,7 +300,8 @@ std::unique_ptr<SSH2Session> createSshSession(const int fd, std::queue<std::uniq
     return std::make_unique<SSH2Session>(fd);
 }
 
-void destroySshSession(std::queue<std::unique_ptr<SSH2Session>> &sessionObjectPool, std::unique_ptr<SSH2Session> sshSession) {
+void destroySshSession(std::queue<std::unique_ptr<SSH2Session>> &sessionObjectPool,
+                       std::unique_ptr<SSH2Session> sshSession) {
     if (sessionObjectPool.size() < MAX_SIZE_SESSION_POOL) {
         if (!sshSession->hasChannelCreatingError()) {
             sessionObjectPool.push(std::move(sshSession));
@@ -396,7 +397,7 @@ ResultCode SSHProxy::sshWrite(const std::shared_ptr<ClientContext> &clientCtx) {
         return ResultCode::Ok;
     }
     auto resultCode = ResultCode::Ok;
-    while (totalWritten < clientCtx->readBuffer.size()) {
+    while (totalWritten < static_cast<ssize_t>(clientCtx->readBuffer.size())) {
         const ssize_t bytesWritten = clientCtx->sshContext->channel->write(
             std::span(clientCtx->readBuffer.data() + totalWritten,
                       clientCtx->readBuffer.size() - totalWritten));
@@ -449,43 +450,37 @@ ResultCode SSHProxy::sendToClient(const std::shared_ptr<ClientContext> &clientCt
     return ResultCode::Ok;
 }
 
-SSHProxy::SSHProxy() :
-    running(false),
-    serverFd(-1) {
+SSHProxy::SSHProxy(const std::atomic_bool &stopSignalFlag) :
+    serverFd(-1),
+    stopSignalFlag(stopSignalFlag) {
     libssh2_init(0);
 }
 
 SSHProxy::~SSHProxy() {
-    stop();
+    requestStop();
     libssh2_exit();
 }
 
 bool SSHProxy::start(const ProxyConfig &config_) {
-    if (running.load()) {
+    if (mainThread) {
         return false;
     }
     config = config_;
-    running = true;
-
-    // Setup epoll
-    if (setupEpoll() != ResultCode::Ok) {
-        return false;
-    }
 
     mainThread = std::jthread(&SSHProxy::mainLoop, this);
     return true;
 }
 
-void SSHProxy::stop() {
-    if (!running) {
-        return;
+void SSHProxy::requestStop() noexcept {
+    if (mainThread) {
+        mainThread->request_stop();
     }
-    running = false;
-    closeAllConnection();
 }
 
 void SSHProxy::waitForFinish() {
-    mainThread.value().join();
+    if (mainThread) {
+        mainThread.value().join();
+    }
 }
 
 ResultCode SSHProxy::setupEpoll() {
@@ -593,14 +588,22 @@ void SSHProxy::setupSshConnection(const std::shared_ptr<ClientContext> &clientCt
     }
 }
 
-void SSHProxy::mainLoop() {
+void SSHProxy::mainLoop(const std::stop_token &stopToken) {
+    // Setup epoll
+    if (setupEpoll() != ResultCode::Ok) {
+        return;
+    }
+
     log_d("SOCKS5 proxy started on port: {} via SSH: {}:{}\n",
           config.value().listenPort,
           config.value().ssh.host,
           config.value().ssh.port);
-    log_d("Press Ctrl+C to stop...\n");
+    log_d("Proxy started. Press Ctrl+C to stop...\n");
 
-    while (running) {
+    const auto isStopRequested = [&] {
+        return stopToken.stop_requested() || stopSignalFlag.load(std::memory_order_relaxed);
+    };
+    while (!isStopRequested()) {
         // Setup local server
         if (!setupLocalServer()) {
             log_e("Failed to setup local server\n");
@@ -608,7 +611,7 @@ void SSHProxy::mainLoop() {
         }
         epollManager->add(serverFd, EPollManager::EPOLL_IN);
 
-        while (serverFd != -1) {
+        while (serverFd != -1 && !isStopRequested()) {
             const int countFd = epollManager->wait(500);
             if (countFd == -1) {
                 if (errno == EINTR) {
@@ -692,12 +695,12 @@ void SSHProxy::mainLoop() {
         closeAllConnection();
         epollManager->remove(serverFd);
     }
+    log_d("Proxy finished\n");
 }
 
 void SSHProxy::handleClientForRead(const std::shared_ptr<ClientContext> &clientCtx) {
     char buffer[BUFFER_SIZE];
     // Read all available data
-    ssize_t totalBytesRead = 0;
     while (true) {
         const ssize_t bytesRead = recv(clientCtx->fd, buffer, sizeof(buffer), 0);
         log_v("{}, Client read bytes: {}, errno: {}\n", clientCtx->fd, bytesRead, errno);
@@ -713,7 +716,6 @@ void SSHProxy::handleClientForRead(const std::shared_ptr<ClientContext> &clientC
             return;
         }
         if (bytesRead > 0) {
-            totalBytesRead += bytesRead;
             clientCtx->readBuffer.insert(clientCtx->readBuffer.end(),
                                          buffer,
                                          buffer + bytesRead);
@@ -835,7 +837,7 @@ void SSHProxy::handleSocks5Handshake(const std::shared_ptr<ClientContext> &clien
     const unsigned char version = clientCtx->readBuffer[0];
     const unsigned char nmethods = clientCtx->readBuffer[1];
 
-    if (version != Socks5::Version || clientCtx->readBuffer.size() < 2 + nmethods) {
+    if (version != Socks5::Version || clientCtx->readBuffer.size() < static_cast<size_t>(2 + nmethods)) {
         closeConnection(clientCtx);
         return;
     }
@@ -887,7 +889,7 @@ void SSHProxy::handleSocks5Request(const std::shared_ptr<ClientContext> &clientC
         break;
 
     case Socks5::Atyp::Domain:
-        if (clientCtx->readBuffer.size() < 5 + clientCtx->readBuffer[4] + 2) {
+        if (clientCtx->readBuffer.size() < static_cast<size_t>(5 + clientCtx->readBuffer[4] + 2)) {
             return;
         }
         targetHost = std::string(reinterpret_cast<const char *>(&clientCtx->readBuffer[5]), clientCtx->readBuffer[4]);
@@ -1058,12 +1060,8 @@ void SSHProxy::closeAllConnection() {
         serverFd = -1;
     }
 
-    for (const auto &[fst, snd] : clients) {
-        close(fst);
+    for (const auto &socketFd : clients | std::views::keys) {
+        close(socketFd);
     }
     clients.clear();
-}
-
-bool SSHProxy::isRunning() const {
-    return running;
 }

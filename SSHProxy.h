@@ -2,8 +2,8 @@
 // Created by vadim on 31.10.2025.
 //
 
-#ifndef SSHEPOLLPROXY_H
-#define SSHEPOLLPROXY_H
+#ifndef SSHEPROXY_H
+#define SSHEPROXY_H
 
 #include <atomic>
 #include <memory>
@@ -25,8 +25,8 @@ struct SSHConfig final {
     std::string username;
     std::string host;
     std::uint16_t port;
-    std::optional<std::string> privateKeyPath;
-    std::optional<std::string> privateKeyData;
+    std::optional<std::string> privateKeyPath = {};
+    std::optional<std::string> privateKeyData = {};
 };
 
 struct ProxyConfig final {
@@ -35,21 +35,20 @@ struct ProxyConfig final {
 };
 
 class EPollManager;
-class ClientContext;
+struct ClientContext;
 class SSH2Session;
 
 class SSHProxy {
 public:
-    SSHProxy();
+    explicit SSHProxy(const std::atomic_bool &stopSignalFlag);
     ~SSHProxy();
 
     bool start(const ProxyConfig &config_);
-    void stop();
+    void requestStop() noexcept;
     void waitForFinish();
-    bool isRunning() const;
 
 private:
-    void mainLoop();
+    void mainLoop(const std::stop_token &stopToken);
     void handleClientForRead(const std::shared_ptr<ClientContext> &clientCtx);
     void handleClientForWrite(const std::shared_ptr<ClientContext> &clientCtx);
     void handleSshRead(const std::shared_ptr<ClientContext> &clientCtx);
@@ -73,13 +72,13 @@ private:
     [[nodiscard]] std::optional<std::shared_ptr<ClientContext>> getClientCtxByFd(int clientFd);
 
     std::optional<ProxyConfig> config;
-    std::atomic<bool> running;
     std::shared_ptr<EPollManager> epollManager;
     int serverFd;
     std::unordered_map<int, std::shared_ptr<ClientContext>> clients;
     std::optional<std::jthread> mainThread;
     std::unordered_map<int, int> sshToClientSockets;
     std::queue<std::unique_ptr<SSH2Session>> sshSessionObjectPool;
+    const std::atomic_bool &stopSignalFlag;
 };
 
-#endif // SSHEPOLLPROXY_H
+#endif // SSHEPROXY_H

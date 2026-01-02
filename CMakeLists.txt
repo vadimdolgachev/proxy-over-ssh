@@ -68,6 +68,8 @@ target_link_libraries(proxy_over_ssh PRIVATE
         libssh2
 )
 
+target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic)
+
 if(ANDROID)
     target_link_libraries(proxy_over_ssh PRIVATE dl z log android)
 endif()

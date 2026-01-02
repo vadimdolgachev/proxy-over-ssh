@@ -1,6 +1,7 @@
 # proxy_over_ssh
 
-A **C++ SSH-based proxy** application built on **libssh2 + OpenSSL**.  
+A **C++ SSH-based asynchronous (epoll/event-driven)** proxy application built on
+**libssh2 + OpenSSL**.  
 The proxy exposes a local **SOCKS5** server and forwards traffic through an
 SSH connection using `direct-tcpip` channels.
 
@@ -55,4 +56,13 @@ cmake --build build -j
   --ssh-port PORT \
   --ssh-key ~/.ssh/id_rsa \
   --listen-port LOCAL_PORT
+```
+
+## Systemd
+``` bash
+sudo cp proxy_over_ssh.service ${HOME}/.config/systemd/user/
+sudo systemctl daemon-reexec
+sudo systemctl daemon-reload
+sudo systemctl enable proxy_over_ssh
+sudo systemctl start proxy_over_ssh
 ```

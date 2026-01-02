@@ -1,11 +1,11 @@
 #include <iostream>
-
-#include "SSHProxy.h"
-
 #include <expected>
 #include <unordered_map>
 #include <string_view>
 #include <charconv>
+#include <csignal>
+
+#include "SSHProxy.h"
 
 std::expected<ProxyConfig, std::string> parseConfig(const int argc, char **argv) {
     using namespace std::string_view_literals;
@@ -78,9 +78,16 @@ std::expected<ProxyConfig, std::string> parseConfig(const int argc, char **argv)
     };
 }
 
-int main(int argc, char **argv) {
+static std::atomic_bool stopSignalFlag = false;
+
+extern "C" void onSignalTerm(int) {
+    stopSignalFlag.store(true, std::memory_order_relaxed);
+}
+
+int main(const int argc, char **argv) {
+    std::signal(SIGTERM, onSignalTerm);
     if (const auto config = parseConfig(argc, argv)) {
-        if (const auto proxy = std::make_unique<SSHProxy>(); proxy->start(config.value())) {
+        if (const auto proxy = std::make_unique<SSHProxy>(stopSignalFlag); proxy->start(config.value())) {
             proxy->waitForFinish();
         } else {
             std::cerr << "Failed to start proxy" << std::endl;
