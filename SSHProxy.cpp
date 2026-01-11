@@ -140,7 +140,7 @@ public:
         CLOSED
     };
 
-    explicit SSHChannel(LIBSSH2_CHANNEL *const channel) : channel(channel) {}
+    explicit SSHChannel(LIBSSH2_CHANNEL *const channel_) : channel(channel_) {}
     SSHChannel(const SSHChannel &) = delete;
     SSHChannel &operator=(const SSHChannel &) = delete;
 
@@ -191,7 +191,7 @@ public:
 
     const int fd;
 
-    explicit SSH2Session(const int fd) : fd(fd),
+    explicit SSH2Session(const int fd_) : fd(fd_),
                                          session(libssh2_session_init()) {
         if (session == nullptr) {
             throw InitSessionError();
@@ -239,7 +239,7 @@ public:
         } else if (config.privateKeyPath.has_value()) {
             rc = libssh2_userauth_publickey_fromfile_ex(session,
                                                         config.username.c_str(),
-                                                        config.username.length(),
+                                                        static_cast<unsigned int>(config.username.length()),
                                                         nullptr,
                                                         config.privateKeyPath.value().c_str(),
                                                         nullptr);
@@ -337,8 +337,8 @@ struct ClientContext final {
         CHANNEL_CLOSING
     };
 
-    explicit ClientContext(const int fd) :
-        fd(fd) {}
+    explicit ClientContext(const int fd_) :
+        fd(fd_) {}
 
     ClientContext(const ClientContext &) = delete;
     ClientContext &operator=(const ClientContext &) = delete;
@@ -350,8 +350,8 @@ struct ClientContext final {
     std::vector<unsigned char> writeBuffer;
     State state = State::NONE;
     Address addr;
-    std::uint64_t totalBytesRead = 0;
-    std::uint64_t totalBytesWritten = 0;
+    size_t totalBytesRead = 0;
+    size_t totalBytesWritten = 0;
     std::chrono::high_resolution_clock::time_point requestTime;
 };
 
@@ -368,7 +368,7 @@ ResultCode SSHProxy::sshRead(const std::shared_ptr<ClientContext> &clientCtx) {
               clientCtx->fd, bytesRead, clientCtx->addr.toString());
         if (bytesRead > 0) {
             clientCtx->writeBuffer.insert(clientCtx->writeBuffer.end(), buffer, buffer + bytesRead);
-            clientCtx->totalBytesRead += bytesRead;
+            clientCtx->totalBytesRead += static_cast<size_t>(bytesRead);
             if (const auto result = sendToClient(clientCtx); result == ResultCode::ErrIO) {
                 return result;
             }
@@ -392,20 +392,21 @@ ResultCode SSHProxy::sshRead(const std::shared_ptr<ClientContext> &clientCtx) {
 
 ResultCode SSHProxy::sshWrite(const std::shared_ptr<ClientContext> &clientCtx) {
     // Forward data to SSH channel
-    ssize_t totalWritten = 0;
+    size_t totalWritten = 0;
     if (clientCtx->readBuffer.empty()) {
         return ResultCode::Ok;
     }
     auto resultCode = ResultCode::Ok;
-    while (totalWritten < static_cast<ssize_t>(clientCtx->readBuffer.size())) {
+    while (totalWritten < clientCtx->readBuffer.size()) {
         const ssize_t bytesWritten = clientCtx->sshContext->channel->write(
             std::span(clientCtx->readBuffer.data() + totalWritten,
                       clientCtx->readBuffer.size() - totalWritten));
-        clientCtx->totalBytesWritten += bytesWritten;
+
         log_v("{}, Ssh write bytes: {}, addr: {}\n", clientCtx->fd, bytesWritten, clientCtx->addr.toString());
 
         if (bytesWritten > 0) {
-            totalWritten += bytesWritten;
+            clientCtx->totalBytesWritten += static_cast<size_t>(bytesWritten);
+            totalWritten += static_cast<size_t>(bytesWritten);
         } else if (bytesWritten == LIBSSH2_ERROR_EAGAIN) {
             resultCode = ResultCode::ErrAgain;
         } else {
@@ -415,7 +416,7 @@ ResultCode SSHProxy::sshWrite(const std::shared_ptr<ClientContext> &clientCtx) {
     }
 
     if (totalWritten > 0) {
-        clientCtx->readBuffer.erase(clientCtx->readBuffer.begin(), clientCtx->readBuffer.begin() + totalWritten);
+        clientCtx->readBuffer.erase(clientCtx->readBuffer.begin(), clientCtx->readBuffer.begin() + static_cast<ssize_t>(totalWritten));
         log_v("{}, Ssh write total bytes: {}, left: {}\n", clientCtx->fd, totalWritten,
               clientCtx->readBuffer.size());
     }
@@ -450,9 +451,9 @@ ResultCode SSHProxy::sendToClient(const std::shared_ptr<ClientContext> &clientCt
     return ResultCode::Ok;
 }
 
-SSHProxy::SSHProxy(const std::atomic_bool &stopSignalFlag) :
+SSHProxy::SSHProxy(const std::atomic_bool &stopSignalFlag_) :
     serverFd(-1),
-    stopSignalFlag(stopSignalFlag) {
+    stopSignalFlag(stopSignalFlag_) {
     libssh2_init(0);
 }
 
@@ -621,7 +622,7 @@ void SSHProxy::mainLoop(const std::stop_token &stopToken) {
                 break;
             }
 
-            for (int i = 0; i < countFd; ++i) {
+            for (size_t i = 0; i < static_cast<size_t>(countFd); ++i) {
                 const int fd = epollManager->getEvent(i).data.fd;
                 const uint32_t eventMask = epollManager->getEvent(i).events;
                 // log_d("{}, mask: {}\n", fd, eventMask);
@@ -952,20 +953,20 @@ ResultCode SSHProxy::createSshChannel(const std::shared_ptr<ClientContext> &clie
     if (inet_pton(AF_INET6, clientCtx->addr.host.c_str(), &sa6.sin6_addr) == 1) {
         clientCtx->writeBuffer[3] = Socks5::Atyp::IpV6;
         inet_pton(AF_INET6, clientCtx->addr.host.c_str(), &clientCtx->writeBuffer[4]);
-        clientCtx->writeBuffer[20] = clientCtx->addr.port >> 8 & 0xFF;
-        clientCtx->writeBuffer[21] = clientCtx->addr.port & 0xFF;
+        clientCtx->writeBuffer[20] = static_cast<unsigned char>(clientCtx->addr.port >> 8 & 0xFF);
+        clientCtx->writeBuffer[21] = static_cast<unsigned char>(clientCtx->addr.port & 0xFF);
         responseLen = 22;
     } else if (inet_pton(AF_INET, clientCtx->addr.host.c_str(), &sa.sin_addr) == 1) {
         clientCtx->writeBuffer[3] = Socks5::Atyp::IpV4;
         inet_pton(AF_INET, clientCtx->addr.host.c_str(), &clientCtx->writeBuffer[4]);
-        clientCtx->writeBuffer[8] = clientCtx->addr.port >> 8 & 0xFF;
-        clientCtx->writeBuffer[9] = clientCtx->addr.port & 0xFF;
+        clientCtx->writeBuffer[8] = static_cast<unsigned char>(clientCtx->addr.port >> 8 & 0xFF);
+        clientCtx->writeBuffer[9] = static_cast<unsigned char>(clientCtx->addr.port & 0xFF);
         responseLen = 10;
     } else {
         clientCtx->writeBuffer[3] = Socks5::Atyp::IpV4;
         memset(&clientCtx->writeBuffer[4], 0, 4);
-        clientCtx->writeBuffer[8] = clientCtx->addr.port >> 8 & 0xFF;
-        clientCtx->writeBuffer[9] = clientCtx->addr.port & 0xFF;
+        clientCtx->writeBuffer[8] = static_cast<unsigned char>(clientCtx->addr.port >> 8 & 0xFF);
+        clientCtx->writeBuffer[9] = static_cast<unsigned char>(clientCtx->addr.port & 0xFF);
         responseLen = 10;
     }
 

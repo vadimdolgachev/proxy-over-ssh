@@ -61,14 +61,15 @@ message("ANDROID_PLATFORM=${ANDROID_PLATFORM}")
 add_executable(proxy_over_ssh main.cpp
         SSHProxy.cpp
         SSHProxy.h
+        CoroTask.h
 )
 target_link_libraries(proxy_over_ssh PRIVATE
         OpenSSL::Crypto
         OpenSSL::SSL
         libssh2
 )
-
-target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic)
+#target_link_options(proxy_over_ssh PUBLIC -fsanitize=address)
+target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion -Wsign-conversion -Wnull-dereference -Wno-unused-variable -Wno-unused-parameter -Wno-unused-private-field -fno-omit-frame-pointer)
 
 if(ANDROID)
     target_link_libraries(proxy_over_ssh PRIVATE dl z log android)
