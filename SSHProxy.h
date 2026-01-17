@@ -43,7 +43,7 @@ public:
     explicit SSHProxy(const std::atomic_bool &stopSignalFlag);
     ~SSHProxy();
 
-    bool start(const ProxyConfig &config_);
+    void start(const ProxyConfig &proxyConfig);
     void requestStop() noexcept;
     void waitForFinish();
 
@@ -77,7 +77,7 @@ private:
     std::unordered_map<int, std::shared_ptr<ClientContext>> clients;
     std::optional<std::jthread> mainThread;
     std::unordered_map<int, int> sshToClientSockets;
-    std::queue<std::unique_ptr<SSH2Session>> sshSessionObjectPool;
+    std::deque<std::unique_ptr<SSH2Session>> sshSessionObjectPool;
     const std::atomic_bool &stopSignalFlag;
 };
 

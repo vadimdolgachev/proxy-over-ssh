@@ -20,6 +20,26 @@
 #include <sys/epoll.h>
 #include <libssh2.h>
 
+namespace {
+    bool checkConnection(const int fd) {
+        int err;
+        socklen_t len = sizeof(err);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err) {
+            return false;
+        }
+
+        char tmp;
+        const auto result = recv(fd, &tmp, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (result == 0) {
+            return false;
+        }
+        if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            return false;
+        }
+        return true;
+    }
+}
+
 constexpr int BUFFER_SIZE = 2 * 8192;
 constexpr int MAX_SIZE_SESSION_POOL = 25;
 constexpr bool PRINT_VERBOSE_LOG = false;
@@ -190,9 +210,12 @@ public:
     class InitSessionError final : public std::exception {};
 
     const int fd;
+    const std::shared_ptr<EPollManager> epollManager;
 
-    explicit SSH2Session(const int fd) : fd(fd),
-                                         session(libssh2_session_init()) {
+    explicit SSH2Session(const int fd_,
+                         std::shared_ptr<EPollManager> epollManager_) : fd(fd_),
+                                                                        epollManager(std::move(epollManager_)),
+                                                                        session(libssh2_session_init()) {
         if (session == nullptr) {
             throw InitSessionError();
         }
@@ -206,6 +229,7 @@ public:
         libssh2_session_disconnect(session, nullptr);
         libssh2_session_free(session);
         close(fd);
+        epollManager->remove(fd);
     }
 
     enum class State {
@@ -290,38 +314,32 @@ private:
 };
 
 std::unique_ptr<SSH2Session>
-createSshSession(const int fd, std::queue<std::unique_ptr<SSH2Session>> &sessionObjectPool) {
-    if (!sessionObjectPool.empty()) {
-        log_v("Ssh session object pool size: {}\n", sessionObjectPool.size());
-        auto session = std::move(sessionObjectPool.front());
-        sessionObjectPool.pop();
-        return session;
-    }
-    return std::make_unique<SSH2Session>(fd);
+createSshSession(const int fd, const std::shared_ptr<EPollManager> &epollManager) {
+    return std::make_unique<SSH2Session>(fd, epollManager);
 }
 
-void destroySshSession(std::queue<std::unique_ptr<SSH2Session>> &sessionObjectPool,
+void destroySshSession(std::deque<std::unique_ptr<SSH2Session>> &sessionObjectPool,
                        std::unique_ptr<SSH2Session> sshSession) {
-    if (sessionObjectPool.size() < MAX_SIZE_SESSION_POOL) {
-        if (!sshSession->hasChannelCreatingError()) {
-            sessionObjectPool.push(std::move(sshSession));
-        } else {
-            log_e("Do not cache ssh session\n");
-        }
-    } else {
-        log_d("Ssh session object pool limit exceeded\n");
-    }
+
 }
 
 struct SSH2Context final {
     std::unique_ptr<SSH2Session> session;
-    std::queue<std::unique_ptr<SSH2Session>> &sessionObjectPool;
+    std::deque<std::unique_ptr<SSH2Session>> &sessionObjectPool;
     std::shared_ptr<SSHChannel> channel;
     bool isAuthenticated = false;
 
     ~SSH2Context() {
         channel.reset();
-        destroySshSession(sessionObjectPool, std::move(session));
+        if (sessionObjectPool.size() < MAX_SIZE_SESSION_POOL) {
+            if (!session->hasChannelCreatingError()) {
+                sessionObjectPool.push_back(std::move(session));
+            } else {
+                log_e("Do not cache ssh session\n");
+            }
+        } else {
+            log_d("Ssh session object pool limit exceeded\n");
+        }
     }
 };
 
@@ -461,14 +479,12 @@ SSHProxy::~SSHProxy() {
     libssh2_exit();
 }
 
-bool SSHProxy::start(const ProxyConfig &config_) {
+void SSHProxy::start(const ProxyConfig &proxyConfig) {
     if (mainThread) {
-        return false;
+        throw std::runtime_error("Already started");
     }
-    config = config_;
-
+    this->config = proxyConfig;
     mainThread = std::jthread(&SSHProxy::mainLoop, this);
-    return true;
 }
 
 void SSHProxy::requestStop() noexcept {
@@ -545,14 +561,30 @@ ResultCode SSHProxy::connectToSshServer(const std::shared_ptr<ClientContext> &cl
 
 void SSHProxy::setupSshConnection(const std::shared_ptr<ClientContext> &clientCtx) {
     if (clientCtx->state == ClientContext::State::SSH_SERVER_CONNECTING) {
-        const auto fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-        if (fd == -1) {
-            log_e("Failed to create SSH socket: {}\n", strerror(errno));
-            closeConnection(clientCtx);
-            return;
+        std::unique_ptr<SSH2Session> session;
+        if (!sshSessionObjectPool.empty()) {
+            log_v("Ssh session object pool size: {}\n", sshSessionObjectPool.size());
+            while (!sshSessionObjectPool.empty()) {
+                auto cachedSession = std::move(sshSessionObjectPool.front());
+                sshSessionObjectPool.pop_front();
+                if (!checkConnection(cachedSession->fd)) {
+                    continue;
+                }
+                session = std::move(cachedSession);
+                break;
+            }
         }
+        if (!session) {
+            const auto fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+            if (fd == -1) {
+                log_e("Failed to create SSH socket: {}\n", strerror(errno));
+                closeConnection(clientCtx);
+                return;
+            }
+            session = createSshSession(fd, epollManager);
+        }
+
         try {
-            auto session = createSshSession(fd, sshSessionObjectPool);
             clientCtx->sshContext = std::make_unique<SSH2Context>(std::move(session), sshSessionObjectPool);
         } catch (std::exception &e) {
             log_e("Failed to create SSH session: {}\n", e.what());
@@ -677,12 +709,19 @@ void SSHProxy::mainLoop(const std::stop_token &stopToken) {
                             }
                         }
                     } else if (eventMask & EPollManager::EPOLL_ERR) {
-                        log_e("{}, Client socket error/hangup:\n", fd);
+                        log_e("{}, Client socket error/hangup\n", fd);
                         std::optional<std::shared_ptr<ClientContext>> clientCtx;
                         if (sshToClientSockets.contains(fd)) {
                             clientCtx = clients[sshToClientSockets[fd]];
                         } else if (clients.contains(fd)) {
                             clientCtx = clients[fd];
+                        } else {
+                            const auto it = std::ranges::find_if(sshSessionObjectPool, [fd](const auto &item) {
+                                return item->fd == fd;
+                            });
+                            if (it != sshSessionObjectPool.end()) {
+                                sshSessionObjectPool.erase(it);
+                            }
                         }
                         if (clientCtx) {
                             closeConnection(clientCtx.value());

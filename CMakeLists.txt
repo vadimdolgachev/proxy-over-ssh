@@ -53,11 +53,6 @@ CPMAddPackage(
         "OPENSSL_ROOT_DIR ${OPENSSL_ROOT_DIR}"
 )
 
-message("ANDROID_ABI=${ANDROID_ABI}")
-message("ANDROID_NDK=${ANDROID_NDK}")
-message("ANDROID_NATIVE_API_LEVEL=${ANDROID_NATIVE_API_LEVEL}")
-message("ANDROID_PLATFORM=${ANDROID_PLATFORM}")
-
 add_executable(proxy_over_ssh main.cpp
         SSHProxy.cpp
         SSHProxy.h
@@ -71,5 +66,9 @@ target_link_libraries(proxy_over_ssh PRIVATE
 target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic)
 
 if(ANDROID)
+    message("ANDROID_ABI=${ANDROID_ABI}")
+    message("ANDROID_NDK=${ANDROID_NDK}")
+    message("ANDROID_NATIVE_API_LEVEL=${ANDROID_NATIVE_API_LEVEL}")
+    message("ANDROID_PLATFORM=${ANDROID_PLATFORM}")
     target_link_libraries(proxy_over_ssh PRIVATE dl z log android)
 endif()

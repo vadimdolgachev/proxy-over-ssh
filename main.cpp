@@ -87,12 +87,9 @@ extern "C" void onSignalTerm(int) {
 int main(const int argc, char **argv) {
     std::signal(SIGTERM, onSignalTerm);
     if (const auto config = parseConfig(argc, argv)) {
-        if (const auto proxy = std::make_unique<SSHProxy>(stopSignalFlag); proxy->start(config.value())) {
-            proxy->waitForFinish();
-        } else {
-            std::cerr << "Failed to start proxy" << std::endl;
-            return 1;
-        }
+        const auto proxy = std::make_unique<SSHProxy>(stopSignalFlag);
+        proxy->start(config.value());
+        proxy->waitForFinish();
     } else {
         std::cerr << "Failed to parse arguments: " << config.error() << "\n";
     }
