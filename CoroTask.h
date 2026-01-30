@@ -4,13 +4,20 @@
 #include <chrono>
 #include <coroutine>
 #include <cstdlib>
+#include <cerrno>
 #include <unistd.h>
 #include <unordered_map>
 #include <utility>
 #include <cassert>
+#include <functional>
+#include <iostream>
+#include <system_error>
 
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
+
+class Endpoint;
+class Socket;
 
 struct CloseFdFinalizer final {
     void operator()(const int fd) const noexcept {
@@ -48,7 +55,7 @@ public:
         fd = newFd;
     }
 
-    int release() noexcept {
+    [[nodiscard]] int release() noexcept {
         return std::exchange(fd, -1);
     }
 
@@ -70,12 +77,15 @@ using UniqueFd = UniqueFdBasic<>;
 
 class EpollScheduler final {
     struct Entry final {
-        int fd{};
+        int fd = -1;
         std::coroutine_handle<> h;
     };
 
 public:
-    EpollScheduler() : epollFd(epoll_create1(EPOLL_CLOEXEC)) {
+    using PollEvents = EPOLL_EVENTS;
+
+    explicit EpollScheduler(std::function<bool()> stopToken_) : epollFd(epoll_create1(EPOLL_CLOEXEC)),
+                                                                stopToken(std::move(stopToken_)) {
         if (epollFd.get() < 0) {
             throw std::runtime_error("Epoll creation failed");
         }
@@ -85,63 +95,93 @@ public:
 
     EpollScheduler &operator=(const EpollScheduler &) = delete;
 
-    void add(const int fd, const std::coroutine_handle<> h) {
+    void add(const uint32_t events, const int fd, const std::coroutine_handle<> coro) {
         epoll_event ev{};
-        ev.events = EPOLLIN;
-        ev.data.ptr = h.address();
+        ev.events = events;
+        ev.data.ptr = coro.address();
 
-        if (!handles.try_emplace(h.address(), fd, h).second) {
-            std::abort();
+        auto [it, inserted] = handles.try_emplace(coro.address(), fd, coro);
+        if (!inserted) {
+            throw std::runtime_error("Coroutine handler already exists");
         }
 
-        if (epoll_ctl(epollFd.get(), EPOLL_CTL_ADD, fd, &ev) < 0) {
-            std::abort();
+        if (epoll_ctl(epollFd.get(), EPOLL_CTL_ADD, fd, &ev)) {
+            const int err = errno;
+            handles.erase(it); // Rollback insertion
+            throw std::system_error(err, std::system_category(), "Epoll add failed");
+        }
+    }
+
+    void remove(const int fd, const std::coroutine_handle<> coro) {
+        if (handles.erase(coro.address()) > 0) {
+            if (epoll_ctl(epollFd.get(), EPOLL_CTL_DEL, fd, nullptr) < 0) {
+                const int err = errno;
+                // Ignore EBADF (fd already closed) and ENOENT (entry not found)
+                if (err != EBADF && err != ENOENT) {
+                    throw std::system_error(err, std::system_category(), "Epoll remove failed");
+                }
+                std::cout << "Epoll remove ignored error " << err << " for fd=" << fd << "\n";
+            }
+        }
+    }
+
+    void modify(const int fd, const uint32_t events, const std::coroutine_handle<> coro) {
+        if (!handles.contains(coro.address())) {
+            return;
+        }
+
+        epoll_event ev{};
+        ev.events = events;
+        ev.data.ptr = coro.address();
+
+        if (epoll_ctl(epollFd.get(), EPOLL_CTL_MOD, fd, &ev) < 0) {
+            const int err = errno;
+            // Ignore EBADF (fd already closed) and ENOENT (entry not found)
+            if (err != EBADF && err != ENOENT) {
+                throw std::system_error(err, std::system_category(), "Epoll modify failed");
+            }
         }
     }
 
     void run() {
         std::array<epoll_event, 16> events = {};
         while (true) {
-            if (const int n = epoll_wait(epollFd.get(), events.data(), events.size(), -1); n > 0) {
-                for (size_t i = 0; i < static_cast<size_t>(n); ++i) {
+            if (const int size = epoll_wait(epollFd.get(), events.data(), events.size(), 500); size > 0) {
+                std::cout << "new events size=" << size << "\n";
+                for (size_t i = 0; i < static_cast<size_t>(size); ++i) {
                     auto addr = events[i].data.ptr;
                     const auto [fd, h] = handles[addr];
-                    handles.erase(addr);
-                    rem(fd);
+                    remove(fd, h);
                     h.resume();
                 }
-            } else {
-                abort();
+            } else if (stopToken && stopToken()) {
+                break;
             }
         }
     }
 
 private:
-    void rem(const int fd) const {
-        if (epoll_ctl(epollFd.get(), EPOLL_CTL_DEL, fd, nullptr) < 0) {
-            abort();
-        }
-    }
-
     const UniqueFd epollFd;
     std::unordered_map<void *, Entry> handles;
+    std::function<bool()> stopToken;
 };
 
+template<typename T>
 struct SchedulerAware {
-    void setScheduler(EpollScheduler *s) noexcept {
+    void setScheduler(T *s) noexcept {
         assert(sched == nullptr);
         sched = s;
     }
 
-    [[nodiscard]] EpollScheduler *getScheduler() const noexcept {
+    [[nodiscard]] T *getScheduler() const noexcept {
         return sched;
     }
 
 private:
-    EpollScheduler *sched = nullptr;
+    T *sched = nullptr;
 };
 
-struct TimerAwaiter final : SchedulerAware {
+struct TimerAwaiter final : SchedulerAware<EpollScheduler> {
     explicit TimerAwaiter(const std::chrono::nanoseconds delay_) : delay(delay_) {
     }
 
@@ -152,7 +192,7 @@ struct TimerAwaiter final : SchedulerAware {
     void await_suspend(const std::coroutine_handle<> h) {
         timerFd.reset(timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC));
         if (timerFd.get() < 0) {
-            std::terminate();
+            throw std::system_error(errno, std::system_category(), "timerfd_create failed");
         }
 
         itimerspec spec{};
@@ -160,12 +200,12 @@ struct TimerAwaiter final : SchedulerAware {
         spec.it_value.tv_nsec = delay.count() % 1'000'000'000;
         timerfd_settime(timerFd.get(), 0, &spec, nullptr);
 
-        getScheduler()->add(timerFd.get(), h);
+        this->getScheduler()->add(EpollScheduler::PollEvents::EPOLLIN, timerFd.get(), h);
     }
 
     void await_resume() {
         uint64_t expirations;
-        read(timerFd.get(), &expirations, sizeof(expirations));
+        [[maybe_unused]] auto r = read(timerFd.get(), &expirations, sizeof(expirations));
     }
 
 private:
@@ -173,9 +213,8 @@ private:
     UniqueFd timerFd{};
 };
 
-
 template<typename Base>
-struct PromiseBase : SchedulerAware {
+struct PromiseBase : SchedulerAware<EpollScheduler> {
     std::suspend_always initial_suspend() {
         return {};
     }
@@ -273,17 +312,19 @@ template<typename T>
 class CoroTask final {
 public:
     template<typename promise_type>
-    using PromiseBase = std::conditional_t<std::is_void_v<T>, PromiseVoid<promise_type>, PromiseValue<T, promise_type> >
-    ;
+    using PromiseBase = std::conditional_t<std::is_void_v<T>,
+        PromiseVoid<promise_type>,
+        PromiseValue<T, promise_type> >;
 
-    struct promise_type : PromiseBase<promise_type> {
+    struct promise_type final : PromiseBase<promise_type> {
         CoroTask get_return_object() {
             return CoroTask{std::coroutine_handle<promise_type>::from_promise(*this)};
         }
     };
 
-    using Awaiter = std::conditional_t<std::is_void_v<T>, CoroTaskAwaiterVoid<promise_type>, CoroTaskAwaiter<
-        promise_type, T> >;
+    using Awaiter = std::conditional_t<std::is_void_v<T>,
+        CoroTaskAwaiterVoid<promise_type>,
+        CoroTaskAwaiter<promise_type, T> >;
 
     explicit CoroTask(const std::coroutine_handle<promise_type> h) : handle(h) {
     }

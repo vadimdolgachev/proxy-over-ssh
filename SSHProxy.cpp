@@ -13,12 +13,18 @@
 #include <utility>
 #include <vector>
 #include <ranges>
+#include <span>
+#include <string>
+#include <cstdint>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
 #include <libssh2.h>
+
+#include "CoroTask.h"
+#include "Socket.h"
 
 namespace {
     bool checkConnection(const int fd) {
@@ -77,6 +83,18 @@ namespace Socks5 {
         constexpr int Domain = 0x3;
         constexpr int IpV6 = 0x4;
     }
+
+    namespace Rep {
+        constexpr int Success = 0x00;
+        constexpr int GeneralFailure = 0x01;
+        constexpr int ConnectionNotAllowed = 0x02;
+        constexpr int NetworkUnreachable = 0x03;
+        constexpr int HostUnreachable = 0x04;
+        constexpr int ConnectionRefused = 0x05;
+        constexpr int TtlExpired = 0x06;
+        constexpr int CommandNotSupported = 0x07;
+        constexpr int AddressTypeNotSupported = 0x08;
+    }
 }
 
 class EPollManager final {
@@ -84,19 +102,19 @@ public:
     constexpr static std::uint32_t EPOLL_ET = EPOLLET;
     constexpr static std::uint32_t EPOLL_IN = EPOLLIN;
     constexpr static std::uint32_t EPOLL_OUT = EPOLLOUT;
-    constexpr static std::uint32_t EPOLL_IO = EPOLLIN | EPOLLOUT;
+    constexpr static std::uint32_t EPOLL_IO = EPOLL_IN | EPOLL_OUT;
     constexpr static std::uint32_t EPOLL_ERR = EPOLLERR | EPOLLHUP | EPOLLRDHUP;
     constexpr static std::uint32_t EPOLL_IO_ERR = EPOLL_IO | EPOLL_ERR;
 
-    explicit EPollManager(const size_t maxEvents = 128) :
-        epollEvents(maxEvents),
-        epollFd(epoll_create1(0)) {
+    explicit EPollManager(const size_t maxEvents = 128) : epollEvents(maxEvents),
+                                                          epollFd(epoll_create1(0)) {
         if (epollFd == -1) {
             throw std::runtime_error("Failed to create epoll instance");
         }
     }
 
     EPollManager(const EPollManager &) = delete;
+
     EPollManager &operator=(const EPollManager &) = delete;
 
     ~EPollManager() {
@@ -160,8 +178,11 @@ public:
         CLOSED
     };
 
-    explicit SSHChannel(LIBSSH2_CHANNEL *const channel_) : channel(channel_) {}
+    explicit SSHChannel(LIBSSH2_CHANNEL *const channel_) : channel(channel_) {
+    }
+
     SSHChannel(const SSHChannel &) = delete;
+
     SSHChannel &operator=(const SSHChannel &) = delete;
 
     ~SSHChannel() {
@@ -192,11 +213,11 @@ public:
         return ResultCode::ErrIO;
     }
 
-    [[nodiscard]] ssize_t write(const std::span<const unsigned char> buffer) noexcept {
+    [[nodiscard]] ssize_t write(const std::span<const uint8_t> buffer) noexcept {
         return libssh2_channel_write(channel, reinterpret_cast<const char *>(buffer.data()), buffer.size());
     }
 
-    [[nodiscard]] ssize_t read(std::span<unsigned char> buffer) noexcept {
+    [[nodiscard]] ssize_t read(std::span<uint8_t> buffer) noexcept {
         return libssh2_channel_read(channel, reinterpret_cast<char *>(buffer.data()), buffer.size());
     }
 
@@ -207,7 +228,8 @@ private:
 
 class SSH2Session final {
 public:
-    class InitSessionError final : public std::exception {};
+    class InitSessionError final : public std::exception {
+    };
 
     const int fd;
     const std::shared_ptr<EPollManager> epollManager;
@@ -223,6 +245,7 @@ public:
     }
 
     SSH2Session(const SSH2Session &) = delete;
+
     SSH2Session &operator=(const SSH2Session &) = delete;
 
     ~SSH2Session() {
@@ -318,14 +341,13 @@ createSshSession(const int fd, const std::shared_ptr<EPollManager> &epollManager
     return std::make_unique<SSH2Session>(fd, epollManager);
 }
 
-void destroySshSession(std::deque<std::unique_ptr<SSH2Session>> &sessionObjectPool,
-                       std::unique_ptr<SSH2Session> sshSession) {
-
+void destroySshSession([[maybe_unused]] std::deque<std::unique_ptr<SSH2Session> > &sessionObjectPool,
+                       [[maybe_unused]] std::unique_ptr<SSH2Session> sshSession) {
 }
 
 struct SSH2Context final {
     std::unique_ptr<SSH2Session> session;
-    std::deque<std::unique_ptr<SSH2Session>> &sessionObjectPool;
+    std::deque<std::unique_ptr<SSH2Session> > &sessionObjectPool;
     std::shared_ptr<SSHChannel> channel;
     bool isAuthenticated = false;
 
@@ -355,17 +377,19 @@ struct ClientContext final {
         CHANNEL_CLOSING
     };
 
-    explicit ClientContext(const int fd_) :
-        fd(fd_) {}
+    explicit ClientContext(const int fd_) : fd(fd_) {
+    }
 
     ClientContext(const ClientContext &) = delete;
+
     ClientContext &operator=(const ClientContext &) = delete;
+
     ~ClientContext();
 
     const int fd;
     std::unique_ptr<SSH2Context> sshContext;
-    std::vector<unsigned char> readBuffer;
-    std::vector<unsigned char> writeBuffer;
+    std::vector<uint8_t> readBuffer;
+    std::vector<uint8_t> writeBuffer;
     State state = State::NONE;
     Address addr;
     size_t totalBytesRead = 0;
@@ -378,7 +402,7 @@ ClientContext::~ClientContext() {
 }
 
 ResultCode SSHProxy::sshRead(const std::shared_ptr<ClientContext> &clientCtx) {
-    unsigned char buffer[BUFFER_SIZE];
+    uint8_t buffer[BUFFER_SIZE];
     ssize_t bytesRead = 0;
     do {
         bytesRead = clientCtx->sshContext->channel->read({buffer, BUFFER_SIZE});
@@ -434,7 +458,8 @@ ResultCode SSHProxy::sshWrite(const std::shared_ptr<ClientContext> &clientCtx) {
     }
 
     if (totalWritten > 0) {
-        clientCtx->readBuffer.erase(clientCtx->readBuffer.begin(), clientCtx->readBuffer.begin() + static_cast<ssize_t>(totalWritten));
+        clientCtx->readBuffer.erase(clientCtx->readBuffer.begin(),
+                                    clientCtx->readBuffer.begin() + static_cast<ssize_t>(totalWritten));
         log_v("{}, Ssh write total bytes: {}, left: {}\n", clientCtx->fd, totalWritten,
               clientCtx->readBuffer.size());
     }
@@ -469,9 +494,8 @@ ResultCode SSHProxy::sendToClient(const std::shared_ptr<ClientContext> &clientCt
     return ResultCode::Ok;
 }
 
-SSHProxy::SSHProxy(const std::atomic_bool &stopSignalFlag_) :
-    serverFd(-1),
-    stopSignalFlag(stopSignalFlag_) {
+SSHProxy::SSHProxy(const std::atomic_bool &stopSignalFlag_) : serverFd(-1),
+                                                              stopSignalFlag(stopSignalFlag_) {
     libssh2_init(0);
 }
 
@@ -521,12 +545,9 @@ bool SSHProxy::setupLocalServer() {
     constexpr int opt = 1;
     setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port = htons(config.value().listenPort);
-
-    if (bind(serverFd, reinterpret_cast<sockaddr *>(&serverAddr), sizeof(serverAddr)) == -1) {
+    const Endpoint endpoint(config.value().listenPort);
+    if (bind(serverFd, reinterpret_cast<const sockaddr *>(&endpoint.sockaddr()),
+             sizeof(endpoint.sockaddr())) == -1) {
         log_e("Failed to bind server socket: {}\n", strerror(errno));
 
         close(serverFd);
@@ -621,6 +642,390 @@ void SSHProxy::setupSshConnection(const std::shared_ptr<ClientContext> &clientCt
     }
 }
 
+// Simplified client context for coroutine-based SOCKS5 proxy test
+// Tracks connection state, socket, and buffer for async I/O operations
+struct ClientContext2 final {
+    enum class State {
+        HANDSHAKE,
+        REQUEST,
+        SSH_SOCKET_CONNECT,
+        FORWARDING,
+        CLOSED
+    };
+
+    static constexpr size_t kInitialBufferSize = 1024;
+
+    ClientContext2(const Endpoint endpoint_, SocketPtr socket_, std::vector<uint8_t> buffer_)
+        : endpoint(endpoint_),
+          socket(std::move(socket_)),
+          buffer(std::move(buffer_)) {
+    }
+
+    // Delete copy operations (socket is shared_ptr, but prevent accidental copies)
+    ClientContext2(const ClientContext2 &) = delete;
+
+    ClientContext2 &operator=(const ClientContext2 &) = delete;
+
+    // Allow move operations
+    ClientContext2(ClientContext2 &&) = default;
+
+    ClientContext2 &operator=(ClientContext2 &&) = default;
+
+    ~ClientContext2() {
+        if (socket && socket->fd() != -1) {
+            std::cout << "ClientContext2 destroyed for endpoint: "
+                    << endpoint.ip() << ":" << endpoint.port() << '\n';
+        }
+    }
+
+    // Socket operations
+    [[nodiscard]] bool isConnected() const noexcept {
+        return socket && socket->fd() != -1;
+    }
+
+    void closeSocket() noexcept {
+        if (socket) {
+            socket->close();
+        }
+    }
+
+    // State management
+    void setState(const State newState) noexcept {
+        state = newState;
+    }
+
+    [[nodiscard]] State getState() const noexcept {
+        return state;
+    }
+
+    [[nodiscard]] bool isState(const State state_) const noexcept {
+        return state == state_;
+    }
+
+    Endpoint endpoint;
+    SocketPtr socket;
+    std::vector<uint8_t> buffer;
+    Endpoint targetEndpoint;
+
+private:
+    State state = State::HANDSHAKE;
+};
+
+CoroTask<void> handleSocks5Handshake(const std::shared_ptr<ClientContext2> clientCtx) {
+    size_t length = co_await clientCtx->socket->read({clientCtx->buffer.data(), clientCtx->buffer.size()});
+    std::cout << "length: " << length << '\n';
+
+    // Minimum handshake: VER(1) + NMETHODS(1)
+    if (length < 2) {
+        throw std::runtime_error("SOCKS5 handshake too short");
+    }
+
+    const uint8_t version = clientCtx->buffer[0];
+    const uint8_t nmethodLength = clientCtx->buffer[1];
+    std::cout << "version: " << static_cast<int>(version) << ", nmethodLength: " << static_cast<int>(nmethodLength) <<
+            '\n';
+
+    if (version != Socks5::Version) {
+        throw std::runtime_error("SOCKS5 version mismatch");
+    }
+    constexpr size_t nmethodsPos = 2;
+    // Validate we received all methods bytes
+    if (length < nmethodsPos + nmethodLength) {
+        throw std::runtime_error("SOCKS5 handshake incomplete");
+    }
+
+    std::span<const uint8_t> nmethodsData = {&clientCtx->buffer[nmethodsPos], nmethodLength};
+    // Scan methods for NoAuth (0x00)
+    const bool hasNoAuth = std::ranges::find_if(nmethodsData, [](const auto c) {
+        return c == Socks5::Auth::NoAuth;
+    }) != nmethodsData.end();
+
+    // Determine selected method (0x00=NoAuth, 0xFF=no acceptable method)
+    const uint8_t selectedMethod = hasNoAuth ? Socks5::Auth::NoAuth : 0xFF;
+
+    // Always send response first (RFC 1928 requirement)
+    clientCtx->buffer[0] = Socks5::Version;
+    clientCtx->buffer[1] = selectedMethod;
+    clientCtx->buffer.resize(2);
+    length = co_await clientCtx->socket->write({clientCtx->buffer.data(), clientCtx->buffer.size()});
+    if (length != clientCtx->buffer.size()) {
+        throw std::runtime_error("Failed to write to client");
+    }
+
+    // Only after sending response, close connection if no acceptable method
+    if (selectedMethod == 0xFF) {
+        throw std::runtime_error("No acceptable SOCKS5 authentication method");
+    }
+
+    // Handshake successful, transition to REQUEST state
+    clientCtx->setState(ClientContext2::State::REQUEST);
+}
+
+// SOCKS5 request header (RFC 1928)
+// +----+-----+-------+------+----------+----------+
+// |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+// +----+-----+-------+------+----------+----------+
+// | 1  |  1  |   1   |  1   | Variable |    2     |
+// +----+-----+-------+------+----------+----------+
+struct Socks5Request final {
+    static constexpr size_t kHeaderSize = 4;
+
+    uint8_t version;
+    uint8_t cmd;
+    uint8_t rsv;
+    uint8_t atyp;
+
+    static Socks5Request deserialize(const uint8_t *buffer) {
+        return Socks5Request{
+            .version = buffer[0],
+            .cmd = buffer[1],
+            .rsv = buffer[2],
+            .atyp = buffer[3]
+        };
+    }
+};
+
+// SOCKS5 response header (RFC 1928)
+// +----+-----+-------+------+----------+----------+
+// |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+// +----+-----+-------+------+----------+----------+
+// | 1  |  1  |   1   |  1   | Variable |    2     |
+// +----+-----+-------+------+----------+----------+
+struct Socks5Response final {
+    static constexpr size_t kHeaderSize = 4;
+
+    uint8_t version = Socks5::Version;
+    uint8_t rep = Socks5::Rep::Success;
+    uint8_t rsv = 0;
+    uint8_t atyp = Socks5::Atyp::IpV4;
+    std::vector<uint8_t> bndAddr;
+    uint16_t bndPort = 0;
+
+    Socks5Response() = default;
+
+    // Create IPv4 response
+    static Socks5Response ipv4(uint32_t addr, uint16_t port) {
+        Socks5Response resp;
+        resp.atyp = Socks5::Atyp::IpV4;
+        resp.bndAddr.resize(4);
+        resp.bndAddr[0] = static_cast<uint8_t>((addr >> 24) & 0xFF);
+        resp.bndAddr[1] = static_cast<uint8_t>((addr >> 16) & 0xFF);
+        resp.bndAddr[2] = static_cast<uint8_t>((addr >> 8) & 0xFF);
+        resp.bndAddr[3] = static_cast<uint8_t>(addr & 0xFF);
+        resp.bndPort = port;
+        return resp;
+    }
+
+    // Create IPv6 response
+    static Socks5Response ipv6(const uint8_t addr[16], uint16_t port) {
+        Socks5Response resp;
+        resp.atyp = Socks5::Atyp::IpV6;
+        resp.bndAddr.assign(addr, addr + 16);
+        resp.bndPort = port;
+        return resp;
+    }
+
+    // Create domain response
+    static Socks5Response domain(const std::string &domain, uint16_t port) {
+        Socks5Response resp;
+        resp.atyp = Socks5::Atyp::Domain;
+        resp.bndAddr.resize(1 + domain.size());
+        resp.bndAddr[0] = static_cast<uint8_t>(domain.size());
+        std::memcpy(resp.bndAddr.data() + 1, domain.data(), domain.size());
+        resp.bndPort = port;
+        return resp;
+    }
+
+    // Create dummy IPv4 response (0.0.0.0)
+    static Socks5Response dummy(uint16_t port) {
+        return ipv4(0, port);
+    }
+
+    // Create response from host string (attempts IPv6, then IPv4, else domain)
+    static Socks5Response fromHost(const std::string &host, uint16_t port) {
+        sockaddr_in6 sa6{};
+        sockaddr_in sa{};
+
+        if (inet_pton(AF_INET6, host.c_str(), &sa6.sin6_addr) == 1) {
+            // IPv6 address
+            uint8_t addr[16];
+            std::memcpy(addr, &sa6.sin6_addr, 16);
+            return ipv6(addr, port);
+        }
+        if (inet_pton(AF_INET, host.c_str(), &sa.sin_addr) == 1) {
+            // IPv4 address
+            const uint32_t addr = ntohl(sa.sin_addr.s_addr);
+            return ipv4(addr, port);
+        }
+        // Domain name
+        return domain(host, port);
+    }
+
+    // Calculate total serialized size
+    [[nodiscard]] size_t size() const {
+        return kHeaderSize + bndAddr.size() + 2; // +2 for port
+    }
+
+    // Serialize to buffer
+    void serialize(uint8_t *buffer) const {
+        buffer[0] = version;
+        buffer[1] = rep;
+        buffer[2] = rsv;
+        buffer[3] = atyp;
+        std::memcpy(buffer + kHeaderSize, bndAddr.data(), bndAddr.size());
+        const size_t portOffset = kHeaderSize + bndAddr.size();
+        buffer[portOffset] = static_cast<uint8_t>(bndPort >> 8);
+        buffer[portOffset + 1] = static_cast<uint8_t>(bndPort & 0xFF);
+    }
+
+    // Serialize to vector
+    [[nodiscard]] std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> result(size());
+        serialize(result.data());
+        return result;
+    }
+};
+
+CoroTask<void> handleSocks5Request(const std::shared_ptr<ClientContext2> clientCtx) {
+    // Ensure buffer is ready for reading request
+    clientCtx->buffer.resize(ClientContext2::kInitialBufferSize);
+
+    // Read at least 5 bytes to determine request length
+    size_t length = 0;
+    while (length < 5) {
+        const size_t read = co_await clientCtx->socket->read({
+            clientCtx->buffer.data() + length, clientCtx->buffer.size() - length
+        });
+        if (read == 0) {
+            throw std::runtime_error("Socket closed during SOCKS5 request");
+        }
+        length += read;
+    }
+
+    // Parse SOCKS5 request
+    const auto req = Socks5Request::deserialize(clientCtx->buffer.data());
+    if (req.rsv != 0) {
+        throw std::runtime_error("Invalid SOCKS5 request: RSV must be 0");
+    }
+
+    if (req.version != Socks5::Version || req.cmd != Socks5::Cmd::Connect) {
+        throw std::runtime_error("Unsupported SOCKS5 version or command");
+    }
+
+    [[maybe_unused]] ssize_t requestLen = 0;
+    Endpoint targetEndpoint;
+
+    switch (req.atyp) {
+        case Socks5::Atyp::IpV4:
+            if (length < 10) {
+                // Need more bytes
+                const size_t needed = 10 - length;
+                const size_t read = co_await clientCtx->socket->read({
+                    clientCtx->buffer.data() + length, clientCtx->buffer.size() - length
+                });
+                if (read < needed) {
+                    throw std::runtime_error("Incomplete IPv4 SOCKS5 request");
+                }
+                length += read;
+            } {
+                sockaddr_in addr{};
+                addr.sin_family = AF_INET;
+                std::memcpy(&addr.sin_addr, &clientCtx->buffer[4], sizeof(in_addr));
+                addr.sin_port = htons(static_cast<uint16_t>(clientCtx->buffer[8] << 8) | clientCtx->buffer[9]);
+                targetEndpoint = Endpoint(addr);
+            }
+            requestLen = 10;
+            break;
+
+        case Socks5::Atyp::Domain: {
+            const uint8_t domainLen = clientCtx->buffer[4];
+            if (length < static_cast<size_t>(5 + domainLen + 2)) {
+                const size_t needed = 5 + domainLen + 2 - length;
+                const size_t read = co_await clientCtx->socket->read({
+                    clientCtx->buffer.data() + length, clientCtx->buffer.size() - length
+                });
+                if (read < needed) {
+                    throw std::runtime_error("Incomplete domain SOCKS5 request");
+                }
+                length += read;
+            }
+            std::string targetHost = std::string(reinterpret_cast<const char *>(&clientCtx->buffer[5]), domainLen);
+            uint16_t targetPort = static_cast<uint16_t>(clientCtx->buffer[5 + domainLen] << 8) |
+                                  clientCtx->buffer[5 + domainLen + 1];
+            targetEndpoint = Endpoint(targetHost, targetPort);
+            requestLen = 5 + domainLen + 2;
+        }
+        break;
+
+        case Socks5::Atyp::IpV6:
+            if (length < 22) {
+                const size_t needed = 22 - length;
+                const size_t read = co_await clientCtx->socket->read({
+                    clientCtx->buffer.data() + length, clientCtx->buffer.size() - length
+                });
+                if (read < needed) {
+                    throw std::runtime_error("Incomplete IPv6 SOCKS5 request");
+                }
+                length += read;
+            } {
+                sockaddr_in6 addr6{};
+                addr6.sin6_family = AF_INET6;
+                std::memcpy(&addr6.sin6_addr, &clientCtx->buffer[4], sizeof(in6_addr));
+                addr6.sin6_port = htons(static_cast<uint16_t>(clientCtx->buffer[20] << 8) | clientCtx->buffer[21]);
+                targetEndpoint = Endpoint(addr6);
+            }
+            requestLen = 22;
+            break;
+
+        default:
+            throw std::runtime_error("Unsupported SOCKS5 address type");
+    }
+
+    // Store target information
+    clientCtx->targetEndpoint = std::move(targetEndpoint);
+
+    // Send success response (dummy IPv4 0.0.0.0)
+    const auto response = Socks5Response::dummy(clientCtx->targetEndpoint.port());
+    clientCtx->buffer = response.serialize();
+
+    if (const size_t written = co_await clientCtx->socket->write({clientCtx->buffer.data(), clientCtx->buffer.size()});
+        written != clientCtx->buffer.size()) {
+        throw std::runtime_error("Failed to send SOCKS5 response");
+    }
+
+    // Transition to SSH_SOCKET_CONNECT state
+    clientCtx->setState(ClientContext2::State::SSH_SOCKET_CONNECT);
+    std::cout << "SOCKS5 request processed: " << clientCtx->targetEndpoint.toString() << '\n';
+}
+
+CoroTask<void> startMainLoop(const ProxyConfig config) {
+    Socket serverSocket;
+    serverSocket.setReusePort(true);
+    std::cout << "listen port: " << config.listenPort + 1 << '\n';
+    if (!serverSocket.bind(Endpoint(config.listenPort + 1))) {
+        throw std::runtime_error("Failed to bind server socket");
+    }
+    std::unordered_map<Endpoint, std::shared_ptr<ClientContext2> > clients;
+    while (true) {
+        auto [socket, endpoint] = co_await serverSocket.listen();
+        std::cout << "new socket ip: " << endpoint.ipStr() << ", port: " << endpoint.port() << '\n';
+        auto client = std::make_shared<ClientContext2>(endpoint, socket,
+                                                       std::vector<uint8_t>(ClientContext2::kInitialBufferSize));
+        clients.try_emplace(endpoint, client);
+        try {
+            co_await handleSocks5Handshake(client);
+            co_await handleSocks5Request(client);
+            // For now, close connection after request processing
+            client->closeSocket();
+            clients.erase(endpoint);
+        } catch (const std::exception &e) {
+            std::cout << "Error handling client: " << e.what() << '\n';
+            client->closeSocket();
+            clients.erase(endpoint);
+        }
+    }
+}
+
 void SSHProxy::mainLoop(const std::stop_token &stopToken) {
     // Setup epoll
     if (setupEpoll() != ResultCode::Ok) {
@@ -633,9 +1038,18 @@ void SSHProxy::mainLoop(const std::stop_token &stopToken) {
           config.value().ssh.port);
     log_d("Proxy started. Press Ctrl+C to stop...\n");
 
-    const auto isStopRequested = [&] {
-        return stopToken.stop_requested() || stopSignalFlag.load(std::memory_order_relaxed);
+    const auto isStopRequested = [stopToken, &flag = stopSignalFlag] {
+        return stopToken.stop_requested() || flag.load(std::memory_order_relaxed);
     };
+
+#ifndef NDEBUG
+    EpollScheduler sched(isStopRequested);
+    const auto task = startMainLoop(config.value());
+    std::cout << "start\n";
+    task.start(sched);
+    sched.run();
+#endif
+
     while (!isStopRequested()) {
         // Setup local server
         if (!setupLocalServer()) {
@@ -664,30 +1078,30 @@ void SSHProxy::mainLoop(const std::stop_token &stopToken) {
                         handleNewClientConnection();
                     }
                 } else {
-                    if (eventMask & (EPollManager::EPOLL_IN || EPollManager::EPOLL_OUT)) {
+                    if (eventMask & EPollManager::EPOLL_IO) {
                         if (sshToClientSockets.contains(fd)) {
                             if (const auto &clientCtxOpt = getClientCtxBySshFd(fd)) {
                                 switch (clientCtxOpt.value()->state) {
-                                case ClientContext::State::SSH_SERVER_CONNECTING:
-                                case ClientContext::State::SSH_SERVER_AUTHENTICATE:
-                                case ClientContext::State::SSH_CHANNEL_CREATING:
-                                    setupSshConnection(clientCtxOpt.value());
-                                    break;
-                                case ClientContext::State::FORWARDING:
-                                    if (eventMask & EPollManager::EPOLL_IN) {
-                                        handleSshRead(clientCtxOpt.value());
-                                    } else {
-                                        handleSshWrite(clientCtxOpt.value());
-                                    }
-                                    break;
-                                case ClientContext::State::CHANNEL_CLOSING:
-                                    closeConnection(clientCtxOpt.value());
-                                    break;
-                                default:
-                                    log_e("Unexpected client state: {}\n",
-                                          static_cast<int>(clientCtxOpt.value()->state));
-                                    abort();
-                                    break;
+                                    case ClientContext::State::SSH_SERVER_CONNECTING:
+                                    case ClientContext::State::SSH_SERVER_AUTHENTICATE:
+                                    case ClientContext::State::SSH_CHANNEL_CREATING:
+                                        setupSshConnection(clientCtxOpt.value());
+                                        break;
+                                    case ClientContext::State::FORWARDING:
+                                        if (eventMask & EPollManager::EPOLL_IN) {
+                                            handleSshRead(clientCtxOpt.value());
+                                        } else {
+                                            handleSshWrite(clientCtxOpt.value());
+                                        }
+                                        break;
+                                    case ClientContext::State::CHANNEL_CLOSING:
+                                        closeConnection(clientCtxOpt.value());
+                                        break;
+                                    default:
+                                        log_e("Unexpected client state: {}\n",
+                                              static_cast<int>(clientCtxOpt.value()->state));
+                                        abort();
+                                        break;
                                 }
                             } else {
                                 abort();
@@ -695,23 +1109,23 @@ void SSHProxy::mainLoop(const std::stop_token &stopToken) {
                         } else {
                             if (const auto clientCtxOpt = getClientCtxByFd(fd)) {
                                 switch (clientCtxOpt.value()->state) {
-                                case ClientContext::State::HANDSHAKE:
-                                case ClientContext::State::REQUEST:
-                                case ClientContext::State::FORWARDING:
-                                    if (eventMask & EPollManager::EPOLL_IN) {
-                                        handleClientForRead(clientCtxOpt.value());
-                                    } else {
-                                        handleClientForWrite(clientCtxOpt.value());
-                                    }
-                                    break;
-                                default:
-                                    break;
+                                    case ClientContext::State::HANDSHAKE:
+                                    case ClientContext::State::REQUEST:
+                                    case ClientContext::State::FORWARDING:
+                                        if (eventMask & EPollManager::EPOLL_IN) {
+                                            handleClientForRead(clientCtxOpt.value());
+                                        } else {
+                                            handleClientForWrite(clientCtxOpt.value());
+                                        }
+                                        break;
+                                    default:
+                                        break;
                                 }
                             }
                         }
                     } else if (eventMask & EPollManager::EPOLL_ERR) {
                         log_e("{}, Client socket error/hangup\n", fd);
-                        std::optional<std::shared_ptr<ClientContext>> clientCtx;
+                        std::optional<std::shared_ptr<ClientContext> > clientCtx;
                         if (sshToClientSockets.contains(fd)) {
                             clientCtx = clients[sshToClientSockets[fd]];
                         } else if (clients.contains(fd)) {
@@ -768,18 +1182,18 @@ void SSHProxy::handleClientForRead(const std::shared_ptr<ClientContext> &clientC
 
     // Process data based on client state
     switch (clientCtx->state) {
-    case ClientContext::State::HANDSHAKE:
-        handleSocks5Handshake(clientCtx);
-        break;
-    case ClientContext::State::REQUEST:
-        handleSocks5Request(clientCtx);
-        break;
-    case ClientContext::State::FORWARDING:
-        handleSshWrite(clientCtx);
-        break;
-    default:
-        abort();
-        break;
+        case ClientContext::State::HANDSHAKE:
+            handleSocks5Handshake(clientCtx);
+            break;
+        case ClientContext::State::REQUEST:
+            handleSocks5Request(clientCtx);
+            break;
+        case ClientContext::State::FORWARDING:
+            handleSshWrite(clientCtx);
+            break;
+        default:
+            abort();
+            break;
     }
 }
 
@@ -815,31 +1229,31 @@ void SSHProxy::handleClientForWrite(const std::shared_ptr<ClientContext> &client
 
 void SSHProxy::handleSshRead(const std::shared_ptr<ClientContext> &clientCtx) {
     switch (sshRead(clientCtx)) {
-    case ResultCode::Ok:
-    case ResultCode::ErrAgain:
-        break;
-    case ResultCode::ErrIO:
-    case ResultCode::ErrTimeout:
-        closeConnection(clientCtx);
-        break;
-    default:
-        abort();
-        break;
+        case ResultCode::Ok:
+        case ResultCode::ErrAgain:
+            break;
+        case ResultCode::ErrIO:
+        case ResultCode::ErrTimeout:
+            closeConnection(clientCtx);
+            break;
+        default:
+            abort();
+            break;
     }
 }
 
 void SSHProxy::handleSshWrite(const std::shared_ptr<ClientContext> &clientCtx) {
     switch (sshWrite(clientCtx)) {
-    case ResultCode::Ok:
-    case ResultCode::ErrAgain:
-        break;
-    case ResultCode::ErrIO:
-    case ResultCode::ErrTimeout:
-        closeConnection(clientCtx);
-        break;
-    default:
-        abort();
-        break;
+        case ResultCode::Ok:
+        case ResultCode::ErrAgain:
+            break;
+        case ResultCode::ErrIO:
+        case ResultCode::ErrTimeout:
+            closeConnection(clientCtx);
+            break;
+        default:
+            abort();
+            break;
     }
 }
 
@@ -874,8 +1288,8 @@ void SSHProxy::handleSocks5Handshake(const std::shared_ptr<ClientContext> &clien
     }
 
     // Parse SOCKS5 handshake
-    const unsigned char version = clientCtx->readBuffer[0];
-    const unsigned char nmethods = clientCtx->readBuffer[1];
+    const uint8_t version = clientCtx->readBuffer[0];
+    const uint8_t nmethods = clientCtx->readBuffer[1];
 
     if (version != Socks5::Version || clientCtx->readBuffer.size() < static_cast<size_t>(2 + nmethods)) {
         closeConnection(clientCtx);
@@ -883,7 +1297,7 @@ void SSHProxy::handleSocks5Handshake(const std::shared_ptr<ClientContext> &clien
     }
 
     // Send handshake response
-    constexpr unsigned char response[] = {Socks5::Version, Socks5::Auth::NoAuth};
+    constexpr uint8_t response[] = {Socks5::Version, Socks5::Auth::NoAuth};
     if (send(clientCtx->fd, response, sizeof(response), MSG_NOSIGNAL) != sizeof(response)) {
         closeConnection(clientCtx);
         return;
@@ -902,9 +1316,15 @@ void SSHProxy::handleSocks5Request(const std::shared_ptr<ClientContext> &clientC
     }
 
     // Parse SOCKS5 request
-    const unsigned char version = clientCtx->readBuffer[0];
-    const unsigned char cmd = clientCtx->readBuffer[1];
-    const unsigned char atyp = clientCtx->readBuffer[3];
+    const auto req = Socks5Request::deserialize(clientCtx->readBuffer.data());
+    if (req.rsv != 0) {
+        log_d("{}, Invalid SOCKS5 request: RSV must be 0\n", clientCtx->fd);
+        closeConnection(clientCtx);
+        return;
+    }
+    const uint8_t version = req.version;
+    const uint8_t cmd = req.cmd;
+    const uint8_t atyp = req.atyp;
 
     if (version != Socks5::Version || cmd != Socks5::Cmd::Connect) {
         log_d("{}, Unsupported socks5 version\n", clientCtx->fd);
@@ -917,43 +1337,44 @@ void SSHProxy::handleSocks5Request(const std::shared_ptr<ClientContext> &clientC
     std::uint16_t targetPort;
 
     switch (atyp) {
-    case Socks5::Atyp::IpV4:
-        if (clientCtx->readBuffer.size() < 10) {
-            return;
-        }
-        char ipv4[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &clientCtx->readBuffer[4], ipv4, INET_ADDRSTRLEN);
-        targetHost = ipv4;
-        targetPort = clientCtx->readBuffer[8] << 8 | clientCtx->readBuffer[9];
-        requestLen = 10;
-        break;
+        case Socks5::Atyp::IpV4:
+            if (clientCtx->readBuffer.size() < 10) {
+                return;
+            }
+            char ipv4[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &clientCtx->readBuffer[4], ipv4, INET_ADDRSTRLEN);
+            targetHost = ipv4;
+            targetPort = static_cast<uint16_t>(clientCtx->readBuffer[8] << 8) | clientCtx->readBuffer[9];
+            requestLen = 10;
+            break;
 
-    case Socks5::Atyp::Domain:
-        if (clientCtx->readBuffer.size() < static_cast<size_t>(5 + clientCtx->readBuffer[4] + 2)) {
-            return;
-        }
-        targetHost = std::string(reinterpret_cast<const char *>(&clientCtx->readBuffer[5]), clientCtx->readBuffer[4]);
-        targetPort = clientCtx->readBuffer[5 + clientCtx->readBuffer[4]] << 8 | clientCtx->readBuffer[5 + clientCtx->
-            readBuffer[4] + 1];
-        requestLen = 5 + clientCtx->readBuffer[4] + 2;
-        break;
+        case Socks5::Atyp::Domain:
+            if (clientCtx->readBuffer.size() < static_cast<size_t>(5 + clientCtx->readBuffer[4] + 2)) {
+                return;
+            }
+            targetHost = std::string(reinterpret_cast<const char *>(&clientCtx->readBuffer[5]),
+                                     clientCtx->readBuffer[4]);
+            targetPort = static_cast<uint16_t>(clientCtx->readBuffer[5 + clientCtx->readBuffer[4]] << 8)
+                         | clientCtx->readBuffer[5 + clientCtx->readBuffer[4] + 1];
+            requestLen = 5 + clientCtx->readBuffer[4] + 2;
+            break;
 
-    case Socks5::Atyp::IpV6:
-        // IPv6: 16 bytes address + 2 bytes port = 18 bytes + 4 header = 22 bytes total
-        if (clientCtx->readBuffer.size() < 22) {
-            return;
-        }
-        char ipv6[INET6_ADDRSTRLEN];
-        inet_ntop(AF_INET6, &clientCtx->readBuffer[4], ipv6, INET6_ADDRSTRLEN);
-        targetHost = ipv6;
-        targetPort = clientCtx->readBuffer[20] << 8 | clientCtx->readBuffer[21];
-        requestLen = 22;
-        break;
+        case Socks5::Atyp::IpV6:
+            // IPv6: 16 bytes address + 2 bytes port = 18 bytes + 4 header = 22 bytes total
+            if (clientCtx->readBuffer.size() < 22) {
+                return;
+            }
+            char ipv6[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, &clientCtx->readBuffer[4], ipv6, INET6_ADDRSTRLEN);
+            targetHost = ipv6;
+            targetPort = static_cast<uint16_t>(clientCtx->readBuffer[20] << 8) | clientCtx->readBuffer[21];
+            requestLen = 22;
+            break;
 
-    default:
-        log_e("Unsupported address type: {}\n", static_cast<int>(atyp));
-        closeConnection(clientCtx);
-        return;
+        default:
+            log_e("Unsupported address type: {}\n", static_cast<int>(atyp));
+            closeConnection(clientCtx);
+            return;
     }
 
     log_d("{}, Client request: {}:{}, (type: {})\n", clientCtx->fd, targetHost, targetPort, atyp);
@@ -980,36 +1401,9 @@ ResultCode SSHProxy::createSshChannel(const std::shared_ptr<ClientContext> &clie
     clientCtx->requestTime = std::chrono::high_resolution_clock::now();
 
     // Send success response
-    clientCtx->writeBuffer.resize(22);
-    size_t responseLen;
+    const auto response = Socks5Response::fromHost(clientCtx->addr.host, clientCtx->addr.port);
+    clientCtx->writeBuffer = response.serialize();
 
-    clientCtx->writeBuffer[0] = Socks5::Version;
-    clientCtx->writeBuffer[1] = 0x00; // Success
-    clientCtx->writeBuffer[2] = 0x00; // Reserved
-
-    sockaddr_in6 sa6{};
-    sockaddr_in sa{};
-    if (inet_pton(AF_INET6, clientCtx->addr.host.c_str(), &sa6.sin6_addr) == 1) {
-        clientCtx->writeBuffer[3] = Socks5::Atyp::IpV6;
-        inet_pton(AF_INET6, clientCtx->addr.host.c_str(), &clientCtx->writeBuffer[4]);
-        clientCtx->writeBuffer[20] = static_cast<unsigned char>(clientCtx->addr.port >> 8 & 0xFF);
-        clientCtx->writeBuffer[21] = static_cast<unsigned char>(clientCtx->addr.port & 0xFF);
-        responseLen = 22;
-    } else if (inet_pton(AF_INET, clientCtx->addr.host.c_str(), &sa.sin_addr) == 1) {
-        clientCtx->writeBuffer[3] = Socks5::Atyp::IpV4;
-        inet_pton(AF_INET, clientCtx->addr.host.c_str(), &clientCtx->writeBuffer[4]);
-        clientCtx->writeBuffer[8] = static_cast<unsigned char>(clientCtx->addr.port >> 8 & 0xFF);
-        clientCtx->writeBuffer[9] = static_cast<unsigned char>(clientCtx->addr.port & 0xFF);
-        responseLen = 10;
-    } else {
-        clientCtx->writeBuffer[3] = Socks5::Atyp::IpV4;
-        memset(&clientCtx->writeBuffer[4], 0, 4);
-        clientCtx->writeBuffer[8] = static_cast<unsigned char>(clientCtx->addr.port >> 8 & 0xFF);
-        clientCtx->writeBuffer[9] = static_cast<unsigned char>(clientCtx->addr.port & 0xFF);
-        responseLen = 10;
-    }
-
-    clientCtx->writeBuffer.resize(responseLen);
     if (sendToClient(clientCtx) == ResultCode::ErrIO) {
         return ResultCode::ErrIO;
     }
@@ -1027,7 +1421,7 @@ ResultCode SSHProxy::closeSshChannel(const std::shared_ptr<ClientContext> &clien
     return clientCtx->sshContext->channel->closeConnection();
 }
 
-std::optional<std::shared_ptr<ClientContext>> SSHProxy::getClientCtxBySshFd(const int sshFd) {
+std::optional<std::shared_ptr<ClientContext> > SSHProxy::getClientCtxBySshFd(const int sshFd) {
     const auto clientFdIt = sshToClientSockets.find(sshFd);
     if (clientFdIt == sshToClientSockets.end()) {
         return std::nullopt;
@@ -1035,7 +1429,7 @@ std::optional<std::shared_ptr<ClientContext>> SSHProxy::getClientCtxBySshFd(cons
     return getClientCtxByFd(clientFdIt->second);
 }
 
-std::optional<std::shared_ptr<ClientContext>> SSHProxy::getClientCtxByFd(const int clientFd) {
+std::optional<std::shared_ptr<ClientContext> > SSHProxy::getClientCtxByFd(const int clientFd) {
     const auto &clientCtxIt = clients.find(clientFd);
     if (clientCtxIt == clients.end()) {
         return std::nullopt;
@@ -1045,19 +1439,19 @@ std::optional<std::shared_ptr<ClientContext>> SSHProxy::getClientCtxByFd(const i
 
 void SSHProxy::closeConnection(const std::shared_ptr<ClientContext> &clientCtx) {
     switch (clientCtx->state) {
-    case ClientContext::State::HANDSHAKE:
-    case ClientContext::State::REQUEST:
-    case ClientContext::State::SSH_SERVER_CONNECTING:
-    case ClientContext::State::SSH_SERVER_AUTHENTICATE:
-    case ClientContext::State::SSH_CHANNEL_CREATING:
-    case ClientContext::State::FORWARDING:
-        clientCtx->state = ClientContext::State::CHANNEL_CLOSING;
-        break;
-    case ClientContext::State::CHANNEL_CLOSING:
-        break;
-    default:
-        abort();
-        break;
+        case ClientContext::State::HANDSHAKE:
+        case ClientContext::State::REQUEST:
+        case ClientContext::State::SSH_SERVER_CONNECTING:
+        case ClientContext::State::SSH_SERVER_AUTHENTICATE:
+        case ClientContext::State::SSH_CHANNEL_CREATING:
+        case ClientContext::State::FORWARDING:
+            clientCtx->state = ClientContext::State::CHANNEL_CLOSING;
+            break;
+        case ClientContext::State::CHANNEL_CLOSING:
+            break;
+        default:
+            abort();
+            break;
     }
 
     if (clientCtx->sshContext == nullptr) {
@@ -1100,7 +1494,7 @@ void SSHProxy::closeAllConnection() {
         serverFd = -1;
     }
 
-    for (const auto &socketFd : clients | std::views::keys) {
+    for (const auto &socketFd: clients | std::views::keys) {
         close(socketFd);
     }
     clients.clear();

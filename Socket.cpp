@@ -1,0 +1,328 @@
+//
+// Created by vadim on 28.01.2026.
+//
+
+#include "Socket.h"
+
+#include <system_error>
+#include <cerrno>
+#include <cassert>
+#include <span>
+#include <iostream>
+#include <cstring>
+#include <utility>
+
+#include <sys/socket.h>
+#include <poll.h>
+#include <unistd.h>
+#include <sys/epoll.h>
+
+Socket::Socket() : fd_(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)) {
+}
+
+Socket::Socket(const int fd) : fd_(fd) {
+}
+
+Socket::~Socket() {
+    std::cout << "Socket::~Socket()\n";
+    close();
+}
+
+void Socket::setReusePort(const bool reusePort) {
+    const int reuse = reusePort ? 1 : 0;
+    if (setsockopt(fd_.get(), SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0) {
+        throw std::system_error(errno, std::system_category(), "socket port reuse failed");
+    }
+}
+
+void Socket::close() noexcept {
+    fd_.reset(-1);
+}
+
+ConnectSocketAwaiter Socket::connect(Endpoint endpoint) {
+    return {shared_from_this(), std::move(endpoint)};
+}
+
+int Socket::fd() const noexcept {
+    return fd_.get();
+}
+
+bool Socket::bind(const Endpoint &endpoint) const noexcept {
+    try {
+        auto [storage, len] = endpoint.sockaddrStorage();
+        return ::bind(fd_.get(), reinterpret_cast<const sockaddr *>(&storage), len) == 0;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+ListenSocketAwaiter Socket::listen() const {
+    ::listen(fd_.get(), SOMAXCONN);
+    return ListenSocketAwaiter(fd_.get());
+}
+
+ListenSocketAwaiter::ListenSocketAwaiter(const int fd_) : fd(fd_) {
+    if (fd_ == -1) {
+        throw std::runtime_error("Invalid socket descriptor");
+    }
+}
+
+bool ListenSocketAwaiter::await_ready() const noexcept {
+    return false;
+}
+
+void ListenSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
+    assert(this->getScheduler() != nullptr);
+    this->getScheduler()->add(EpollScheduler::PollEvents::EPOLLIN, fd, h);
+}
+
+AcceptedSocket ListenSocketAwaiter::await_resume() {
+    sockaddr_storage addr{};
+    socklen_t socklen = sizeof(addr);
+    const int socketFd = accept4(fd, reinterpret_cast<sockaddr *>(&addr), &socklen, SOCK_NONBLOCK);
+    if (socketFd == -1) {
+        throw std::system_error(errno,
+                                std::system_category(),
+                                "accept4 failed");
+    }
+
+    if (addr.ss_family == AF_INET6) {
+        sockaddr_in6 addr6{};
+        std::memcpy(&addr6, &addr, sizeof(sockaddr_in6));
+        return {std::make_shared<Socket>(socketFd), Endpoint(addr6)};
+    } else {
+        // Default to IPv4 (for AF_INET or unknown)
+        sockaddr_in addr4{};
+        std::memcpy(&addr4, &addr, sizeof(sockaddr_in));
+        return {std::make_shared<Socket>(socketFd), Endpoint(addr4)};
+    }
+}
+
+ReadSocketAwaiter Socket::read(std::span<unsigned char> buffer) {
+    return {shared_from_this(), buffer};
+}
+
+WriteSocketAwaiter Socket::write(std::span<unsigned char> buffer) {
+    return {shared_from_this(), buffer};
+}
+
+ReadSocketAwaiter::ReadSocketAwaiter(SocketPtr socket_, const std::span<unsigned char> buffer_) : socket(std::move(socket_)),
+    buffer(buffer_) {
+    if (!socket || socket->fd() == -1) {
+        throw std::runtime_error("Invalid socket descriptor");
+    }
+    if (buffer_.empty()) {
+        throw std::runtime_error("Buffer is empty");
+    }
+}
+
+bool ReadSocketAwaiter::await_ready() const noexcept {
+    // Check if data is available immediately without blocking
+    while (true) {
+        unsigned char tmp;
+        const ssize_t result = recv(socket->fd(), &tmp, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (result > 0) {
+            return true; // Data available immediately
+        }
+        if (result == 0) {
+            // Connection closed (EOF) - ready to read 0 bytes
+            peekEof = true;
+            return true;
+        }
+        // result < 0: error
+        const int err = errno;
+        if (err == EINTR) {
+            continue; // Interrupted by signal, retry
+        }
+        if (err == EAGAIN || err == EWOULDBLOCK) {
+            return false; // No data available, suspend
+        }
+        // Fatal error
+        peekErrno = err;
+        return true;
+    }
+}
+
+void ReadSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
+    assert(this->getScheduler() != nullptr);
+    this->getScheduler()->add(EpollScheduler::PollEvents::EPOLLIN, socket->fd(), h);
+}
+
+size_t ReadSocketAwaiter::await_resume() {
+    if (peekErrno != 0) {
+        throw std::system_error(peekErrno, std::system_category(), "recv failed");
+    }
+    if (peekEof) {
+        return 0; // Connection closed
+    }
+
+    while (true) {
+        const ssize_t bytesRead = recv(socket->fd(), buffer.data(), buffer.size(), 0);
+        if (bytesRead < 0) {
+            if (errno == EINTR) {
+                continue; // Interrupted by signal, retry
+            }
+            // Other errors (including EAGAIN/EWOULDBLOCK) are unexpected
+            // after epoll reported readiness
+            throw std::system_error(errno,
+                                    std::system_category(),
+                                    "recv failed");
+        }
+        // bytesRead == 0 indicates EOF (connection closed)
+        return static_cast<size_t>(bytesRead);
+    }
+}
+
+WriteSocketAwaiter::WriteSocketAwaiter(SocketPtr socket_, const std::span<unsigned char> buffer_) : socket(std::move(socket_)),
+    buffer(buffer_) {
+}
+
+bool WriteSocketAwaiter::await_ready() const noexcept {
+    while (true) {
+        pollfd pfd{};
+        pfd.fd = socket->fd();
+        pfd.events = POLLOUT;
+        const int result = poll(&pfd, 1, 0);
+        if (result < 0) {
+            const int err = errno;
+            if (err == EINTR) {
+                continue; // Interrupted by signal, retry
+            }
+            // poll() error
+            pollErrno = err;
+            pollError = true;
+            return true;
+        }
+        if (result > 0) {
+            pollRevents = pfd.revents;
+            // Ready if socket is writable OR has an error condition
+            if (pfd.revents & POLLOUT) {
+                return true;
+            }
+            // Check for error conditions
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+void WriteSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
+    assert(this->getScheduler() != nullptr);
+    this->getScheduler()->add(EpollScheduler::PollEvents::EPOLLOUT, socket->fd(), h);
+}
+
+size_t WriteSocketAwaiter::await_resume() {
+    if (pollError) {
+        throw std::system_error(pollErrno, std::system_category(), "poll failed");
+    }
+
+    // Check for socket errors reported by poll
+    if (pollRevents & (POLLERR | POLLHUP | POLLNVAL)) {
+        int sockerr = 0;
+        socklen_t sockerr_len = sizeof(sockerr);
+        if (getsockopt(socket->fd(), SOL_SOCKET, SO_ERROR, &sockerr, &sockerr_len) < 0) {
+            throw std::system_error(errno, std::system_category(), "getsockopt failed");
+        }
+        if (sockerr != 0) {
+            throw std::system_error(sockerr, std::system_category(), "socket error");
+        }
+        // If getsockopt succeeded but sockerr is 0, fall through to normal send
+    }
+
+    size_t totalSent = 0;
+    while (totalSent < buffer.size()) {
+        const ssize_t sent = send(socket->fd(), buffer.data() + totalSent, buffer.size() - totalSent,
+                                  MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (sent < 0) {
+            if (errno == EINTR) {
+                continue; // Interrupted by signal, retry
+            }
+            // Other errors (including EAGAIN/EWOULDBLOCK) are unexpected
+            // after epoll reported readiness or await_ready() returned true
+            throw std::system_error(errno,
+                                    std::system_category(),
+                                    "send failed");
+        }
+        if (sent == 0) {
+            // No progress, avoid infinite loop
+            break;
+        }
+        totalSent += static_cast<size_t>(sent);
+    }
+    return totalSent;
+}
+
+ConnectSocketAwaiter::ConnectSocketAwaiter(SocketPtr socket_, Endpoint endpoint_) : socket(std::move(socket_)),
+    endpoint(endpoint_) {
+    if (!socket || socket->fd() == -1) {
+        throw std::runtime_error("Invalid socket descriptor");
+    }
+}
+
+bool ConnectSocketAwaiter::await_ready() const noexcept {
+    try {
+        auto [storage, len] = endpoint.sockaddrStorage();
+
+        while (true) {
+            const int result = connect(socket->fd(),
+                                       reinterpret_cast<const sockaddr *>(&storage),
+                                       len);
+            if (result == 0) {
+                // Connection succeeded immediately
+                return true;
+            }
+
+            const int err = errno;
+            if (err == EINTR) {
+                continue; // Interrupted by signal, retry
+            }
+
+            if (err == EINPROGRESS || err == EALREADY) {
+                // Connection in progress, need to wait
+                connectPending = true;
+                return false;
+            }
+
+            if (err == EISCONN) {
+                // Socket already connected
+                return true;
+            }
+
+            // Other error (e.g., ECONNREFUSED, ENETUNREACH, etc.)
+            connectErrno = err;
+            return true; // Ready with error (will throw in await_resume)
+        }
+    } catch (const std::exception&) {
+        // Invalid endpoint for socket operation (e.g., hostname)
+        connectErrno = EINVAL;
+        return true;
+    }
+}
+
+void ConnectSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
+    assert(this->getScheduler() != nullptr);
+    // Register for write readiness (connection completion) and error events
+    this->getScheduler()->add(EpollScheduler::PollEvents::EPOLLOUT | EPOLLERR, socket->fd(), h);
+}
+
+void ConnectSocketAwaiter::await_resume() {
+    if (connectErrno != 0) {
+        throw std::system_error(connectErrno, std::system_category(), "connect failed");
+    }
+
+    if (connectPending) {
+        // Check socket error status using getsockopt(SO_ERROR)
+        int sockerr = 0;
+        socklen_t sockerr_len = sizeof(sockerr);
+        if (getsockopt(socket->fd(), SOL_SOCKET, SO_ERROR, &sockerr, &sockerr_len) < 0) {
+            throw std::system_error(errno, std::system_category(), "getsockopt failed");
+        }
+        if (sockerr != 0) {
+            throw std::system_error(sockerr, std::system_category(), "connect failed");
+        }
+        // Connection successful
+    }
+    // If connect succeeded immediately (await_ready returned true), nothing to check
+}

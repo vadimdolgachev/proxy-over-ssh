@@ -57,6 +57,10 @@ add_executable(proxy_over_ssh main.cpp
         SSHProxy.cpp
         SSHProxy.h
         CoroTask.h
+        Socket.cpp
+        Socket.h
+        Endpoint.cpp
+        Endpoint.h
 )
 target_link_libraries(proxy_over_ssh PRIVATE
         OpenSSL::Crypto
@@ -64,7 +68,7 @@ target_link_libraries(proxy_over_ssh PRIVATE
         libssh2
 )
 #target_link_options(proxy_over_ssh PUBLIC -fsanitize=address)
-target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion -Wsign-conversion -Wnull-dereference -Wno-unused-variable -Wno-unused-parameter -Wno-unused-private-field -fno-omit-frame-pointer)
+target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion -Wsign-conversion -Wnull-dereference -Wno-unused-variable -Wno-unused-parameter -Wno-unused-private-field -Werror=uninitialized -fno-omit-frame-pointer)
 
 if(ANDROID)
     message("ANDROID_ABI=${ANDROID_ABI}")
