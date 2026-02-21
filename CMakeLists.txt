@@ -59,6 +59,8 @@ add_executable(proxy_over_ssh main.cpp
         CoroTask.h
         Socket.cpp
         Socket.h
+        SshSocket.cpp
+        SshSocket.h
         Endpoint.cpp
         Endpoint.h
 )

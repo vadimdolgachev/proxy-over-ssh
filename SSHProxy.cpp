@@ -16,6 +16,7 @@
 #include <span>
 #include <string>
 #include <cstdint>
+#include <limits>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -25,6 +26,10 @@
 
 #include "CoroTask.h"
 #include "Socket.h"
+#include "SshSocket.h"
+
+// SOCKS Protocol Version 5 Documentation
+// https://datatracker.ietf.org/doc/html/rfc1928
 
 namespace {
     bool checkConnection(const int fd) {
@@ -48,7 +53,7 @@ namespace {
 
 constexpr int BUFFER_SIZE = 2 * 8192;
 constexpr int MAX_SIZE_SESSION_POOL = 25;
-constexpr bool PRINT_VERBOSE_LOG = false;
+constexpr bool PRINT_VERBOSE_LOG = true;
 
 template<typename... Args>
 void log_d(std::format_string<Args...> fmt, Args &&... args) {
@@ -655,18 +660,15 @@ struct ClientContext2 final {
 
     static constexpr size_t kInitialBufferSize = 1024;
 
-    ClientContext2(const Endpoint endpoint_, SocketPtr socket_, std::vector<uint8_t> buffer_)
-        : endpoint(endpoint_),
-          socket(std::move(socket_)),
-          buffer(std::move(buffer_)) {
+    ClientContext2(Endpoint endpoint_, SocketPtr socket_)
+        : endpoint(std::move(endpoint_)),
+          socket(std::move(socket_)) {
     }
 
-    // Delete copy operations (socket is shared_ptr, but prevent accidental copies)
     ClientContext2(const ClientContext2 &) = delete;
 
     ClientContext2 &operator=(const ClientContext2 &) = delete;
 
-    // Allow move operations
     ClientContext2(ClientContext2 &&) = default;
 
     ClientContext2 &operator=(ClientContext2 &&) = default;
@@ -703,51 +705,116 @@ struct ClientContext2 final {
     }
 
     Endpoint endpoint;
+    Endpoint targetEndpoint;
     SocketPtr socket;
     std::vector<uint8_t> buffer;
-    Endpoint targetEndpoint;
 
 private:
     State state = State::HANDSHAKE;
 };
 
+namespace {
+    // Safe integer addition with overflow check (static storage duration)
+    constexpr size_t safeAdd(const size_t a, const size_t b) {
+        if (a > std::numeric_limits<size_t>::max() - b) {
+            throw std::runtime_error("Integer overflow in size calculation");
+        }
+        return a + b;
+    }
+
+    CoroTask<void> readUntil(const std::shared_ptr<ClientContext2> clientCtx, const size_t totalSize) {
+        // Validate buffer is large enough for requested read
+        if (clientCtx->buffer.size() < totalSize) {
+            throw std::runtime_error("Buffer too small for requested read size");
+        }
+
+        size_t totalRead = 0;
+        while (totalRead < totalSize) {
+            // Ensure we don't read past buffer bounds
+            const size_t remaining = clientCtx->buffer.size() - totalRead;
+            const size_t read = co_await clientCtx->socket->read({
+                clientCtx->buffer.data() + totalRead,
+                remaining
+            });
+            if (read == 0) {
+                throw std::runtime_error("Connection closed during read");
+            }
+            // Defensive: socket should not return more bytes than requested
+            if (read > remaining) {
+                throw std::runtime_error("Socket read overflow");
+            }
+            totalRead = safeAdd(totalRead, read);
+        }
+    }
+} // namespace
+
+
+// SOCKS5 negotiation header (RFC 1928)
+//+----+----------+----------+
+//|VER | NMETHODS | METHODS  |
+//+----+----------+----------+
+//| 1  |    1     | 1 to 255 |
+//+----+----------+----------+
+struct Socks5Negotiation final {
+    static constexpr uint8_t kMaxMethods = 16; // Reasonable limit for authentication methods
+
+    uint8_t version = {};
+    uint8_t nmethodLength = {};
+    std::span<const uint8_t> nmethodsData;
+
+
+    static CoroTask<Socks5Negotiation> parse(const std::shared_ptr<ClientContext2> clientCtx) {
+        Socks5Negotiation result;
+
+        // Read 2-byte header (version + nmethodLength)
+        constexpr size_t kHeaderSize = 2;
+        clientCtx->buffer.resize(kHeaderSize);
+        co_await readUntil(clientCtx, kHeaderSize);
+
+        result.version = clientCtx->buffer[0];
+        result.nmethodLength = clientCtx->buffer[1];
+
+        // Validate version early (though also checked later)
+        if (result.version != Socks5::Version) {
+            throw std::runtime_error("SOCKS5 version mismatch");
+        }
+
+        // Validate nmethodLength is reasonable
+        if (result.nmethodLength == 0) {
+            // Client offers no authentication methods (valid but we can't accept)
+            result.nmethodsData = {};
+            co_return result;
+        }
+
+        // Boundary check: ensure nmethodLength doesn't cause integer overflow
+        if (result.nmethodLength > kMaxMethods) {
+            throw std::runtime_error("SOCKS5 handshake: too many authentication methods");
+        }
+
+        // Read authentication methods
+        clientCtx->buffer.resize(result.nmethodLength);
+        co_await readUntil(clientCtx, result.nmethodLength);
+        result.nmethodsData = {clientCtx->buffer.data(), result.nmethodLength};
+        co_return result;
+    }
+};
+
 CoroTask<void> handleSocks5Handshake(const std::shared_ptr<ClientContext2> clientCtx) {
-    size_t length = co_await clientCtx->socket->read({clientCtx->buffer.data(), clientCtx->buffer.size()});
-    std::cout << "length: " << length << '\n';
+    const auto negotiation = co_await Socks5Negotiation::parse(clientCtx);
 
-    // Minimum handshake: VER(1) + NMETHODS(1)
-    if (length < 2) {
-        throw std::runtime_error("SOCKS5 handshake too short");
-    }
-
-    const uint8_t version = clientCtx->buffer[0];
-    const uint8_t nmethodLength = clientCtx->buffer[1];
-    std::cout << "version: " << static_cast<int>(version) << ", nmethodLength: " << static_cast<int>(nmethodLength) <<
-            '\n';
-
-    if (version != Socks5::Version) {
-        throw std::runtime_error("SOCKS5 version mismatch");
-    }
-    constexpr size_t nmethodsPos = 2;
-    // Validate we received all methods bytes
-    if (length < nmethodsPos + nmethodLength) {
-        throw std::runtime_error("SOCKS5 handshake incomplete");
-    }
-
-    std::span<const uint8_t> nmethodsData = {&clientCtx->buffer[nmethodsPos], nmethodLength};
     // Scan methods for NoAuth (0x00)
-    const bool hasNoAuth = std::ranges::find_if(nmethodsData, [](const auto c) {
+    const bool hasNoAuth = std::ranges::find_if(negotiation.nmethodsData, [](const auto c) {
         return c == Socks5::Auth::NoAuth;
-    }) != nmethodsData.end();
+    }) != negotiation.nmethodsData.end();
 
     // Determine selected method (0x00=NoAuth, 0xFF=no acceptable method)
     const uint8_t selectedMethod = hasNoAuth ? Socks5::Auth::NoAuth : 0xFF;
 
     // Always send response first (RFC 1928 requirement)
+    clientCtx->buffer.resize(2);
     clientCtx->buffer[0] = Socks5::Version;
     clientCtx->buffer[1] = selectedMethod;
-    clientCtx->buffer.resize(2);
-    length = co_await clientCtx->socket->write({clientCtx->buffer.data(), clientCtx->buffer.size()});
+    const size_t length = co_await clientCtx->socket->write({clientCtx->buffer.data(), clientCtx->buffer.size()});
     if (length != clientCtx->buffer.size()) {
         throw std::runtime_error("Failed to write to client");
     }
@@ -759,6 +826,23 @@ CoroTask<void> handleSocks5Handshake(const std::shared_ptr<ClientContext2> clien
 
     // Handshake successful, transition to REQUEST state
     clientCtx->setState(ClientContext2::State::REQUEST);
+}
+
+// Helper: write all data, handling partial writes
+static CoroTask<void> writeAll(const SocketPtr &socket, std::span<const uint8_t> data) {
+    size_t offset = 0;
+    while (offset < data.size()) {
+        // Socket::write expects non-const span, need to cast
+        const size_t written = co_await socket->write({
+            const_cast<uint8_t *>(data.data()) + offset,
+            data.size() - offset
+        });
+        if (written == 0) {
+            throw std::runtime_error("Socket closed during write");
+        }
+        offset += written;
+    }
+    co_return;
 }
 
 // SOCKS5 request header (RFC 1928)
@@ -774,13 +858,83 @@ struct Socks5Request final {
     uint8_t cmd;
     uint8_t rsv;
     uint8_t atyp;
+    Endpoint targetEndpoint;
 
-    static Socks5Request deserialize(const uint8_t *buffer) {
-        return Socks5Request{
-            .version = buffer[0],
-            .cmd = buffer[1],
-            .rsv = buffer[2],
-            .atyp = buffer[3]
+    static CoroTask<Socks5Request> readRequest(const std::shared_ptr<ClientContext2> clientCtx) {
+        // Helper lambda: read exactly 'n' bytes into buffer at current offset
+        auto readBytes = [&clientCtx](auto &buffer, size_t &offset, const size_t n) -> CoroTask<void> {
+            buffer.resize(offset + n);
+            while (offset < buffer.size()) {
+                const size_t read = co_await clientCtx->socket->read({buffer.data() + offset, buffer.size() - offset});
+                if (read == 0) {
+                    throw std::runtime_error("Socket closed during SOCKS5 request");
+                }
+                offset += read;
+            }
+        };
+
+        size_t offset = 0;
+
+        // Read header (4 bytes)
+        co_await readBytes(clientCtx->buffer, offset, kHeaderSize);
+
+        const uint8_t version = clientCtx->buffer[0];
+        const uint8_t cmd = clientCtx->buffer[1];
+        const uint8_t rsv = clientCtx->buffer[2];
+        const uint8_t atyp = clientCtx->buffer[3];
+
+        if (rsv != 0) {
+            throw std::runtime_error("Invalid SOCKS5 request: RSV must be 0");
+        }
+        if (version != Socks5::Version || cmd != Socks5::Cmd::Connect) {
+            throw std::runtime_error("Unsupported SOCKS5 version or command");
+        }
+
+        Endpoint targetEndpoint;
+        switch (atyp) {
+            case Socks5::Atyp::IpV4: {
+                co_await readBytes(clientCtx->buffer, offset, 6); // 4 bytes IPv4 + 2 bytes port
+                sockaddr_in addr{};
+                addr.sin_family = AF_INET;
+                std::memcpy(&addr.sin_addr, &clientCtx->buffer[4], sizeof(in_addr));
+                addr.sin_port = htons(static_cast<uint16_t>(clientCtx->buffer[8] << 8) | clientCtx->buffer[9]);
+                targetEndpoint = Endpoint(addr);
+                break;
+            }
+
+            case Socks5::Atyp::Domain: {
+                // Read domain length byte
+                co_await readBytes(clientCtx->buffer, offset, 1);
+                const uint8_t domainLen = clientCtx->buffer[4];
+                // Read domain + port
+                co_await readBytes(clientCtx->buffer, offset, domainLen + 2);
+                std::string targetHost = std::string(reinterpret_cast<const char *>(&clientCtx->buffer[5]), domainLen);
+                uint16_t targetPort = static_cast<uint16_t>(clientCtx->buffer[5 + domainLen] << 8) |
+                                      clientCtx->buffer[5 + domainLen + 1];
+                targetEndpoint = Endpoint(targetHost, targetPort);
+                break;
+            }
+
+            case Socks5::Atyp::IpV6: {
+                co_await readBytes(clientCtx->buffer, offset, 18); // 16 bytes IPv6 + 2 bytes port
+                sockaddr_in6 addr6{};
+                addr6.sin6_family = AF_INET6;
+                std::memcpy(&addr6.sin6_addr, &clientCtx->buffer[4], sizeof(in6_addr));
+                addr6.sin6_port = htons(static_cast<uint16_t>(clientCtx->buffer[20] << 8) | clientCtx->buffer[21]);
+                targetEndpoint = Endpoint(addr6);
+                break;
+            }
+
+            default:
+                throw std::runtime_error("Unsupported SOCKS5 address type");
+        }
+
+        co_return Socks5Request{
+            .version = version,
+            .cmd = cmd,
+            .rsv = rsv,
+            .atyp = atyp,
+            .targetEndpoint = targetEndpoint
         };
     }
 };
@@ -836,8 +990,9 @@ struct Socks5Response final {
         return resp;
     }
 
-    // Create dummy IPv4 response (0.0.0.0)
-    static Socks5Response dummy(uint16_t port) {
+    // Create success response with IPv4 any address (0.0.0.0)
+    // Used when the bound address is not relevant (e.g., SOCKS5 tunneling proxy)
+    static Socks5Response ipv4Any(const uint16_t port) {
         return ipv4(0, port);
     }
 
@@ -867,12 +1022,12 @@ struct Socks5Response final {
     }
 
     // Serialize to buffer
-    void serialize(uint8_t *buffer) const {
+    void serialize(std::span<uint8_t> buffer) const {
         buffer[0] = version;
         buffer[1] = rep;
         buffer[2] = rsv;
         buffer[3] = atyp;
-        std::memcpy(buffer + kHeaderSize, bndAddr.data(), bndAddr.size());
+        std::memcpy(buffer.data() + kHeaderSize, bndAddr.data(), bndAddr.size());
         const size_t portOffset = kHeaderSize + bndAddr.size();
         buffer[portOffset] = static_cast<uint8_t>(bndPort >> 8);
         buffer[portOffset + 1] = static_cast<uint8_t>(bndPort & 0xFF);
@@ -881,142 +1036,110 @@ struct Socks5Response final {
     // Serialize to vector
     [[nodiscard]] std::vector<uint8_t> serialize() const {
         std::vector<uint8_t> result(size());
-        serialize(result.data());
+        serialize(result);
         return result;
+    }
+
+    // Serialize directly into buffer (resizes buffer first)
+    void serializeTo(std::vector<uint8_t> &buffer) const {
+        buffer.resize(size());
+        serialize(buffer);
     }
 };
 
 CoroTask<void> handleSocks5Request(const std::shared_ptr<ClientContext2> clientCtx) {
-    // Ensure buffer is ready for reading request
-    clientCtx->buffer.resize(ClientContext2::kInitialBufferSize);
-
-    // Read at least 5 bytes to determine request length
-    size_t length = 0;
-    while (length < 5) {
-        const size_t read = co_await clientCtx->socket->read({
-            clientCtx->buffer.data() + length, clientCtx->buffer.size() - length
-        });
-        if (read == 0) {
-            throw std::runtime_error("Socket closed during SOCKS5 request");
-        }
-        length += read;
-    }
-
-    // Parse SOCKS5 request
-    const auto req = Socks5Request::deserialize(clientCtx->buffer.data());
-    if (req.rsv != 0) {
-        throw std::runtime_error("Invalid SOCKS5 request: RSV must be 0");
-    }
-
-    if (req.version != Socks5::Version || req.cmd != Socks5::Cmd::Connect) {
-        throw std::runtime_error("Unsupported SOCKS5 version or command");
-    }
-
-    [[maybe_unused]] ssize_t requestLen = 0;
-    Endpoint targetEndpoint;
-
-    switch (req.atyp) {
-        case Socks5::Atyp::IpV4:
-            if (length < 10) {
-                // Need more bytes
-                const size_t needed = 10 - length;
-                const size_t read = co_await clientCtx->socket->read({
-                    clientCtx->buffer.data() + length, clientCtx->buffer.size() - length
-                });
-                if (read < needed) {
-                    throw std::runtime_error("Incomplete IPv4 SOCKS5 request");
-                }
-                length += read;
-            } {
-                sockaddr_in addr{};
-                addr.sin_family = AF_INET;
-                std::memcpy(&addr.sin_addr, &clientCtx->buffer[4], sizeof(in_addr));
-                addr.sin_port = htons(static_cast<uint16_t>(clientCtx->buffer[8] << 8) | clientCtx->buffer[9]);
-                targetEndpoint = Endpoint(addr);
-            }
-            requestLen = 10;
-            break;
-
-        case Socks5::Atyp::Domain: {
-            const uint8_t domainLen = clientCtx->buffer[4];
-            if (length < static_cast<size_t>(5 + domainLen + 2)) {
-                const size_t needed = 5 + domainLen + 2 - length;
-                const size_t read = co_await clientCtx->socket->read({
-                    clientCtx->buffer.data() + length, clientCtx->buffer.size() - length
-                });
-                if (read < needed) {
-                    throw std::runtime_error("Incomplete domain SOCKS5 request");
-                }
-                length += read;
-            }
-            std::string targetHost = std::string(reinterpret_cast<const char *>(&clientCtx->buffer[5]), domainLen);
-            uint16_t targetPort = static_cast<uint16_t>(clientCtx->buffer[5 + domainLen] << 8) |
-                                  clientCtx->buffer[5 + domainLen + 1];
-            targetEndpoint = Endpoint(targetHost, targetPort);
-            requestLen = 5 + domainLen + 2;
-        }
-        break;
-
-        case Socks5::Atyp::IpV6:
-            if (length < 22) {
-                const size_t needed = 22 - length;
-                const size_t read = co_await clientCtx->socket->read({
-                    clientCtx->buffer.data() + length, clientCtx->buffer.size() - length
-                });
-                if (read < needed) {
-                    throw std::runtime_error("Incomplete IPv6 SOCKS5 request");
-                }
-                length += read;
-            } {
-                sockaddr_in6 addr6{};
-                addr6.sin6_family = AF_INET6;
-                std::memcpy(&addr6.sin6_addr, &clientCtx->buffer[4], sizeof(in6_addr));
-                addr6.sin6_port = htons(static_cast<uint16_t>(clientCtx->buffer[20] << 8) | clientCtx->buffer[21]);
-                targetEndpoint = Endpoint(addr6);
-            }
-            requestLen = 22;
-            break;
-
-        default:
-            throw std::runtime_error("Unsupported SOCKS5 address type");
-    }
-
+    const auto req = co_await Socks5Request::readRequest(clientCtx);
     // Store target information
-    clientCtx->targetEndpoint = std::move(targetEndpoint);
+    clientCtx->targetEndpoint = req.targetEndpoint;
 
-    // Send success response (dummy IPv4 0.0.0.0)
-    const auto response = Socks5Response::dummy(clientCtx->targetEndpoint.port());
-    clientCtx->buffer = response.serialize();
+    // Send success response with IPv4 any address (0.0.0.0) and bound port
+    // Serialize directly into client context buffer (no extra allocation)
+    Socks5Response::ipv4Any(clientCtx->targetEndpoint.port()).serializeTo(clientCtx->buffer);
 
-    if (const size_t written = co_await clientCtx->socket->write({clientCtx->buffer.data(), clientCtx->buffer.size()});
-        written != clientCtx->buffer.size()) {
-        throw std::runtime_error("Failed to send SOCKS5 response");
-    }
+    // Write all response bytes
+    co_await writeAll(clientCtx->socket, {clientCtx->buffer.data(), clientCtx->buffer.size()});
 
     // Transition to SSH_SOCKET_CONNECT state
     clientCtx->setState(ClientContext2::State::SSH_SOCKET_CONNECT);
     std::cout << "SOCKS5 request processed: " << clientCtx->targetEndpoint.toString() << '\n';
 }
 
+// Bidirectional data forwarding
+// Reads from both directions and forwards data
+static CoroTask<void> forwardData(const std::shared_ptr<ClientContext2> clientCtx, const std::shared_ptr<SshSocket> sshSocket) {
+    clientCtx->setState(ClientContext2::State::FORWARDING);
+    std::cout << "Starting bidirectional forwarding\n";
+
+    constexpr size_t kBufferSize = 8192;
+    std::vector<uint8_t> buffer(kBufferSize);
+
+    while (clientCtx->isState(ClientContext2::State::FORWARDING)) {
+        // Read from client, forward to SSH
+        const size_t clientRead = co_await clientCtx->socket->read(buffer);
+        if (clientRead == 0) {
+            std::cout << "Client closed connection\n";
+            break;
+        }
+        std::cout << "Read " << clientRead << " bytes from client\n";
+
+        // Write to SSH
+        size_t sshWritten = 0;
+        while (sshWritten < clientRead) {
+            const size_t chunk = co_await sshSocket->write({buffer.data() + sshWritten, clientRead - sshWritten});
+            if (chunk == 0) {
+                throw std::runtime_error("SSH channel closed during write");
+            }
+            sshWritten += chunk;
+        }
+        std::cout << "Wrote " << sshWritten << " bytes to SSH\n";
+
+        // Read from SSH, forward to client
+        const size_t sshRead = co_await sshSocket->read(buffer);
+        if (sshRead == 0) {
+            std::cout << "SSH channel closed\n";
+            break;
+        }
+        std::cout << "Read " << sshRead << " bytes from SSH\n";
+
+        // Write to client
+        co_await writeAll(clientCtx->socket, {buffer.data(), sshRead});
+        std::cout << "Wrote " << sshRead << " bytes to client\n";
+    }
+
+    std::cout << "Forwarding stopped, closing connection\n";
+    clientCtx->setState(ClientContext2::State::CLOSED);
+    clientCtx->closeSocket();
+    sshSocket->close();
+}
+
 CoroTask<void> startMainLoop(const ProxyConfig config) {
     Socket serverSocket;
     serverSocket.setReusePort(true);
-    std::cout << "listen port: " << config.listenPort + 1 << '\n';
-    if (!serverSocket.bind(Endpoint(config.listenPort + 1))) {
+    std::cout << "listen port: " << config.listenPort << '\n';
+    if (!serverSocket.bind(Endpoint(config.listenPort))) {
         throw std::runtime_error("Failed to bind server socket");
     }
     std::unordered_map<Endpoint, std::shared_ptr<ClientContext2> > clients;
     while (true) {
         auto [socket, endpoint] = co_await serverSocket.listen();
         std::cout << "new socket ip: " << endpoint.ipStr() << ", port: " << endpoint.port() << '\n';
-        auto client = std::make_shared<ClientContext2>(endpoint, socket,
-                                                       std::vector<uint8_t>(ClientContext2::kInitialBufferSize));
+        auto client = std::make_shared<ClientContext2>(endpoint, socket);
         clients.try_emplace(endpoint, client);
         try {
+            std::cout << "[1] Starting SOCKS5 handshake\n";
             co_await handleSocks5Handshake(client);
+            std::cout << "[2] Handshake complete, starting SOCKS5 request\n";
             co_await handleSocks5Request(client);
-            // For now, close connection after request processing
-            client->closeSocket();
+            std::cout << "[3] Request complete, connecting SSH\n";
+
+            auto sshSocket = std::make_shared<SshSocket>(config.ssh);
+            co_await sshSocket->connectAsync(client->targetEndpoint);
+            std::cout << "[4] SSH connected, starting data forwarding\n";
+
+            // Start bidirectional data forwarding
+            co_await forwardData(client, sshSocket);
+
+            std::cout << "[5] Forwarding complete\n";
             clients.erase(endpoint);
         } catch (const std::exception &e) {
             std::cout << "Error handling client: " << e.what() << '\n';
@@ -1027,6 +1150,9 @@ CoroTask<void> startMainLoop(const ProxyConfig config) {
 }
 
 void SSHProxy::mainLoop(const std::stop_token &stopToken) {
+    std::cout << "mainLoop: stopToken.stop_requested()=" << stopToken.stop_requested() << "\n";
+    std::cout << "mainLoop: stopSignalFlag=" << stopSignalFlag.load(std::memory_order_relaxed) << "\n";
+
     // Setup epoll
     if (setupEpoll() != ResultCode::Ok) {
         return;
@@ -1038,18 +1164,27 @@ void SSHProxy::mainLoop(const std::stop_token &stopToken) {
           config.value().ssh.port);
     log_d("Proxy started. Press Ctrl+C to stop...\n");
 
-    const auto isStopRequested = [stopToken, &flag = stopSignalFlag] {
-        return stopToken.stop_requested() || flag.load(std::memory_order_relaxed);
+    const auto isStopRequested = [stopToken, &flag = stopSignalFlag]() {
+        const bool stop = stopToken.stop_requested() || flag.load(std::memory_order_relaxed);
+        if (stop) {
+            std::cout << "isStopRequested: stopToken.stop_requested()=" << stopToken.stop_requested()
+                      << ", flag=" << flag.load(std::memory_order_relaxed) << "\n";
+        }
+        return stop;
     };
 
 #ifndef NDEBUG
+    // Coroutine-based implementation (debug builds)
     EpollScheduler sched(isStopRequested);
     const auto task = startMainLoop(config.value());
-    std::cout << "start\n";
+    std::cout << "Starting coroutine-based main loop\n";
     task.start(sched);
-    sched.run();
+    sched.run();  // Runs until stop requested
+    std::cout << "Coroutine-based main loop exited\n";
+    return;  // Don't run production loop in debug mode
 #endif
 
+    // Production epoll-based implementation (release builds)
     while (!isStopRequested()) {
         // Setup local server
         if (!setupLocalServer()) {
@@ -1316,16 +1451,16 @@ void SSHProxy::handleSocks5Request(const std::shared_ptr<ClientContext> &clientC
     }
 
     // Parse SOCKS5 request
-    const auto req = Socks5Request::deserialize(clientCtx->readBuffer.data());
-    if (req.rsv != 0) {
+    const auto version = clientCtx->readBuffer[0];
+    const auto cmd = clientCtx->readBuffer[1];
+    const auto rsv = clientCtx->readBuffer[2];
+    const auto atyp = clientCtx->readBuffer[3];
+
+    if (rsv != 0) {
         log_d("{}, Invalid SOCKS5 request: RSV must be 0\n", clientCtx->fd);
         closeConnection(clientCtx);
         return;
     }
-    const uint8_t version = req.version;
-    const uint8_t cmd = req.cmd;
-    const uint8_t atyp = req.atyp;
-
     if (version != Socks5::Version || cmd != Socks5::Cmd::Connect) {
         log_d("{}, Unsupported socks5 version\n", clientCtx->fd);
         closeConnection(clientCtx);

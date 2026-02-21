@@ -59,13 +59,9 @@ public:
     [[nodiscard]] std::pair<sockaddr_storage, socklen_t> sockaddrStorage() const;
 
 private:
-    struct IPv4Addr {
-        sockaddr_in addr{};
-    };
+    using IPv4Addr = sockaddr_in;
 
-    struct IPv6Addr {
-        sockaddr_in6 addr{};
-    };
+    using IPv6Addr = sockaddr_in6;
 
     struct HostnameAddr {
         std::string host;
@@ -84,34 +80,6 @@ struct std::hash<Endpoint> {
     size_t operator()(const Endpoint &endpoint) const noexcept;
 };
 
-inline bool operator==(const Endpoint &lhs, const Endpoint &rhs) noexcept {
-    if (lhs.type() != rhs.type()) {
-        return false;
-    }
-
-    if (lhs.port() != rhs.port()) {
-        return false;
-    }
-
-    if (lhs.isIPv4()) {
-        const auto &lhsAddr = std::get<Endpoint::IPv4Addr>(lhs.storage);
-        const auto &rhsAddr = std::get<Endpoint::IPv4Addr>(rhs.storage);
-        return lhsAddr.addr.sin_addr.s_addr == rhsAddr.addr.sin_addr.s_addr;
-    }
-
-    if (lhs.isIPv6()) {
-        const auto &lhsAddr = std::get<Endpoint::IPv6Addr>(lhs.storage);
-        const auto &rhsAddr = std::get<Endpoint::IPv6Addr>(rhs.storage);
-        return memcmp(&lhsAddr.addr.sin6_addr, &rhsAddr.addr.sin6_addr, sizeof(in6_addr)) == 0;
-    }
-
-    if (lhs.isHostname()) {
-        const auto &lhsAddr = std::get<Endpoint::HostnameAddr>(lhs.storage);
-        const auto &rhsAddr = std::get<Endpoint::HostnameAddr>(rhs.storage);
-        return lhsAddr.host == rhsAddr.host;
-    }
-
-    return false;
-}
+bool operator==(const Endpoint &lhs, const Endpoint &rhs) noexcept;
 
 #endif //PROXY_OVER_SSH_ENDPOINT_H

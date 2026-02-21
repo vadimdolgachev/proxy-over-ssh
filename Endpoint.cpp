@@ -63,9 +63,9 @@ uint16_t Endpoint::port() const {
     return std::visit([](const auto &addr) -> uint16_t {
         using T = std::decay_t<decltype(addr)>;
         if constexpr (std::is_same_v<T, IPv4Addr>) {
-            return ntohs(addr.addr.sin_port);
+            return ntohs(addr.sin_port);
         } else if constexpr (std::is_same_v<T, IPv6Addr>) {
-            return ntohs(addr.addr.sin6_port);
+            return ntohs(addr.sin6_port);
         } else if constexpr (std::is_same_v<T, HostnameAddr>) {
             return addr.port;
         }
@@ -77,7 +77,7 @@ uint32_t Endpoint::ip() const {
         throw std::runtime_error("Endpoint::ip() called on non-IPv4 endpoint");
     }
     const auto &ipv4 = std::get<IPv4Addr>(storage);
-    return ntohl(ipv4.addr.sin_addr.s_addr);
+    return ntohl(ipv4.sin_addr.s_addr);
 }
 
 std::string Endpoint::ipStr() const {
@@ -88,12 +88,12 @@ std::string Endpoint::ipStr() const {
     if (isIPv4()) {
         const auto &ipv4 = std::get<IPv4Addr>(storage);
         std::array<char, INET_ADDRSTRLEN> ipStr = {};
-        inet_ntop(AF_INET, &ipv4.addr.sin_addr, ipStr.data(), INET_ADDRSTRLEN);
+        inet_ntop(AF_INET, &ipv4.sin_addr, ipStr.data(), INET_ADDRSTRLEN);
         return {ipStr.data()};
     } else {
         const auto &ipv6 = std::get<IPv6Addr>(storage);
         std::array<char, INET6_ADDRSTRLEN> ipStr = {};
-        inet_ntop(AF_INET6, &ipv6.addr.sin6_addr, ipStr.data(), INET6_ADDRSTRLEN);
+        inet_ntop(AF_INET6, &ipv6.sin6_addr, ipStr.data(), INET6_ADDRSTRLEN);
         return {ipStr.data()};
     }
 }
@@ -136,14 +136,14 @@ const sockaddr_in &Endpoint::sockaddr() const {
     if (!isIPv4()) {
         throw std::runtime_error("Endpoint::sockaddr() called on non-IPv4 endpoint");
     }
-    return std::get<IPv4Addr>(storage).addr;
+    return std::get<IPv4Addr>(storage);
 }
 
 const sockaddr_in6 &Endpoint::sockaddr6() const {
     if (!isIPv6()) {
         throw std::runtime_error("Endpoint::sockaddr6() called on non-IPv6 endpoint");
     }
-    return std::get<IPv6Addr>(storage).addr;
+    return std::get<IPv6Addr>(storage);
 }
 
 std::pair<sockaddr_storage, socklen_t> Endpoint::sockaddrStorage() const {
@@ -151,11 +151,11 @@ std::pair<sockaddr_storage, socklen_t> Endpoint::sockaddrStorage() const {
     socklen_t len = 0;
 
     if (isIPv4()) {
-        const auto &[addr] = std::get<IPv4Addr>(this->storage);
+        const auto &addr = std::get<IPv4Addr>(this->storage);
         std::memcpy(&storage_, &addr, sizeof(sockaddr_in));
         len = sizeof(sockaddr_in);
     } else if (isIPv6()) {
-        const auto &[addr] = std::get<IPv6Addr>(this->storage);
+        const auto &addr = std::get<IPv6Addr>(this->storage);
         std::memcpy(&storage_, &addr, sizeof(sockaddr_in6));
         len = sizeof(sockaddr_in6);
     } else {
@@ -166,29 +166,59 @@ std::pair<sockaddr_storage, socklen_t> Endpoint::sockaddrStorage() const {
 }
 
 size_t std::hash<Endpoint>::operator()(const Endpoint &endpoint) const noexcept {
-    std::hash<uint16_t> portHasher;
-    std::hash<int> typeHasher;
-    std::hash<uint32_t> ip4Hasher;
-    std::hash<uint64_t> ip6Hasher;
-    std::hash<std::string> stringHasher;
+    constexpr std::hash<uint16_t> portHasher;
+    constexpr std::hash<int> typeHasher;
 
     const size_t portHash = portHasher(endpoint.port());
     const size_t typeHash = typeHasher(static_cast<int>(endpoint.type()));
 
     if (endpoint.isIPv4()) {
+        constexpr std::hash<uint32_t> ip4Hasher;
         const auto &ipv4 = std::get<Endpoint::IPv4Addr>(endpoint.storage);
-        const uint32_t ip = ntohl(ipv4.addr.sin_addr.s_addr);
+        const uint32_t ip = ntohl(ipv4.sin_addr.s_addr);
         return portHash ^ typeHash ^ ip4Hasher(ip);
     }
     if (endpoint.isIPv6()) {
+        constexpr std::hash<uint64_t> ip6Hasher;
         const auto &ipv6 = std::get<Endpoint::IPv6Addr>(endpoint.storage);
-        const auto *ip6Parts = reinterpret_cast<const uint64_t *>(&ipv6.addr.sin6_addr);
+        const auto *ip6Parts = reinterpret_cast<const uint64_t *>(&ipv6.sin6_addr);
         return portHash ^ typeHash ^ ip6Hasher(ip6Parts[0]) ^ ip6Hasher(ip6Parts[1]);
     }
     if (endpoint.isHostname()) {
+        constexpr std::hash<std::string> stringHasher;
         const auto &hostname = std::get<Endpoint::HostnameAddr>(endpoint.storage);
         return portHash ^ typeHash ^ stringHasher(hostname.host);
     }
 
     return portHash ^ typeHash;
+}
+
+bool operator==(const Endpoint &lhs, const Endpoint &rhs) noexcept {
+    if (lhs.type() != rhs.type()) {
+        return false;
+    }
+
+    if (lhs.port() != rhs.port()) {
+        return false;
+    }
+
+    if (lhs.isIPv4()) {
+        const auto &lhsAddr = std::get<Endpoint::IPv4Addr>(lhs.storage);
+        const auto &rhsAddr = std::get<Endpoint::IPv4Addr>(rhs.storage);
+        return lhsAddr.sin_addr.s_addr == rhsAddr.sin_addr.s_addr;
+    }
+
+    if (lhs.isIPv6()) {
+        const auto &lhsAddr = std::get<Endpoint::IPv6Addr>(lhs.storage);
+        const auto &rhsAddr = std::get<Endpoint::IPv6Addr>(rhs.storage);
+        return memcmp(&lhsAddr.sin6_addr, &rhsAddr.sin6_addr, sizeof(in6_addr)) == 0;
+    }
+
+    if (lhs.isHostname()) {
+        const auto &lhsAddr = std::get<Endpoint::HostnameAddr>(lhs.storage);
+        const auto &rhsAddr = std::get<Endpoint::HostnameAddr>(rhs.storage);
+        return lhsAddr.host == rhsAddr.host;
+    }
+
+    return false;
 }

@@ -51,7 +51,7 @@ bool Socket::bind(const Endpoint &endpoint) const noexcept {
     try {
         auto [storage, len] = endpoint.sockaddrStorage();
         return ::bind(fd_.get(), reinterpret_cast<const sockaddr *>(&storage), len) == 0;
-    } catch (const std::exception&) {
+    } catch (const std::exception &) {
         return false;
     }
 }
@@ -99,6 +99,9 @@ AcceptedSocket ListenSocketAwaiter::await_resume() {
 }
 
 ReadSocketAwaiter Socket::read(std::span<unsigned char> buffer) {
+    if (buffer.empty()) {
+        throw std::runtime_error("Buffer is empty");
+    }
     return {shared_from_this(), buffer};
 }
 
@@ -106,8 +109,10 @@ WriteSocketAwaiter Socket::write(std::span<unsigned char> buffer) {
     return {shared_from_this(), buffer};
 }
 
-ReadSocketAwaiter::ReadSocketAwaiter(SocketPtr socket_, const std::span<unsigned char> buffer_) : socket(std::move(socket_)),
-    buffer(buffer_) {
+ReadSocketAwaiter::ReadSocketAwaiter(SocketPtr socket_,
+                                     const std::span<unsigned char> buffer_)
+    : socket(std::move(socket_)),
+      buffer(buffer_) {
     if (!socket || socket->fd() == -1) {
         throw std::runtime_error("Invalid socket descriptor");
     }
@@ -173,8 +178,10 @@ size_t ReadSocketAwaiter::await_resume() {
     }
 }
 
-WriteSocketAwaiter::WriteSocketAwaiter(SocketPtr socket_, const std::span<unsigned char> buffer_) : socket(std::move(socket_)),
-    buffer(buffer_) {
+WriteSocketAwaiter::WriteSocketAwaiter(SocketPtr socket_,
+                                       const std::span<unsigned char> buffer_)
+    : socket(std::move(socket_)),
+      buffer(buffer_) {
 }
 
 bool WriteSocketAwaiter::await_ready() const noexcept {
@@ -294,7 +301,7 @@ bool ConnectSocketAwaiter::await_ready() const noexcept {
             connectErrno = err;
             return true; // Ready with error (will throw in await_resume)
         }
-    } catch (const std::exception&) {
+    } catch (const std::exception &) {
         // Invalid endpoint for socket operation (e.g., hostname)
         connectErrno = EINVAL;
         return true;
