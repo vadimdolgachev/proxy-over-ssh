@@ -3,17 +3,16 @@
 //
 
 #include "SshSocket.h"
-#include "SSHProxy.h"
+#include "Types.h"
 
 #include <libssh2.h>
 #include <stdexcept>
 #include <utility>
-#include <cstring>
 #include <cerrno>
-#include <unistd.h>
-#include <arpa/inet.h>  // for inet_pton, htons
-#include <netinet/in.h>  // for sockaddr_in, sockaddr_in6
 #include <chrono>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 namespace {
     std::string resultCodeToString(const ResultCode rc) {
@@ -28,9 +27,8 @@ namespace {
     }
 }
 
-SshSocket::SshSocket(SSHConfig sshConfig_)
-    : sshConfig(std::move(sshConfig_)),
-      tcpSocket(std::make_shared<Socket>()) {
+SshSocket::SshSocket(SSHConfig sshConfig_) : sshConfig(std::move(sshConfig_)),
+                                             tcpSocket(std::make_shared<Socket>()) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(sshConfig.port);
@@ -69,18 +67,16 @@ ResultCode SshSocket::tryTcpConnect() {
 
     const int err = errno;
     if (err == EINPROGRESS || err == EALREADY) {
-        // Connection in progress, will be completed asynchronously
         return ResultCode::ErrAgain;
     }
 
     if (err == EISCONN) {
-        // Socket is already connected, check for any error
-        int sockerr = 0;
-        socklen_t sockerr_len = sizeof(sockerr);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockerr, &sockerr_len) < 0) {
+        int sockErr = 0;
+        socklen_t sockErrLen = sizeof(sockErr);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockErr, &sockErrLen) < 0) {
             return ResultCode::ErrIO;
         }
-        if (sockerr != 0) {
+        if (sockErr != 0) {
             return ResultCode::ErrIO;
         }
         state = State::TCP_CONNECTED;
@@ -95,7 +91,6 @@ ResultCode SshSocket::advanceConnection() {
         case State::DISCONNECTED: {
             const auto rc = tryTcpConnect();
             if (rc == ResultCode::ErrAgain) {
-                // TCP connection in progress, need to wait for EPOLLOUT
                 pendingDirections = LIBSSH2_SESSION_BLOCK_OUTBOUND;
                 return ResultCode::ErrAgain;
             }
@@ -179,14 +174,12 @@ ResultCode SshSocket::performAuthentication() {
     }
 
     if (rc == LIBSSH2_ERROR_EAGAIN) {
-        // Need to wait for I/O
         const int direction = libssh2_session_block_directions(libssh2Session);
         pendingDirections = direction;
         return ResultCode::ErrAgain;
     }
 
     if (rc != 0) {
-        // Authentication failed
         libssh2_session_free(libssh2Session);
         libssh2Session = nullptr;
         state = State::ERROR;
@@ -214,13 +207,11 @@ ResultCode SshSocket::createChannel() {
     if (libssh2Channel == nullptr) {
         if (const int lastErr = libssh2_session_last_errno(libssh2Session);
             lastErr == LIBSSH2_ERROR_EAGAIN) {
-            // Need to wait for I/O
             const int direction = libssh2_session_block_directions(libssh2Session);
             pendingDirections = direction;
             return ResultCode::ErrAgain;
         }
 
-        // Failed to create channel
         libssh2_session_free(libssh2Session);
         libssh2Session = nullptr;
         state = State::ERROR;
@@ -243,7 +234,6 @@ CoroTask<ResultCode> SshSocket::connectAsync(const Endpoint &targetEndpoint_) {
     while (state != State::CHANNEL_CREATED) {
         const auto rc = advanceConnection();
         if (rc == ResultCode::ErrAgain) {
-            // Wait for I/O using the existing awaiter
             SshConnectAwaiter awaiter{shared_from_this(), targetEndpoint};
             co_await awaiter;
             continue;
@@ -251,7 +241,6 @@ CoroTask<ResultCode> SshSocket::connectAsync(const Endpoint &targetEndpoint_) {
         if (rc != ResultCode::Ok) {
             co_return rc;
         }
-        // State advanced, continue loop
     }
     co_return ResultCode::Ok;
 }
@@ -262,6 +251,16 @@ SshReadAwaiter SshSocket::read(std::span<unsigned char> buffer) {
 
 SshWriteAwaiter SshSocket::write(std::span<unsigned char> buffer) {
     return {shared_from_this(), buffer};
+}
+
+CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer) {
+    co_return co_await SshReadAwaiter(shared_from_this(),
+                                      std::span(buffer.data(), buffer.size()));
+}
+
+CoroTask<size_t> SshSocket::writeAsync(std::span<const uint8_t> data) {
+    co_return co_await SshWriteAwaiter(shared_from_this(),
+                                       std::span(const_cast<unsigned char *>(data.data()), data.size()));
 }
 
 int SshSocket::fd() const noexcept {
@@ -299,19 +298,16 @@ void SshSocket::close() noexcept {
     pendingEvents = 0;
 }
 
-// SshConnectAwaiter implementation
 SshConnectAwaiter::SshConnectAwaiter(std::shared_ptr<SshSocket> sshSocket_, Endpoint targetEndpoint_)
     : sshSocket(std::move(sshSocket_)),
       targetEndpoint(std::move(targetEndpoint_)) {
 }
 
 bool SshConnectAwaiter::await_ready() const noexcept {
-    // If already fully connected, return true
     if (sshSocket->state == SshSocket::State::CHANNEL_CREATED) {
         return true;
     }
 
-    // If pendingDirections is set, we already know we need to wait for I/O
     if (sshSocket->pendingDirections != 0) {
         return false;
     }
@@ -321,7 +317,6 @@ bool SshConnectAwaiter::await_ready() const noexcept {
         const auto rc = sshSocket->advanceConnection();
 
         if (rc == ResultCode::ErrAgain) {
-            // Need to wait for I/O
             return false;
         }
 
@@ -345,7 +340,6 @@ void SshConnectAwaiter::await_suspend(std::coroutine_handle<> h) {
         throw std::runtime_error("No scheduler set for SshConnectAwaiter");
     }
 
-    // Determine which events to wait for based on pendingDirections
     uint32_t events = 0;
     if (sshSocket->pendingDirections & LIBSSH2_SESSION_BLOCK_OUTBOUND) {
         events |= EpollScheduler::PollEvents::EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
@@ -354,7 +348,6 @@ void SshConnectAwaiter::await_suspend(std::coroutine_handle<> h) {
         events |= EpollScheduler::PollEvents::EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
     }
 
-    // If no pending directions (e.g., initial TCP connect), wait for EPOLLOUT
     if (events == 0) {
         events = EpollScheduler::PollEvents::EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
     }
@@ -369,9 +362,10 @@ void SshConnectAwaiter::await_resume() {
     }
 }
 
-// SshReadAwaiter implementation
-SshReadAwaiter::SshReadAwaiter(std::shared_ptr<SshSocket> sshSocket_, std::span<unsigned char> buffer_)
-    : sshSocket(std::move(sshSocket_)), buffer(buffer_), startTime(std::chrono::steady_clock::now()) {
+SshReadAwaiter::SshReadAwaiter(std::shared_ptr<SshSocket> sshSocket_,
+                               const std::span<unsigned char> buffer_) : sshSocket(std::move(sshSocket_)),
+                                                                         buffer(buffer_),
+                                                                         startTime(std::chrono::steady_clock::now()) {
 }
 
 bool SshReadAwaiter::await_ready() const noexcept {
@@ -380,13 +374,11 @@ bool SshReadAwaiter::await_ready() const noexcept {
         return true;
     }
 
-    // Check timeout
     if (std::chrono::steady_clock::now() - startTime > timeout) {
         peekEof = true;
         return true;
     }
 
-    // Try non-blocking read
     const ssize_t n = libssh2_channel_read(sshSocket->libssh2Channel,
                                            reinterpret_cast<char*>(buffer.data()),
                                            buffer.size());
@@ -405,7 +397,12 @@ bool SshReadAwaiter::await_ready() const noexcept {
             peekEof = true;
             return true;
         }
-        return false; // Need to wait for I/O
+        return false;
+    }
+
+    if (n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
+        peekEof = true;
+        return true;
     }
 
     peekErrno = static_cast<int>(-n);
@@ -425,11 +422,10 @@ void SshReadAwaiter::await_suspend(const std::coroutine_handle<> h) {
         }
     }
 
-    // Default to EPOLLIN for reads
     if (events == 0) {
         events = EpollScheduler::PollEvents::EPOLLIN;
     }
-    // Always monitor for hangup and error conditions
+
     events |= EpollScheduler::PollEvents::EPOLLHUP | EpollScheduler::PollEvents::EPOLLERR;
     this->getScheduler()->add(events, sshSocket->fd(), h);
 }
@@ -445,12 +441,10 @@ size_t SshReadAwaiter::await_resume() {
         return *peekResult;
     }
 
-    // Perform the actual read after resuming
     if (!sshSocket->libssh2Channel) {
         throw std::runtime_error("SSH channel not created");
     }
 
-    // After epoll event, try to read
     const ssize_t n = libssh2_channel_read(sshSocket->libssh2Channel,
                                            reinterpret_cast<char*>(buffer.data()),
                                            buffer.size());
@@ -469,10 +463,13 @@ size_t SshReadAwaiter::await_resume() {
         return 0;
     }
 
+    if (n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
+        return 0;
+    }
+
     throw std::runtime_error("SSH channel read error: " + std::to_string(n));
 }
 
-// SshWriteAwaiter implementation
 SshWriteAwaiter::SshWriteAwaiter(std::shared_ptr<SshSocket> sshSocket_, std::span<unsigned char> buffer_)
     : sshSocket(std::move(sshSocket_)), buffer(buffer_) {
 }
@@ -494,9 +491,13 @@ bool SshWriteAwaiter::await_ready() const noexcept {
         return true;
     }
 
-    // n < 0: error or EAGAIN
     if (n == LIBSSH2_ERROR_EAGAIN) {
-        return false; // Need to wait for I/O
+        return false;
+    }
+
+    if (n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
+        pollResult = 0;
+        return true;
     }
 
     pollErrno = static_cast<int>(-n);
@@ -504,7 +505,7 @@ bool SshWriteAwaiter::await_ready() const noexcept {
     return true;
 }
 
-void SshWriteAwaiter::await_suspend(std::coroutine_handle<> h) {
+void SshWriteAwaiter::await_suspend(const std::coroutine_handle<> h) {
     if (this->getScheduler() == nullptr) {
         throw std::runtime_error("No scheduler set for SshWriteAwaiter");
     }
@@ -536,7 +537,6 @@ size_t SshWriteAwaiter::await_resume() {
         return *pollResult;
     }
 
-    // Perform the actual write after resuming
     if (!sshSocket->libssh2Channel) {
         throw std::runtime_error("SSH channel not created");
     }
@@ -549,7 +549,10 @@ size_t SshWriteAwaiter::await_resume() {
     }
 
     if (n == LIBSSH2_ERROR_EAGAIN) {
-        // EAGAIN after epoll event - return 0, caller should retry
+        return 0;
+    }
+
+    if (n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
         return 0;
     }
 

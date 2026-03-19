@@ -21,65 +21,15 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <sys/epoll.h>
 #include <libssh2.h>
 
+#include "BackendSocket.h"
 #include "CoroTask.h"
+#include "Logger.h"
 #include "Socket.h"
-#include "SshSocket.h"
-
-// SOCKS Protocol Version 5 Documentation
-// https://datatracker.ietf.org/doc/html/rfc1928
+#include "Types.h"
 
 constexpr int BUFFER_SIZE = 2 * 8192;
-constexpr bool PRINT_VERBOSE_LOG = true;
-
-template<typename... Args>
-void log_d(std::format_string<Args...> fmt, Args &&... args) {
-    std::cout << std::format(fmt, std::forward<Args>(args)...);
-}
-
-template<typename... Args>
-void log_v(std::format_string<Args...> fmt, Args &&... args) {
-    if (PRINT_VERBOSE_LOG) {
-        log_d(fmt, std::forward<Args>(args)...);
-    }
-}
-
-template<typename... Args>
-void log_e(std::format_string<Args...> fmt, Args &&... args) {
-    std::cerr << std::format(fmt, std::forward<Args>(args)...);
-}
-
-namespace Socks5 {
-    constexpr int Version = 0x5;
-
-    namespace Cmd {
-        constexpr int Connect = 0x1;
-    }
-
-    namespace Auth {
-        constexpr int NoAuth = 0x0;
-    }
-
-    namespace Atyp {
-        constexpr int IpV4 = 0x1;
-        constexpr int Domain = 0x3;
-        constexpr int IpV6 = 0x4;
-    }
-
-    namespace Rep {
-        constexpr int Success = 0x00;
-        constexpr int GeneralFailure = 0x01;
-        constexpr int ConnectionNotAllowed = 0x02;
-        constexpr int NetworkUnreachable = 0x03;
-        constexpr int HostUnreachable = 0x04;
-        constexpr int ConnectionRefused = 0x05;
-        constexpr int TtlExpired = 0x06;
-        constexpr int CommandNotSupported = 0x07;
-        constexpr int AddressTypeNotSupported = 0x08;
-    }
-} // namespace Socks5
 
 struct ClientContextCoro final {
     enum class State {
@@ -452,10 +402,9 @@ static CoroTask<void> sendSocks5Success(const std::shared_ptr<ClientContextCoro>
     co_await writeAll(clientCtx->socket, {clientCtx->buffer.data(), clientCtx->buffer.size()});
 }
 
-static void sendSocks5FailureSync(const std::shared_ptr<ClientContextCoro> clientCtx,
-                                  uint8_t errorCode = Socks5::Rep::GeneralFailure) {
+static void sendSocks5FailureSync(const std::shared_ptr<ClientContextCoro> &clientCtx) {
     Socks5Response response;
-    response.rep = errorCode;
+    response.rep = Socks5::Rep::GeneralFailure;
     response.atyp = Socks5::Atyp::IpV4;
     response.bndAddr = {0, 0, 0, 0};
     response.bndPort = 0;
@@ -472,10 +421,10 @@ struct ForwardState {
     std::atomic<bool> clientDone{false};
     std::atomic<bool> sshDone{false};
     std::shared_ptr<ClientContextCoro> client;
-    std::shared_ptr<SshSocket> ssh;
+    BackendSocketPtr backend;
 };
 
-static CoroTask<void> forwardClientToSsh(std::shared_ptr<ForwardState> state) {
+static CoroTask<void> forwardClientToBackend(std::shared_ptr<ForwardState> state) {
     constexpr size_t kBufferSize = 8192;
     std::vector<uint8_t> buffer(kBufferSize);
 
@@ -494,12 +443,12 @@ static CoroTask<void> forwardClientToSsh(std::shared_ptr<ForwardState> state) {
 
         size_t written = 0;
         while (written < n && !state->sshDone.load()) {
-            if (state->ssh->isEof()) {
+            if (state->backend->isEof()) {
                 state->sshDone.store(true);
                 break;
             }
-            const size_t chunk = co_await state->ssh->write({buffer.data() + written, n - written});
-            if (chunk == 0 && state->ssh->isEof()) {
+            const size_t chunk = co_await state->backend->writeAsync({buffer.data() + written, n - written});
+            if (chunk == 0 && state->backend->isEof()) {
                 state->sshDone.store(true);
                 break;
             }
@@ -508,21 +457,21 @@ static CoroTask<void> forwardClientToSsh(std::shared_ptr<ForwardState> state) {
     }
 
     state->clientDone.store(true);
-    state->ssh->close();
+    state->backend->close();
 }
 
-static CoroTask<void> forwardSshToClient(std::shared_ptr<ForwardState> state) {
+static CoroTask<void> forwardBackendToClient(std::shared_ptr<ForwardState> state) {
     constexpr size_t kBufferSize = 8192;
     std::vector<uint8_t> buffer(kBufferSize);
 
     while (!state->sshDone.load() && !state->clientDone.load()) {
-        if (state->ssh->isEof()) {
+        if (state->backend->isEof()) {
             break;
         }
 
-        const size_t n = co_await state->ssh->read(buffer);
+        const size_t n = co_await state->backend->readAsync(buffer);
         if (n == 0) {
-            if (state->ssh->isEof()) {
+            if (state->backend->isEof()) {
                 break;
             }
             continue;
@@ -541,20 +490,20 @@ static CoroTask<void> forwardSshToClient(std::shared_ptr<ForwardState> state) {
 }
 
 static CoroTask<void> forwardData(const std::shared_ptr<ClientContextCoro> clientCtx,
-                                  const std::shared_ptr<SshSocket> sshSocket) {
+                                  const BackendSocketPtr backendSocket) {
     clientCtx->setState(ClientContextCoro::State::FORWARDING);
 
     const auto state = std::make_shared<ForwardState>();
     state->client = clientCtx;
-    state->ssh = sshSocket;
+    state->backend = backendSocket;
 
     auto *scheduler = co_await GetScheduler{};
 
-    auto clientToSsh = forwardClientToSsh(state);
-    auto sshToClient = forwardSshToClient(state);
+    auto clientToBackend = forwardClientToBackend(state);
+    auto backendToClient = forwardBackendToClient(state);
 
-    clientToSsh.detach(*scheduler);
-    sshToClient.detach(*scheduler);
+    clientToBackend.detach(*scheduler);
+    backendToClient.detach(*scheduler);
 
     const auto startTime = std::chrono::steady_clock::now();
     constexpr auto timeout = std::chrono::seconds(30);
@@ -564,7 +513,7 @@ static CoroTask<void> forwardData(const std::shared_ptr<ClientContextCoro> clien
             state->clientDone.store(true);
             state->sshDone.store(true);
             shutdown(clientCtx->socket->fd(), SHUT_RDWR);
-            shutdown(sshSocket->fd(), SHUT_RDWR);
+            shutdown(backendSocket->fd(), SHUT_RDWR);
             break;
         }
         co_await TimerAwaiter{std::chrono::milliseconds{100}};
@@ -573,7 +522,7 @@ static CoroTask<void> forwardData(const std::shared_ptr<ClientContextCoro> clien
     clientCtx->setState(ClientContextCoro::State::CLOSED);
 }
 
-static CoroTask<void> handleClient(SSHConfig sshConfig,
+static CoroTask<void> handleClient(BackendFactory backendFactory,
                                    Endpoint endpoint,
                                    SocketPtr socket) {
     const auto client = std::make_shared<ClientContextCoro>(endpoint, socket);
@@ -581,8 +530,8 @@ static CoroTask<void> handleClient(SSHConfig sshConfig,
         co_await handleSocks5Handshake(client);
         co_await handleSocks5Request(client);
 
-        const auto sshSocket = std::make_shared<SshSocket>(sshConfig);
-        if (const auto connectResult = co_await sshSocket->connectAsync(client->targetEndpoint);
+        const auto backendSocket = backendFactory(client->targetEndpoint);
+        if (const auto connectResult = co_await backendSocket->connectAsync(client->targetEndpoint);
             connectResult != ResultCode::Ok) {
             sendSocks5FailureSync(client);
             client->closeSocket();
@@ -590,7 +539,7 @@ static CoroTask<void> handleClient(SSHConfig sshConfig,
         }
 
         co_await sendSocks5Success(client);
-        co_await forwardData(client, sshSocket);
+        co_await forwardData(client, backendSocket);
     } catch (const std::exception &) {
         sendSocks5FailureSync(client);
     } catch (...) {
@@ -602,7 +551,7 @@ static CoroTask<void> handleClient(SSHConfig sshConfig,
 CoroTask<void> startMainLoop(const ProxyConfig config) {
     Socket serverSocket;
     serverSocket.setReusePort(true);
-    std::cout << "listen port: " << config.listenPort << '\n';
+    log_d("listen port: {}\n", config.listenPort);
     if (!serverSocket.bind(Endpoint(config.listenPort))) {
         throw std::runtime_error("Failed to bind server socket");
     }
@@ -611,9 +560,9 @@ CoroTask<void> startMainLoop(const ProxyConfig config) {
 
     while (true) {
         auto [socket, endpoint] = co_await serverSocket.listen();
-        std::cout << "new socket ip: " << endpoint.ipStr() << ", port: " << endpoint.port() << '\n';
+        log_d("new socket ip: {}, port: {}\n", endpoint.ipStr(), endpoint.port());
 
-        auto handler = handleClient(config.ssh, endpoint, socket);
+        auto handler = handleClient(config.backendFactory, endpoint, socket);
         handler.detach(*scheduler);
     }
 }
@@ -648,10 +597,7 @@ void SSHProxy::waitForFinish() {
 }
 
 void SSHProxy::mainLoop(const std::stop_token &stopToken) {
-    log_d("SOCKS5 proxy started on port: {} via SSH: {}:{}\n",
-          config.value().listenPort,
-          config.value().ssh.host,
-          config.value().ssh.port);
+    log_d("SOCKS5 proxy started on port: {}\n", config.value().listenPort);
     log_d("Proxy started. Press Ctrl+C to stop...\n");
 
     const auto isStopRequested = [stopToken, &flag = stopSignalFlag]() {

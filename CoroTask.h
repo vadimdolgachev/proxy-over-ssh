@@ -3,7 +3,6 @@
 
 #include <chrono>
 #include <coroutine>
-#include <cstdlib>
 #include <cerrno>
 #include <unistd.h>
 #include <unordered_map>
@@ -84,8 +83,9 @@ class EpollScheduler final {
 public:
     using PollEvents = EPOLL_EVENTS;
 
-    explicit EpollScheduler(std::function<bool()> stopToken_) : epollFd(epoll_create1(EPOLL_CLOEXEC)),
-                                                                stopToken(std::move(stopToken_)) {
+    explicit EpollScheduler(std::function<bool()> stopToken_)
+        : epollFd(epoll_create1(EPOLL_CLOEXEC)),
+          stopToken(std::move(stopToken_)) {
         if (epollFd.get() < 0) {
             throw std::runtime_error("Epoll creation failed");
         }
@@ -135,9 +135,8 @@ public:
         ev.data.ptr = coro.address();
 
         if (epoll_ctl(epollFd.get(), EPOLL_CTL_MOD, fd, &ev) < 0) {
-            const int err = errno;
             // Ignore EBADF (fd already closed) and ENOENT (entry not found)
-            if (err != EBADF && err != ENOENT) {
+            if (const int err = errno; err != EBADF && err != ENOENT) {
                 throw std::system_error(err, std::system_category(), "Epoll modify failed");
             }
         }
@@ -145,21 +144,20 @@ public:
 
     void run() {
         std::array<epoll_event, 16> events = {};
-        while (true) {
-            if (const int size = epoll_wait(epollFd.get(), events.data(), events.size(), 10'000); size > 0) {
+        while (stopToken ? !stopToken() : true) {
+            if (const int size = epoll_wait(epollFd.get(), events.data(), events.size(), EPOLL_TIMEOUT_MS); size > 0) {
                 for (size_t i = 0; i < static_cast<size_t>(size); ++i) {
                     auto addr = events[i].data.ptr;
                     const auto [fd, h] = handles[addr];
                     remove(fd, h);
                     h.resume();
                 }
-            } else if (stopToken && stopToken()) {
-                break;
             }
         }
     }
 
 private:
+    static constexpr size_t EPOLL_TIMEOUT_MS = 1'000;
     const UniqueFd epollFd;
     std::unordered_map<void *, Entry> handles;
     std::function<bool()> stopToken;
@@ -185,7 +183,7 @@ struct TimerAwaiter final : SchedulerAware<EpollScheduler> {
     }
 
     [[nodiscard]] bool await_ready() const noexcept {
-        return false;
+        return delay.count() == 0;
     }
 
     void await_suspend(const std::coroutine_handle<> h) {
@@ -211,7 +209,7 @@ struct TimerAwaiter final : SchedulerAware<EpollScheduler> {
     }
 
 private:
-    std::chrono::nanoseconds delay{};
+    std::chrono::nanoseconds delay;
     UniqueFd timerFd{};
     std::coroutine_handle<> coroHandle;
 };
@@ -307,7 +305,7 @@ template<typename Promise, typename Resume>
 struct CoroTaskAwaiter final : CoroTaskAwaiterBase<Promise> {
     using CoroTaskAwaiterBase<Promise>::handle;
 
-    Resume await_resume() noexcept {
+    Resume await_resume() {
         auto &promise = handle.promise();
         if (promise.exception) {
             std::rethrow_exception(promise.exception);
@@ -320,7 +318,7 @@ template<typename Promise>
 struct CoroTaskAwaiterVoid final : CoroTaskAwaiterBase<Promise> {
     using CoroTaskAwaiterBase<Promise>::handle;
 
-    void await_resume() noexcept {
+    void await_resume() {
         if (handle.promise().exception) {
             std::rethrow_exception(handle.promise().exception);
         }

@@ -5,21 +5,19 @@
 #ifndef PROXY_OVER_SSH_SSHSOCKET_H
 #define PROXY_OVER_SSH_SSHSOCKET_H
 
+#include "BackendSocket.h"
 #include "CoroTask.h"
 #include "Endpoint.h"
 #include "Socket.h"
+#include "SSHProxy.h"
+
+#include "libssh2.h"
 
 #include <span>
 #include <memory>
 #include <optional>
 
-#include "SSHProxy.h"
-
 class SshSocket;
-
-// libssh2 forward declarations
-typedef struct _LIBSSH2_SESSION LIBSSH2_SESSION;
-typedef struct _LIBSSH2_CHANNEL LIBSSH2_CHANNEL;
 
 struct SshConnectAwaiter final : SchedulerAware<EpollScheduler> {
     SshConnectAwaiter(std::shared_ptr<SshSocket> sshSocket_, Endpoint targetEndpoint_);
@@ -73,7 +71,7 @@ private:
     mutable std::optional<size_t> pollResult;
 };
 
-class SshSocket : public std::enable_shared_from_this<SshSocket> {
+class SshSocket : public IBackendSocket, public std::enable_shared_from_this<SshSocket> {
 public:
     explicit SshSocket(SSHConfig sshConfig_);
 
@@ -81,21 +79,25 @@ public:
 
     SshSocket &operator=(const SshSocket &) = delete;
 
-    ~SshSocket();
+    ~SshSocket() override;
 
     [[nodiscard]] SshConnectAwaiter connect(const Endpoint &targetEndpoint_);
 
-    [[nodiscard]] CoroTask<ResultCode> connectAsync(const Endpoint &targetEndpoint_);
+    [[nodiscard]] CoroTask<ResultCode> connectAsync(const Endpoint &targetEndpoint_) override;
 
     [[nodiscard]] SshReadAwaiter read(std::span<unsigned char> buffer);
 
     [[nodiscard]] SshWriteAwaiter write(std::span<unsigned char> buffer);
 
-    [[nodiscard]] int fd() const noexcept;
+    [[nodiscard]] CoroTask<size_t> readAsync(std::span<uint8_t> buffer) override;
 
-    [[nodiscard]] bool isEof() const noexcept;
+    [[nodiscard]] CoroTask<size_t> writeAsync(std::span<const uint8_t> data) override;
 
-    void close() noexcept;
+    [[nodiscard]] int fd() const noexcept override;
+
+    [[nodiscard]] bool isEof() const noexcept override;
+
+    void close() noexcept override;
 
 private:
     friend struct SshConnectAwaiter;
@@ -111,16 +113,6 @@ private:
         ERROR
     };
 
-    SSHConfig sshConfig;
-    Endpoint sshServerEndpoint;
-    SocketPtr tcpSocket;
-    LIBSSH2_SESSION *libssh2Session = nullptr;
-    LIBSSH2_CHANNEL *libssh2Channel = nullptr;
-    int pendingDirections = 0;
-    uint32_t pendingEvents = 0;
-    State state = State::DISCONNECTED;
-    Endpoint targetEndpoint;
-
     ResultCode tryTcpConnect();
 
     ResultCode advanceConnection();
@@ -130,6 +122,16 @@ private:
     ResultCode performAuthentication();
 
     ResultCode createChannel();
+
+    SSHConfig sshConfig;
+    Endpoint sshServerEndpoint;
+    SocketPtr tcpSocket;
+    LIBSSH2_SESSION *libssh2Session = nullptr;
+    LIBSSH2_CHANNEL *libssh2Channel = nullptr;
+    int pendingDirections = 0;
+    uint32_t pendingEvents = 0;
+    State state = State::DISCONNECTED;
+    Endpoint targetEndpoint;
 };
 
 using SshSocketPtr = std::shared_ptr<SshSocket>;

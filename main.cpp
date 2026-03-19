@@ -1,20 +1,23 @@
 #include <algorithm>
-#include <iostream>
 #include <expected>
 #include <unordered_map>
 #include <string_view>
 #include <charconv>
 #include <csignal>
 #include <format>
+#include <memory>
 
+#include "BackendSocket.h"
+#include "Logger.h"
 #include "SSHProxy.h"
+#include "SshSocket.h"
 
 namespace {
     std::string parsePrivateKey(const std::string_view privateKey) {
         using namespace std::string_view_literals;
         auto content = std::string(privateKey);
         if (content.starts_with("$")) {
-            for (const auto pattern : {"$"sv, "{"sv, "}"sv}) {
+            for (const auto pattern: {"$"sv, "{"sv, "}"sv}) {
                 size_t pos = 0;
                 while ((pos = content.find(pattern, pos)) != std::string::npos) {
                     content.replace(pos, pattern.length(), "");
@@ -35,7 +38,12 @@ namespace {
         return std::format("-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----", content);
     }
 
-    std::expected<ProxyConfig, std::string> parseConfig(const int argc, char **argv) {
+    struct AppConfig {
+        SSHConfig ssh;
+        std::uint16_t listenPort;
+    };
+
+    std::expected<AppConfig, std::string> parseConfig(const int argc, char **argv) {
         using namespace std::string_view_literals;
 
         if ((argc - 1) % 2 != 0) {
@@ -104,7 +112,7 @@ namespace {
             return std::unexpected(listenPort.error());
         }
 
-        return ProxyConfig{
+        return AppConfig{
             .ssh = {
                 .username = std::string(*sshUser),
                 .host = std::string(*sshHost),
@@ -126,13 +134,22 @@ extern "C" void onSignalTerm(int) {
 
 int main(const int argc, char **argv) {
     std::signal(SIGTERM, onSignalTerm);
-    if (const auto config = parseConfig(argc, argv)) {
+    if (const auto appConfig = parseConfig(argc, argv)) {
+        const auto factory = [sshConfig = appConfig->ssh](const Endpoint &) -> BackendSocketPtr {
+            return std::make_shared<SshSocket>(sshConfig);
+        };
+
+        ProxyConfig proxyConfig{
+            .backendFactory = factory,
+            .listenPort = appConfig->listenPort,
+        };
+
         const auto proxy = std::make_unique<SSHProxy>(stopSignalFlag);
-        proxy->start(config.value());
+        proxy->start(proxyConfig);
         proxy->waitForFinish();
     } else {
-        std::cerr << "Failed to parse arguments: " << config.error() << "\n";
+        log_e("Failed to parse arguments: {}\n", appConfig.error());
     }
-    std::cout << "Exit\n";
+    log_d("Exit\n");
     return 0;
 }

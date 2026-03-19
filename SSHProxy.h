@@ -6,18 +6,12 @@
 #define SSHEPROXY_H
 
 #include <atomic>
-#include <memory>
 #include <optional>
 #include <thread>
+#include <string>
+#include <functional>
 
-enum class ResultCode {
-    Ok,
-    ErrAgain,
-    ErrIO,
-    ErrTimeout,
-    ErrInvalidPrivateKey,
-    ErrUnknown,
-};
+#include "BackendSocket.h"
 
 struct SSHConfig final {
     std::string username;
@@ -28,17 +22,20 @@ struct SSHConfig final {
 };
 
 struct ProxyConfig final {
-    SSHConfig ssh;
+    BackendFactory backendFactory;
     std::uint16_t listenPort;
 };
 
 class SSHProxy {
 public:
-    explicit SSHProxy(const std::atomic_bool &stopSignalFlag);
+    explicit SSHProxy(const std::atomic_bool &stopSignalFlag_);
+
     ~SSHProxy();
 
     void start(const ProxyConfig &proxyConfig);
+
     void requestStop() noexcept;
+
     void waitForFinish();
 
 private:
