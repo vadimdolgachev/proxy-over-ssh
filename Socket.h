@@ -110,6 +110,8 @@ public:
 
     [[nodiscard]] WriteSocketAwaiter write(std::span<unsigned char> buffer);
 
+    [[nodiscard]] bool isEof() const noexcept;
+
 private:
     UniqueFd fd_;
 };

@@ -61,6 +61,24 @@ ListenSocketAwaiter Socket::listen() const {
     return ListenSocketAwaiter(fd_.get());
 }
 
+bool Socket::isEof() const noexcept {
+    if (fd() < 0) {
+        return true;
+    }
+    unsigned char tmp;
+    const ssize_t result = recv(fd(), &tmp, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (result == 0) {
+        return true;
+    }
+    if (result < 0) {
+        if (const int err = errno; err == EAGAIN || err == EWOULDBLOCK) {
+            return false; // Still open, no data available
+        }
+        return true;
+    }
+    return false;
+}
+
 ListenSocketAwaiter::ListenSocketAwaiter(const int fd_) : fd(fd_) {
     if (fd_ == -1) {
         throw std::runtime_error("Invalid socket descriptor");

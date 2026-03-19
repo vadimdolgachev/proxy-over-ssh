@@ -15,9 +15,6 @@
 
 #include "SSHProxy.h"
 
-// Forward declarations (also declared in SSHProxy.h)
-// class SSHChannel;
-// class SSH2Session;
 class SshSocket;
 
 // libssh2 forward declarations
@@ -54,6 +51,8 @@ private:
     mutable int peekErrno = 0;
     mutable bool peekEof = false;
     mutable std::optional<size_t> peekResult;
+    std::chrono::steady_clock::time_point startTime;
+    static constexpr std::chrono::seconds timeout{30};
 };
 
 struct SshWriteAwaiter final : SchedulerAware<EpollScheduler> {
@@ -86,13 +85,15 @@ public:
 
     [[nodiscard]] SshConnectAwaiter connect(const Endpoint &targetEndpoint_);
 
-    [[nodiscard]] CoroTask<void> connectAsync(const Endpoint &targetEndpoint_);
+    [[nodiscard]] CoroTask<ResultCode> connectAsync(const Endpoint &targetEndpoint_);
 
     [[nodiscard]] SshReadAwaiter read(std::span<unsigned char> buffer);
 
     [[nodiscard]] SshWriteAwaiter write(std::span<unsigned char> buffer);
 
     [[nodiscard]] int fd() const noexcept;
+
+    [[nodiscard]] bool isEof() const noexcept;
 
     void close() noexcept;
 

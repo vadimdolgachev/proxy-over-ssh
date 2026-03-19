@@ -146,8 +146,7 @@ public:
     void run() {
         std::array<epoll_event, 16> events = {};
         while (true) {
-            if (const int size = epoll_wait(epollFd.get(), events.data(), events.size(), 500); size > 0) {
-                std::cout << "new events size=" << size << "\n";
+            if (const int size = epoll_wait(epollFd.get(), events.data(), events.size(), 10'000); size > 0) {
                 for (size_t i = 0; i < static_cast<size_t>(size); ++i) {
                     auto addr = events[i].data.ptr;
                     const auto [fd, h] = handles[addr];
@@ -190,6 +189,7 @@ struct TimerAwaiter final : SchedulerAware<EpollScheduler> {
     }
 
     void await_suspend(const std::coroutine_handle<> h) {
+        coroHandle = h;
         timerFd.reset(timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC));
         if (timerFd.get() < 0) {
             throw std::system_error(errno, std::system_category(), "timerfd_create failed");
@@ -206,11 +206,14 @@ struct TimerAwaiter final : SchedulerAware<EpollScheduler> {
     void await_resume() {
         uint64_t expirations;
         [[maybe_unused]] auto r = read(timerFd.get(), &expirations, sizeof(expirations));
+        // Remove from scheduler before timerFd is destroyed
+        this->getScheduler()->remove(timerFd.get(), coroHandle);
     }
 
 private:
     std::chrono::nanoseconds delay{};
     UniqueFd timerFd{};
+    std::coroutine_handle<> coroHandle;
 };
 
 template<typename Base>
@@ -228,6 +231,8 @@ struct PromiseBase : SchedulerAware<EpollScheduler> {
             void await_suspend(std::coroutine_handle<Base> h) noexcept {
                 if (auto cont = std::exchange(h.promise().continuation, nullptr)) {
                     cont.resume();
+                } else if (h.promise().detached) {
+                    h.destroy();
                 }
             }
 
@@ -251,6 +256,7 @@ struct PromiseBase : SchedulerAware<EpollScheduler> {
 
     std::exception_ptr exception;
     std::coroutine_handle<> continuation = nullptr;
+    bool detached = false;
 };
 
 
@@ -267,6 +273,19 @@ struct PromiseValue : PromiseBase<Base> {
     template<typename U>
     void return_value(U &&v) {
         value.emplace(std::forward<U>(v));
+    }
+};
+
+struct GetScheduler : SchedulerAware<EpollScheduler> {
+    [[nodiscard]] bool await_ready() const noexcept {
+        return true;
+    }
+
+    void await_suspend(std::coroutine_handle<>) noexcept {
+    }
+
+    [[nodiscard]] EpollScheduler *await_resume() const noexcept {
+        return this->getScheduler();
     }
 };
 
@@ -348,12 +367,27 @@ public:
         }
     }
 
+    // Detach the coroutine for fire-and-forget execution
+    // The coroutine will destroy itself when it completes
+    void detach(EpollScheduler &scheduler) {
+        if (handle && !handle.done()) {
+            handle.promise().setScheduler(&scheduler);
+            handle.promise().detached = true;
+            handle.resume();
+            release();
+        }
+    }
+
     auto operator co_await() const noexcept {
         return Awaiter{handle};
     }
 
     void setScheduler(EpollScheduler *s) noexcept {
         handle.promise().setScheduler(s);
+    }
+
+    std::coroutine_handle<promise_type> release() noexcept {
+        return std::exchange(handle, {});
     }
 
 private:
