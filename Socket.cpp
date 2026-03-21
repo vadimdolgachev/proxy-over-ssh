@@ -69,7 +69,7 @@ bool Socket::isEof() const noexcept {
         return true;
     }
     if (result < 0) {
-        if (const int err = errno; err == EAGAIN || err == EWOULDBLOCK) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return false;
         }
         return true;
