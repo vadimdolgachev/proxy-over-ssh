@@ -5,17 +5,18 @@
 #ifndef PROXY_OVER_SSH_SSHSOCKET_H
 #define PROXY_OVER_SSH_SSHSOCKET_H
 
-#include "BackendSocket.h"
-#include "CoroTask.h"
-#include "Endpoint.h"
-#include "Socket.h"
-#include "SSHProxy.h"
-
-#include "libssh2.h"
-
 #include <span>
 #include <memory>
 #include <optional>
+
+#include "libssh2.h"
+
+#include "BackendSocket.h"
+#include "CoroTask.h"
+#include "Endpoint.h"
+#include "SSHProxy.h"
+#include "SessionPool.h"
+#include "SshSessionHandler.h"
 
 class SshSocket;
 
@@ -73,7 +74,7 @@ private:
 
 class SshSocket : public IBackendSocket, public std::enable_shared_from_this<SshSocket> {
 public:
-    explicit SshSocket(SSHConfig sshConfig_);
+    SshSocket(SSHConfig sshConfig_, const std::shared_ptr<SessionPool> &sessionPool_);
 
     SshSocket(const SshSocket &) = delete;
 
@@ -123,13 +124,12 @@ private:
 
     ResultCode createChannel();
 
+    std::shared_ptr<SessionPool> sessionPool;
     SSHConfig sshConfig;
     Endpoint sshServerEndpoint;
-    SocketPtr tcpSocket;
-    LIBSSH2_SESSION *libssh2Session = nullptr;
+    std::optional<SshSessionHandler> sessionHandle;
     LIBSSH2_CHANNEL *libssh2Channel = nullptr;
     int pendingDirections = 0;
-    uint32_t pendingEvents = 0;
     State state = State::DISCONNECTED;
     Endpoint targetEndpoint;
 };

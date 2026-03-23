@@ -63,6 +63,9 @@ add_executable(proxy_over_ssh main.cpp
         SshSocket.h
         Endpoint.cpp
         Endpoint.h
+        SessionPool.cpp
+        SessionPool.h
+        SshSessionHandler.h
 )
 target_link_libraries(proxy_over_ssh PRIVATE
         OpenSSL::Crypto

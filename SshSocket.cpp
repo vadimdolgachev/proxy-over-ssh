@@ -2,9 +2,6 @@
 // Created by vadim on 28.01.2026.
 //
 
-#include "SshSocket.h"
-#include "Types.h"
-
 #include <libssh2.h>
 #include <stdexcept>
 #include <utility>
@@ -13,6 +10,11 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+
+#include "SshSocket.h"
+#include "Logger.h"
+#include "Types.h"
+#include "SessionPool.h"
 
 namespace {
     std::string resultCodeToString(const ResultCode rc) {
@@ -27,8 +29,9 @@ namespace {
     }
 }
 
-SshSocket::SshSocket(SSHConfig sshConfig_) : sshConfig(std::move(sshConfig_)),
-                                             tcpSocket(std::make_shared<Socket>()) {
+SshSocket::SshSocket(SSHConfig sshConfig_, const std::shared_ptr<SessionPool> &sessionPool_)
+    : sessionPool(sessionPool_),
+      sshConfig(std::move(sshConfig_)) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(sshConfig.port);
@@ -52,11 +55,27 @@ SshSocket::~SshSocket() {
 }
 
 ResultCode SshSocket::tryTcpConnect() {
-    if (!tcpSocket || tcpSocket->fd() < 0) {
+    if (sessionPool && sessionHandle == std::nullopt) {
+        sessionHandle = sessionPool->acquire();
+        if (sessionHandle && sessionHandle->tcpSocket) {
+            state = State::SSH_AUTHENTICATED;
+            return ResultCode::Ok;
+        }
+    }
+
+    if (sessionHandle == std::nullopt) {
+        sessionHandle = SshSessionHandler{
+            .sshSession = nullptr,
+            .tcpSocket = std::make_unique<Socket>(),
+            .lastUsed = std::chrono::steady_clock::now(),
+        };
+    }
+
+    if (!sessionHandle->tcpSocket || sessionHandle->tcpSocket->fd() < 0) {
         return ResultCode::ErrIO;
     }
 
-    const int fd = tcpSocket->fd();
+    const int fd = sessionHandle->tcpSocket->fd();
     auto [storage, len] = sshServerEndpoint.sockaddrStorage();
 
     if (const int rc = ::connect(fd, reinterpret_cast<const sockaddr *>(&storage), len);
@@ -114,30 +133,25 @@ ResultCode SshSocket::advanceConnection() {
 }
 
 ResultCode SshSocket::performHandshake() {
-    if (!tcpSocket || tcpSocket->fd() < 0) {
-        return ResultCode::ErrIO;
-    }
-
-    if (!libssh2Session) {
-        libssh2Session = libssh2_session_init();
-        if (!libssh2Session) {
+    if (sessionHandle->sshSession == nullptr) {
+        try {
+            sessionHandle->sshSession = std::make_unique<SshSession>();
+        } catch (const std::exception &e) {
             state = State::ERROR;
             return ResultCode::ErrUnknown;
         }
-        libssh2_session_set_blocking(libssh2Session, 0);
-        libssh2_session_set_timeout(libssh2Session, 30000);
     }
 
-    const int rc = libssh2_session_handshake(libssh2Session, tcpSocket->fd());
+    const int rc = sessionHandle->sshSession->handshake(sessionHandle->tcpSocket);
     if (rc == LIBSSH2_ERROR_EAGAIN) {
-        const int direction = libssh2_session_block_directions(libssh2Session);
+        const int direction = sessionHandle->sshSession->blockDirections();
         pendingDirections = direction;
         return ResultCode::ErrAgain;
     }
 
     if (rc != 0) {
-        libssh2_session_free(libssh2Session);
-        libssh2Session = nullptr;
+        sessionHandle = std::nullopt;
+        std::cout << "ERROR: performHandshake\n";
         state = State::ERROR;
         return ResultCode::ErrUnknown;
     }
@@ -148,13 +162,13 @@ ResultCode SshSocket::performHandshake() {
 }
 
 ResultCode SshSocket::performAuthentication() {
-    if (!libssh2Session) {
+    if (sessionHandle->sshSession == nullptr) {
         return ResultCode::ErrUnknown;
     }
 
     int rc;
     if (sshConfig.privateKeyData.has_value()) {
-        rc = libssh2_userauth_publickey_frommemory(libssh2Session,
+        rc = libssh2_userauth_publickey_frommemory(sessionHandle->sshSession->raw(),
                                                    sshConfig.username.c_str(),
                                                    sshConfig.username.length(),
                                                    nullptr,
@@ -163,7 +177,7 @@ ResultCode SshSocket::performAuthentication() {
                                                    sshConfig.privateKeyData.value().length(),
                                                    nullptr);
     } else if (sshConfig.privateKeyPath.has_value()) {
-        rc = libssh2_userauth_publickey_fromfile_ex(libssh2Session,
+        rc = libssh2_userauth_publickey_fromfile_ex(sessionHandle->sshSession->raw(),
                                                     sshConfig.username.c_str(),
                                                     static_cast<unsigned int>(sshConfig.username.length()),
                                                     nullptr,
@@ -174,14 +188,14 @@ ResultCode SshSocket::performAuthentication() {
     }
 
     if (rc == LIBSSH2_ERROR_EAGAIN) {
-        const int direction = libssh2_session_block_directions(libssh2Session);
+        const int direction = sessionHandle->sshSession->blockDirections();
         pendingDirections = direction;
         return ResultCode::ErrAgain;
     }
 
     if (rc != 0) {
-        libssh2_session_free(libssh2Session);
-        libssh2Session = nullptr;
+        sessionHandle = std::nullopt;
+        std::cout << "ERROR: performAuthentication\n";
         state = State::ERROR;
         return ResultCode::ErrUnknown;
     }
@@ -192,28 +206,29 @@ ResultCode SshSocket::performAuthentication() {
 }
 
 ResultCode SshSocket::createChannel() {
-    if (!libssh2Session) {
+    if (!sessionHandle->sshSession) {
         return ResultCode::ErrUnknown;
     }
 
     const auto host = targetEndpoint.host();
     const int port = targetEndpoint.port();
 
-    libssh2Channel = libssh2_channel_direct_tcpip_ex(libssh2Session,
+    libssh2Channel = libssh2_channel_direct_tcpip_ex(sessionHandle->sshSession->raw(),
                                                      host.c_str(),
                                                      port,
                                                      "::1",
                                                      0);
     if (libssh2Channel == nullptr) {
-        if (const int lastErr = libssh2_session_last_errno(libssh2Session);
+        const int lastErr = libssh2_session_last_errno(sessionHandle->sshSession->raw());
+        if (
             lastErr == LIBSSH2_ERROR_EAGAIN) {
-            const int direction = libssh2_session_block_directions(libssh2Session);
+            const int direction = sessionHandle->sshSession->blockDirections();
             pendingDirections = direction;
             return ResultCode::ErrAgain;
         }
 
-        libssh2_session_free(libssh2Session);
-        libssh2Session = nullptr;
+        sessionHandle = std::nullopt;
+        std::cout << "ERROR: createChannel lastErr=" << lastErr << ", host=" << host << "\n";
         state = State::ERROR;
         return ResultCode::ErrIO;
     }
@@ -264,8 +279,8 @@ CoroTask<size_t> SshSocket::writeAsync(std::span<const uint8_t> data) {
 }
 
 int SshSocket::fd() const noexcept {
-    if (tcpSocket) {
-        return tcpSocket->fd();
+    if (sessionHandle->tcpSocket) {
+        return sessionHandle->tcpSocket->fd();
     }
     return -1;
 }
@@ -280,22 +295,28 @@ bool SshSocket::isEof() const noexcept {
 
 
 void SshSocket::close() noexcept {
+    std::cout << "SshSocket::close libssh2Channel: " << libssh2Channel << "\n" << std::endl;
+    std::cout << "SshSocket::close sessionHandle: " << sessionHandle.has_value() << "\n" << std::endl;
+    std::cout << "SshSocket::close state: " << static_cast<int>(state) << "\n" << std::endl;
     if (libssh2Channel != nullptr) {
         libssh2_channel_close(libssh2Channel);
         libssh2_channel_free(libssh2Channel);
         libssh2Channel = nullptr;
     }
-    if (libssh2Session) {
-        libssh2_session_disconnect(libssh2Session, "Normal shutdown");
-        libssh2_session_free(libssh2Session);
-        libssh2Session = nullptr;
+
+    if (sessionPool && sessionHandle) {
+        if (state != State::ERROR) {
+            sessionPool->release(std::move(sessionHandle.value()));
+            log_v("SshSocket: Returned session to pool\n");
+        } else {
+            sessionPool->invalidate(*sessionHandle);
+            log_v("SshSocket: Invalidated session from pool due to error\n");
+        }
     }
-    if (tcpSocket) {
-        tcpSocket->close();
-    }
+
+    sessionHandle = std::nullopt;
     state = State::DISCONNECTED;
     pendingDirections = 0;
-    pendingEvents = 0;
 }
 
 SshConnectAwaiter::SshConnectAwaiter(std::shared_ptr<SshSocket> sshSocket_, Endpoint targetEndpoint_)
@@ -369,7 +390,7 @@ SshReadAwaiter::SshReadAwaiter(std::shared_ptr<SshSocket> sshSocket_,
 }
 
 bool SshReadAwaiter::await_ready() const noexcept {
-    if (!sshSocket->libssh2Session) {
+    if (!sshSocket->sessionHandle || !sshSocket->sessionHandle->sshSession) {
         peekErrno = EINVAL;
         return true;
     }
@@ -393,7 +414,7 @@ bool SshReadAwaiter::await_ready() const noexcept {
     }
 
     if (n == LIBSSH2_ERROR_EAGAIN) {
-        if (libssh2_channel_eof(sshSocket->libssh2Channel)) {
+        if (sshSocket->libssh2Channel && libssh2_channel_eof(sshSocket->libssh2Channel)) {
             peekEof = true;
             return true;
         }
@@ -412,8 +433,8 @@ bool SshReadAwaiter::await_ready() const noexcept {
 void SshReadAwaiter::await_suspend(const std::coroutine_handle<> h) {
     // Determine which events to wait for based on libssh2's direction hint
     uint32_t events = 0;
-    if (sshSocket->libssh2Session) {
-        const int directions = libssh2_session_block_directions(sshSocket->libssh2Session);
+    if (sshSocket->sessionHandle && sshSocket->sessionHandle->sshSession) {
+        const int directions = sshSocket->sessionHandle->sshSession->blockDirections();
         if (directions & LIBSSH2_SESSION_BLOCK_INBOUND) {
             events |= EpollScheduler::PollEvents::EPOLLIN;
         }
@@ -475,7 +496,7 @@ SshWriteAwaiter::SshWriteAwaiter(std::shared_ptr<SshSocket> sshSocket_, std::spa
 }
 
 bool SshWriteAwaiter::await_ready() const noexcept {
-    if (!sshSocket->libssh2Session) {
+    if (!sshSocket->sessionHandle || !sshSocket->sessionHandle->sshSession) {
         pollErrno = EINVAL;
         pollError = true;
         return true;
@@ -511,8 +532,8 @@ void SshWriteAwaiter::await_suspend(const std::coroutine_handle<> h) {
     }
 
     uint32_t events = 0;
-    if (sshSocket->libssh2Session) {
-        const int directions = libssh2_session_block_directions(sshSocket->libssh2Session);
+    if (sshSocket->sessionHandle && sshSocket->sessionHandle->sshSession) {
+        const int directions = sshSocket->sessionHandle->sshSession->blockDirections();
         if (directions & LIBSSH2_SESSION_BLOCK_INBOUND) {
             events |= EpollScheduler::PollEvents::EPOLLIN;
         }

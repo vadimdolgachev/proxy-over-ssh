@@ -11,6 +11,7 @@
 #include "Logger.h"
 #include "SSHProxy.h"
 #include "SshSocket.h"
+#include "SessionPool.h"
 
 namespace {
     std::string parsePrivateKey(const std::string_view privateKey) {
@@ -135,8 +136,9 @@ extern "C" void onSignalTerm(int) {
 int main(const int argc, char **argv) {
     std::signal(SIGTERM, onSignalTerm);
     if (const auto appConfig = parseConfig(argc, argv)) {
-        const auto factory = [sshConfig = appConfig->ssh](const Endpoint &) -> BackendSocketPtr {
-            return std::make_shared<SshSocket>(sshConfig);
+        auto sessionPool = std::make_shared<SessionPool>(25);
+        const auto factory = [sshConfig = appConfig->ssh, sessionPool](const Endpoint &) -> BackendSocketPtr {
+            return std::make_shared<SshSocket>(sshConfig, sessionPool);
         };
 
         ProxyConfig proxyConfig{
