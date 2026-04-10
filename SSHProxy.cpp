@@ -4,7 +4,6 @@
 
 #include "SSHProxy.h"
 
-#include <iostream>
 #include <unistd.h>
 #include <cstring>
 #include <expected>
@@ -16,11 +15,12 @@
 #include <span>
 #include <string>
 #include <limits>
-#include <chrono>
 
 #include <sys/socket.h>
+#include <sys/eventfd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <poll.h>
 #include <libssh2.h>
 
 #include "BackendSocket.h"
@@ -28,8 +28,10 @@
 #include "Logger.h"
 #include "Socket.h"
 #include "Types.h"
-
-constexpr int BUFFER_SIZE = 2 * 8192;
+#include "Constants.h"
+#include "Buffer.h"
+#include "IdleTimer.h"
+#include "CompletionSignal.h"
 
 struct ClientContextCoro final {
     enum class State {
@@ -55,26 +57,14 @@ struct ClientContextCoro final {
 
     ~ClientContextCoro() = default;
 
-    [[nodiscard]] bool isConnected() const noexcept {
-        return socket && socket->fd() != -1;
-    }
-
     void closeSocket() noexcept {
-        if (socket) {
+        if (socket != nullptr) {
             socket->close();
         }
     }
 
     void setState(const State newState) noexcept {
         state = newState;
-    }
-
-    [[nodiscard]] State getState() const noexcept {
-        return state;
-    }
-
-    [[nodiscard]] bool isState(const State state_) const noexcept {
-        return state == state_;
     }
 
     Endpoint endpoint;
@@ -392,8 +382,21 @@ struct Socks5Response final {
 
 CoroTask<void> handleSocks5Request(const std::shared_ptr<ClientContextCoro> clientCtx) {
     const auto req = co_await Socks5Request::readRequest(clientCtx);
-    clientCtx->targetEndpoint = req.targetEndpoint;
 
+    if (req.targetEndpoint.isIPv6()) {
+        Socks5Response response;
+        response.rep = Socks5::Rep::AddressTypeNotSupported;
+        response.atyp = Socks5::Atyp::IpV4;
+        response.bndAddr = {0, 0, 0, 0};
+        response.bndPort = 0;
+
+        std::vector<uint8_t> buffer;
+        response.serializeTo(buffer);
+        co_await writeAll(clientCtx->socket, {buffer.data(), buffer.size()});
+        clientCtx->socket->close();
+        throw std::runtime_error("Address not allowed");
+    }
+    clientCtx->targetEndpoint = req.targetEndpoint;
     clientCtx->setState(ClientContextCoro::State::SSH_SOCKET_CONNECT);
 }
 
@@ -417,87 +420,215 @@ static void sendSocks5FailureSync(const std::shared_ptr<ClientContextCoro> &clie
     }
 }
 
-struct ForwardState {
-    std::atomic<bool> clientDone{false};
-    std::atomic<bool> sshDone{false};
+struct ForwardCoordinator final {
+    std::atomic<bool> clientReadDone = false;
+    std::atomic<bool> backendReadDone = false;
+    std::atomic<bool> closed = false;
     std::shared_ptr<ClientContextCoro> client;
     BackendSocketPtr backend;
+    CompletionSignal completionSignal;
+    IdleTimer idleTimer;
+    EpollScheduler *scheduler = nullptr;
+
+    ForwardCoordinator(std::shared_ptr<ClientContextCoro> client_, BackendSocketPtr backend_)
+        : client(std::move(client_)), backend(std::move(backend_)) {
+        idleTimer.arm();
+    }
+
+    void resetIdleTimer() {
+        idleTimer.arm();
+    }
+
+    void signalCompletion() {
+        completionSignal.signal();
+    }
+
+    void onDirectionDone(const bool isClientDirection) {
+        auto &self = isClientDirection ? clientReadDone : backendReadDone;
+        const auto &other = isClientDirection ? backendReadDone : clientReadDone;
+        self.store(true, std::memory_order_release);
+
+        if (scheduler != nullptr) {
+            if (isClientDirection && client != nullptr && client->socket != nullptr) {
+                scheduler->forceRemoveFd(client->socket->fd());
+            } else if (!isClientDirection && backend != nullptr) {
+                scheduler->forceRemoveFd(backend->fd());
+            }
+        }
+
+        if (other.load(std::memory_order_acquire)) {
+            closeAll();
+        }
+        signalCompletion();
+    }
+
+    void closeAll() {
+        if (scheduler != nullptr) {
+            if (backend != nullptr && backend->fd() >= 0) {
+                scheduler->forceRemoveFd(backend->fd());
+            }
+            if (client != nullptr && client->socket != nullptr && client->socket->fd() >= 0) {
+                scheduler->forceRemoveFd(client->socket->fd());
+            }
+        }
+
+        if (closed.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+
+        if (backend != nullptr) {
+            backend->close();
+        }
+        if (client != nullptr && client->socket != nullptr) {
+            client->socket->close();
+        }
+    }
+
+    [[nodiscard]] bool isBothDone() const {
+        return clientReadDone.load(std::memory_order_relaxed) &&
+               backendReadDone.load(std::memory_order_relaxed);
+    }
+
+    void drainCompletion() const {
+        completionSignal.drain();
+    }
+
+    bool checkIdleTimeout() {
+        idleTimer.drain();
+        log_v("Closing connection due to idle timeout\n");
+        closeAll();
+        return true;
+    }
 };
 
-static CoroTask<void> forwardClientToBackend(std::shared_ptr<ForwardState> state) {
-    constexpr size_t kBufferSize = 8192;
-    std::vector<uint8_t> buffer(kBufferSize);
+template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typename DestIsEofFunc>
+static CoroTask<void> forwardDirection(const std::shared_ptr<ForwardCoordinator> state,
+                                       ReadFunc read, WriteFunc write,
+                                       SourceIsEofFunc sourceIsEof, DestIsEofFunc destIsEof,
+                                       std::atomic<bool> &sourceDoneFlag,
+                                       std::atomic<bool> &destDoneFlag,
+                                       bool isClientDirection) {
+    constexpr size_t kBufferSize = Constants::BUFFER_SIZE;
+    Buffer buffer(kBufferSize);
 
-    while (!state->clientDone.load() && !state->sshDone.load()) {
-        if (state->client->socket->isEof()) {
-            break;
+    try {
+        while (!sourceDoneFlag.load()) {
+            if (destDoneFlag.load() || destIsEof()) {
+                break;
+            }
+            if (sourceIsEof()) {
+                break;
+            }
+
+            const size_t n = co_await read(buffer.span());
+            if (n == 0) {
+                break;
+            }
+
+            state->resetIdleTimer();
+
+            size_t written = 0;
+            while (written < n) {
+                if (destDoneFlag.load() || destIsEof()) {
+                    break;
+                }
+                const size_t chunk = co_await write(buffer.subspan(written, n - written));
+                if (chunk == 0) {
+                    break;
+                }
+                written += chunk;
+                state->resetIdleTimer();
+            }
         }
+    } catch (const std::exception &e) {
+        log_e("{}->{} exception: {}\n",
+              isClientDirection ? "C" : "B",
+              isClientDirection ? "B" : "C",
+              e.what());
+    } catch (...) {
+    }
 
-        const size_t n = co_await state->client->socket->read(buffer);
-        if (n == 0) {
-            if (state->client->socket->isEof()) {
-                break;
-            }
-            continue;
-        }
+    state->onDirectionDone(isClientDirection);
+}
 
-        size_t written = 0;
-        while (written < n && !state->sshDone.load()) {
-            if (state->backend->isEof()) {
-                state->sshDone.store(true);
-                break;
-            }
-            const size_t chunk = co_await state->backend->writeAsync({buffer.data() + written, n - written});
-            if (chunk == 0 && state->backend->isEof()) {
-                state->sshDone.store(true);
-                break;
-            }
-            written += chunk;
+static CoroTask<void> forwardClientToBackend(const std::shared_ptr<ForwardCoordinator> state) {
+    co_await forwardDirection(state,
+                              [state](std::span<uint8_t> buf) -> CoroTask<size_t> {
+                                  co_return co_await state->client->socket->read(buf);
+                              },
+                              [state](std::span<const uint8_t> buf) -> CoroTask<size_t> {
+                                  return state->backend->writeAsync(buf);
+                              },
+                              [state]() -> bool { return state->client->socket->isEof(); },
+                              [state]() -> bool { return state->backend->isEof(); },
+                              state->clientReadDone,
+                              state->backendReadDone,
+                              true);
+}
+
+static CoroTask<void> forwardBackendToClient(const std::shared_ptr<ForwardCoordinator> state) {
+    co_await forwardDirection(state,
+                              [state](std::span<uint8_t> buf) -> CoroTask<size_t> {
+                                  return state->backend->readAsync(buf);
+                              },
+                              [state](std::span<const uint8_t> buf) -> CoroTask<size_t> {
+                                  co_await writeAll(state->client->socket, buf);
+                                  co_return buf.size();
+                              },
+                              [state]() -> bool { return state->backend->isEof(); },
+                              [state]() -> bool { return state->client->socket->isEof(); },
+                              state->backendReadDone,
+                              state->clientReadDone,
+                              false);
+}
+
+struct MultiFdAwaiter final : SchedulerAware<EpollScheduler> {
+    struct FdInfo final {
+        [[maybe_unused]] int fd;
+        [[maybe_unused]] uint32_t events;
+    };
+
+    explicit MultiFdAwaiter(std::vector<FdInfo> fds_) : fds(std::move(fds_)) {
+    }
+
+    [[nodiscard]] bool await_ready() const noexcept {
+        return false;
+    }
+
+    void await_suspend(const std::coroutine_handle<> h) {
+        handle = h;
+        for (const auto &[fd, events]: fds) {
+            this->getScheduler()->add(events, fd, h);
         }
     }
 
-    state->clientDone.store(true);
-    state->backend->close();
-}
-
-static CoroTask<void> forwardBackendToClient(std::shared_ptr<ForwardState> state) {
-    constexpr size_t kBufferSize = 8192;
-    std::vector<uint8_t> buffer(kBufferSize);
-
-    while (!state->sshDone.load() && !state->clientDone.load()) {
-        if (state->backend->isEof()) {
-            break;
+    std::vector<int> await_resume() {
+        for (const auto &[fd, _]: fds) {
+            this->getScheduler()->remove(fd, handle);
         }
-
-        const size_t n = co_await state->backend->readAsync(buffer);
-        if (n == 0) {
-            if (state->backend->isEof()) {
-                break;
+        std::vector<int> ready;
+        for (const auto &[fd, _]: fds) {
+            pollfd pollFD{fd, POLLIN, 0};
+            if (poll(&pollFD, 1, 0) == 1 && pollFD.revents & POLLIN) {
+                ready.push_back(fd);
             }
-            continue;
         }
-
-        try {
-            co_await writeAll(state->client->socket, {buffer.data(), n});
-        } catch (const std::runtime_error &) {
-            state->clientDone.store(true);
-            break;
-        }
+        return ready;
     }
 
-    state->sshDone.store(true);
-    state->client->closeSocket();
-}
+private:
+    std::vector<FdInfo> fds;
+    std::coroutine_handle<> handle = {};
+};
 
 static CoroTask<void> forwardData(const std::shared_ptr<ClientContextCoro> clientCtx,
                                   const BackendSocketPtr backendSocket) {
     clientCtx->setState(ClientContextCoro::State::FORWARDING);
 
-    const auto state = std::make_shared<ForwardState>();
-    state->client = clientCtx;
-    state->backend = backendSocket;
+    const auto state = std::make_shared<ForwardCoordinator>(clientCtx, backendSocket);
 
     auto *scheduler = co_await GetScheduler{};
+    state->scheduler = scheduler;
 
     auto clientToBackend = forwardClientToBackend(state);
     auto backendToClient = forwardBackendToClient(state);
@@ -505,18 +636,21 @@ static CoroTask<void> forwardData(const std::shared_ptr<ClientContextCoro> clien
     clientToBackend.detach(*scheduler);
     backendToClient.detach(*scheduler);
 
-    const auto startTime = std::chrono::steady_clock::now();
-    constexpr auto timeout = std::chrono::seconds(30);
+    while (!state->isBothDone()) {
+        const auto readyFds = co_await MultiFdAwaiter{
+            {
+                {state->completionSignal.getFd(), EPOLLIN},
+                {state->idleTimer.getFd(), EPOLLIN}
+            }
+        };
 
-    while (!state->clientDone.load() || !state->sshDone.load()) {
-        if (std::chrono::steady_clock::now() - startTime > timeout) {
-            state->clientDone.store(true);
-            state->sshDone.store(true);
-            shutdown(clientCtx->socket->fd(), SHUT_RDWR);
-            shutdown(backendSocket->fd(), SHUT_RDWR);
-            break;
+        for (const int fd: readyFds) {
+            if (fd == state->completionSignal.getFd()) {
+                state->drainCompletion();
+            } else if (fd == state->idleTimer.getFd() && state->checkIdleTimeout()) {
+                break;
+            }
         }
-        co_await TimerAwaiter{std::chrono::milliseconds{100}};
     }
 
     clientCtx->setState(ClientContextCoro::State::CLOSED);
@@ -577,7 +711,7 @@ SSHProxy::~SSHProxy() {
 }
 
 void SSHProxy::start(const ProxyConfig &proxyConfig) {
-    if (mainThread) {
+    if (mainThread != std::nullopt) {
         throw std::runtime_error("Already started");
     }
     this->config = proxyConfig;
@@ -585,13 +719,13 @@ void SSHProxy::start(const ProxyConfig &proxyConfig) {
 }
 
 void SSHProxy::requestStop() noexcept {
-    if (mainThread) {
+    if (mainThread != std::nullopt) {
         mainThread->request_stop();
     }
 }
 
 void SSHProxy::waitForFinish() {
-    if (mainThread) {
+    if (mainThread != std::nullopt) {
         mainThread.value().join();
     }
 }

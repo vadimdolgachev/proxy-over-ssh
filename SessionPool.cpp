@@ -4,8 +4,10 @@
 
 #include "SessionPool.h"
 
+#include <libssh2.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <ranges>
 
 #include "Logger.h"
@@ -22,11 +24,47 @@ SessionPool::~SessionPool() {
 }
 
 void SessionPool::invalidate(const SshSessionHandler &handle) {
+    std::lock_guard lock(mutex);
+    if (handle.sshSession == nullptr) {
+        return;
+    }
     if (const auto it = std::ranges::find_if(sessions, [&handle](const SshSessionHandler &sh) {
-        return sh.sshSession->raw() == handle.sshSession->raw();
+        return sh.sshSession != nullptr && sh.sshSession->raw() == handle.sshSession->raw();
     }); it != sessions.end()) {
         sessions.erase(it);
     }
+}
+
+SessionPool::BorrowedSession::BorrowedSession(SessionPool &pool_, SshSessionHandler session_) : pool(pool_),
+    session(std::move(session_)) {
+}
+
+SessionPool::BorrowedSession::~BorrowedSession() {
+    if (session.has_value()) {
+        pool.release(std::move(session.value()));
+    }
+}
+
+SessionPool::BorrowedSession::BorrowedSession(BorrowedSession &&other) noexcept : pool(other.pool),
+    session(std::exchange(other.session, std::nullopt)) {
+}
+
+SshSessionHandler &SessionPool::BorrowedSession::getSession() {
+    return session.value();
+}
+
+const SshSessionHandler &SessionPool::BorrowedSession::getSession() const {
+    return session.value();
+}
+
+SessionPool::BorrowedSession::operator bool() const {
+    return session.has_value();
+}
+
+SshSessionHandler SessionPool::BorrowedSession::take() {
+    SshSessionHandler s = std::move(session.value());
+    session = std::nullopt;
+    return s;
 }
 
 std::optional<SshSessionHandler> SessionPool::acquire() {
@@ -35,20 +73,41 @@ std::optional<SshSessionHandler> SessionPool::acquire() {
     while (!sessions.empty()) {
         auto handle = std::move(sessions.back());
         sessions.pop_back();
-        if (validateSession(handle)) {
+        const ValidationResult result = validateSessionDetailed(handle);
+        if (result == ValidationResult::VALID) {
             handle.lastUsed = std::chrono::steady_clock::now();
+            handle.lastHealthCheck = std::chrono::steady_clock::now();
+            handle.failedHealthChecks = 0;
             return handle;
         }
-        log_v("SessionPool: Error socket validation!\n");
+        log_v("SessionPool: Discarding invalid session (socket={}, reason={})\n",
+              handle.tcpSocket != nullptr ? handle.tcpSocket->fd() : -1,
+              validationResultToString(result));
     }
     log_v("SessionPool: No session available in pool\n");
     return std::nullopt;
 }
 
+SessionPool::BorrowedSession SessionPool::borrow() {
+    if (auto opt = acquire()) {
+        return {*this, std::move(*opt)};
+    }
+    return BorrowedSession(*this, SshSessionHandler{});
+}
+
 void SessionPool::release(SshSessionHandler session) {
     std::lock_guard lock(mutex);
+    if (session.sshSession == nullptr || session.tcpSocket == nullptr) {
+        log_v("SessionPool: Discarding empty session\n");
+        return;
+    }
+    session.lastHealthCheck = std::chrono::steady_clock::now();
+    session.failedHealthChecks = 0;
+
+    if (sessions.size() > maxSessions) {
+        sessions.pop_front();
+    }
     sessions.push_back(std::move(session));
-    log_v("SessionPool: Released session size {}\n", sessions.size());
 }
 
 void SessionPool::cleanup() {
@@ -56,17 +115,60 @@ void SessionPool::cleanup() {
     sessions.clear();
 }
 
-bool SessionPool::validateSession(const SshSessionHandler &handle) {
-    if (!handle.sshSession || handle.tcpSocket->fd() < 0) {
-        return false;
+SessionPool::ValidationResult SessionPool::validateSessionDetailed(const SshSessionHandler &handle) {
+    if (handle.sshSession == nullptr || handle.tcpSocket == nullptr) {
+        return ValidationResult::NULL_COMPONENTS;
+    }
+
+    if (handle.tcpSocket->fd() < 0) {
+        return ValidationResult::INVALID_SOCKET_FD;
     }
 
     int error = 0;
     socklen_t len = sizeof(error);
     if (getsockopt(handle.tcpSocket->fd(), SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
-        return false;
+        return ValidationResult::SOCKET_OPT_FAILED;
+    }
+    if (error != 0) {
+        return ValidationResult::SOCKET_ERROR;
     }
 
-    std::cout << "validateSession: socket: " << handle.tcpSocket->fd() << ", error:" << error << std::endl;
-    return error == 0;
+    const int originalFlags = fcntl(handle.tcpSocket->fd(), F_GETFL, 0);
+    if (originalFlags == -1) {
+        return ValidationResult::SOCKET_OPT_FAILED;
+    }
+    if (fcntl(handle.tcpSocket->fd(), F_SETFL, originalFlags | O_NONBLOCK) == -1) {
+        return ValidationResult::SOCKET_OPT_FAILED;
+    }
+
+    const int keepaliveResult = libssh2_keepalive_send(handle.sshSession->raw(), nullptr);
+
+    fcntl(handle.tcpSocket->fd(), F_SETFL, originalFlags);
+
+    if (keepaliveResult == LIBSSH2_ERROR_EAGAIN) {
+        return ValidationResult::VALID;
+    }
+    if (keepaliveResult < 0) {
+        return ValidationResult::SSH_KEEPALIVE_FAILED;
+    }
+
+    return ValidationResult::VALID;
+}
+
+bool SessionPool::validateSession(const SshSessionHandler &handle) {
+    return validateSessionDetailed(handle) == ValidationResult::VALID;
+}
+
+const char *SessionPool::validationResultToString(ValidationResult result) {
+    switch (result) {
+        case ValidationResult::VALID: return "VALID";
+        case ValidationResult::NULL_COMPONENTS: return "NULL_COMPONENTS";
+        case ValidationResult::INVALID_SOCKET_FD: return "INVALID_SOCKET_FD";
+        case ValidationResult::SOCKET_OPT_FAILED: return "SOCKET_OPT_FAILED";
+        case ValidationResult::SOCKET_ERROR: return "SOCKET_ERROR";
+        case ValidationResult::SSH_KEEPALIVE_FAILED: return "SSH_KEEPALIVE_FAILED";
+        case ValidationResult::SSH_SESSION_DEAD: return "SSH_SESSION_DEAD";
+        case ValidationResult::TIMEOUT: return "TIMEOUT";
+        default: return "UNKNOWN";
+    }
 }

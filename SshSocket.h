@@ -17,63 +17,19 @@
 #include "SSHProxy.h"
 #include "SessionPool.h"
 #include "SshSessionHandler.h"
+#include "SshConStateMachine.h"
 
 class SshSocket;
+struct SshConnectAwaiter;
+struct SshFdWaitAwaiter;
+struct SshSocketAwaiterBase;
 
-struct SshConnectAwaiter final : SchedulerAware<EpollScheduler> {
-    SshConnectAwaiter(std::shared_ptr<SshSocket> sshSocket_, Endpoint targetEndpoint_);
-
-    [[nodiscard]] bool await_ready() const noexcept;
-
-    void await_suspend(std::coroutine_handle<> h);
-
-    void await_resume();
-
-private:
-    std::shared_ptr<SshSocket> sshSocket;
-    Endpoint targetEndpoint;
-    mutable int connectErrno = 0;
-};
-
-struct SshReadAwaiter final : SchedulerAware<EpollScheduler> {
-    SshReadAwaiter(std::shared_ptr<SshSocket> sshSocket_, std::span<unsigned char> buffer_);
-
-    [[nodiscard]] bool await_ready() const noexcept;
-
-    void await_suspend(std::coroutine_handle<> h);
-
-    size_t await_resume();
-
-private:
-    std::shared_ptr<SshSocket> sshSocket;
-    std::span<unsigned char> buffer;
-    mutable int peekErrno = 0;
-    mutable bool peekEof = false;
-    mutable std::optional<size_t> peekResult;
-    std::chrono::steady_clock::time_point startTime;
-    static constexpr std::chrono::seconds timeout{30};
-};
-
-struct SshWriteAwaiter final : SchedulerAware<EpollScheduler> {
-    SshWriteAwaiter(std::shared_ptr<SshSocket> sshSocket_, std::span<unsigned char> buffer_);
-
-    [[nodiscard]] bool await_ready() const noexcept;
-
-    void await_suspend(std::coroutine_handle<> h);
-
-    size_t await_resume();
-
-private:
-    std::shared_ptr<SshSocket> sshSocket;
-    std::span<unsigned char> buffer;
-    mutable int pollErrno = 0;
-    mutable bool pollError = false;
-    mutable short pollRevents = 0;
-    mutable std::optional<size_t> pollResult;
-};
-
-class SshSocket : public IBackendSocket, public std::enable_shared_from_this<SshSocket> {
+class SshSocket : public IBackendSocket,
+                  public std::enable_shared_from_this<SshSocket>,
+                  SshConStateMachine::Context {
 public:
+    using State = SshConStateMachine::State;
+
     SshSocket(SSHConfig sshConfig_, const std::shared_ptr<SessionPool> &sessionPool_);
 
     SshSocket(const SshSocket &) = delete;
@@ -86,10 +42,6 @@ public:
 
     [[nodiscard]] CoroTask<ResultCode> connectAsync(const Endpoint &targetEndpoint_) override;
 
-    [[nodiscard]] SshReadAwaiter read(std::span<unsigned char> buffer);
-
-    [[nodiscard]] SshWriteAwaiter write(std::span<unsigned char> buffer);
-
     [[nodiscard]] CoroTask<size_t> readAsync(std::span<uint8_t> buffer) override;
 
     [[nodiscard]] CoroTask<size_t> writeAsync(std::span<const uint8_t> data) override;
@@ -98,40 +50,89 @@ public:
 
     [[nodiscard]] bool isEof() const noexcept override;
 
+    [[nodiscard]] ResultCode tryTcpConnect() override;
+
+    [[nodiscard]] ResultCode performHandshake() override;
+
+    [[nodiscard]] ResultCode performAuthentication() override;
+
+    [[nodiscard]] ResultCode createChannel() override;
+
     void close() noexcept override;
 
 private:
     friend struct SshConnectAwaiter;
-    friend struct SshReadAwaiter;
-    friend struct SshWriteAwaiter;
+    friend struct SshFdWaitAwaiter;
+    friend struct SshSocketAwaiterBase;
 
-    enum class State {
-        DISCONNECTED,
-        TCP_CONNECTED,
-        SSH_HANDSHAKE,
-        SSH_AUTHENTICATED,
-        CHANNEL_CREATED,
-        ERROR
-    };
+    int getBlockDirections() const;
 
-    ResultCode tryTcpConnect();
+    static uint32_t computePollEvents(int directions, uint32_t defaultEvents);
 
     ResultCode advanceConnection();
 
-    ResultCode performHandshake();
+    ResultCode handleLibSsh2Result(int rc, const char *operation, SshConStateMachine::State successState);
 
-    ResultCode performAuthentication();
+    ResultCode handleLibSsh2ChannelResult(const LIBSSH2_CHANNEL *channel, const char *operation,
+                                          const std::string &host);
 
-    ResultCode createChannel();
+    ResultCode tryConnectNonBlocking();
 
     std::shared_ptr<SessionPool> sessionPool;
     SSHConfig sshConfig;
     Endpoint sshServerEndpoint;
     std::optional<SshSessionHandler> sessionHandle;
-    LIBSSH2_CHANNEL *libssh2Channel = nullptr;
+    LIBSSH2_CHANNEL *libSsh2Channel = nullptr;
     int pendingDirections = 0;
-    State state = State::DISCONNECTED;
+    SshConStateMachine stateMachine;
     Endpoint targetEndpoint;
+};
+
+struct SshSocketAwaiterBase : SchedulerAware<EpollScheduler> {
+protected:
+    explicit SshSocketAwaiterBase(std::shared_ptr<SshSocket> socket)
+        : sshSocket(std::move(socket)) {
+    }
+
+    [[nodiscard]] uint32_t computePollEvents(const uint32_t defaultEvents) const {
+        const int directions = sshSocket->getBlockDirections();
+        return sshSocket->computePollEvents(directions, defaultEvents);
+    }
+
+    void scheduleResume(const std::coroutine_handle<> h, const uint32_t defaultEvents) {
+        assert(this->getScheduler() != nullptr);
+        uint32_t events = computePollEvents(defaultEvents);
+        events |= EpollScheduler::PollEvents::EPOLLERR | EpollScheduler::PollEvents::EPOLLHUP;
+        this->getScheduler()->add(events, sshSocket->fd(), h);
+    }
+
+    std::shared_ptr<SshSocket> sshSocket;
+};
+
+struct SshConnectAwaiter final : SshSocketAwaiterBase {
+    SshConnectAwaiter(std::shared_ptr<SshSocket> sshSocket_, Endpoint targetEndpoint_);
+
+    [[nodiscard]] bool await_ready() const noexcept;
+
+    void await_suspend(std::coroutine_handle<> h);
+
+    void await_resume();
+
+private:
+    Endpoint targetEndpoint;
+    mutable int connectErrno = 0;
+};
+
+struct SshFdWaitAwaiter final : SshSocketAwaiterBase {
+    explicit SshFdWaitAwaiter(std::shared_ptr<SshSocket> socket)
+        : SshSocketAwaiterBase(std::move(socket)) {
+    }
+
+    [[nodiscard]] bool await_ready() const noexcept;
+
+    void await_suspend(std::coroutine_handle<> h);
+
+    void await_resume() noexcept;
 };
 
 using SshSocketPtr = std::shared_ptr<SshSocket>;

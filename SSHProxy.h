@@ -2,8 +2,8 @@
 // Created by vadim on 31.10.2025.
 //
 
-#ifndef SSHEPROXY_H
-#define SSHEPROXY_H
+#ifndef PROXY_OVER_SSH_SSHEPROXY_H
+#define PROXY_OVER_SSH_SSHEPROXY_H
 
 #include <atomic>
 #include <optional>
@@ -46,4 +46,4 @@ private:
     const std::atomic_bool &stopSignalFlag;
 };
 
-#endif // SSHEPROXY_H
+#endif // PROXY_OVER_SSH_SSHEPROXY_H

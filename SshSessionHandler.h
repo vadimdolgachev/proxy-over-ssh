@@ -8,6 +8,7 @@
 #include <libssh2.h>
 
 #include "Socket.h"
+#include "Constants.h"
 
 class SshSession final {
 public:
@@ -16,12 +17,11 @@ public:
             throw std::runtime_error("libssh2_session_init() failed");
         }
         libssh2_session_set_blocking(libssh2Session, 0);
-        libssh2_session_set_timeout(libssh2Session, 30000);
+        libssh2_keepalive_config(libssh2Session, 1, Constants::SSH_KEEPALIVE_INTERVAL_SEC);
     }
 
     ~SshSession() {
-        // std::cout << "~SshSession libssh2Session=" << libssh2Session << std::endl;
-        if (libssh2Session) {
+        if (libssh2Session != nullptr) {
             libssh2_session_free(libssh2Session);
         }
     }
@@ -34,11 +34,12 @@ public:
     }
 
     SshSession &operator=(SshSession &&handler) noexcept {
-        if (handler.libssh2Session != nullptr) {
-            handler.disconnect();
-            libssh2_session_free(handler.libssh2Session);
+        if (&handler != this) {
+            if (libssh2Session != nullptr) {
+                libssh2_session_free(libssh2Session);
+            }
+            libssh2Session = std::exchange(handler.libssh2Session, nullptr);
         }
-        libssh2Session = handler.libssh2Session;
         return *this;
     }
 
@@ -66,6 +67,9 @@ struct SshSessionHandler final {
     std::unique_ptr<SshSession> sshSession;
     SocketPtr tcpSocket;
     std::chrono::steady_clock::time_point lastUsed;
+    std::chrono::steady_clock::time_point lastHealthCheck;
+    int failedHealthChecks = 0;
+    bool keepaliveConfigured = true;
 };
 
 #endif //PROXY_OVER_SSH_SSHSESSIONHANDLER_H

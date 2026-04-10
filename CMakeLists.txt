@@ -17,7 +17,7 @@ CPMAddPackage(
 
 set(OPENSSL_ROOT_DIR ${openssl-cmake_BINARY_DIR})
 set(OPENSSL_INCLUDE_DIR ${openssl-cmake_BINARY_DIR}/include)
-if(ANDROID)
+if (ANDROID)
     set(OPENSSL_SSL_LIBRARY ${openssl-cmake_BINARY_DIR}/ssl/libssl_1_1.a)
     set(OPENSSL_CRYPTO_LIBRARY ${openssl-cmake_BINARY_DIR}/crypto/libcrypto_1_1.a)
 else ()
@@ -57,14 +57,19 @@ add_executable(proxy_over_ssh main.cpp
         SSHProxy.cpp
         SSHProxy.h
         CoroTask.h
+        Timer.h
         Socket.cpp
         Socket.h
         SshSocket.cpp
         SshSocket.h
+        SshConStateMachine.cpp
+        SshConStateMachine.h
         Endpoint.cpp
         Endpoint.h
         SessionPool.cpp
         SessionPool.h
+        IdleTimer.h
+        CompletionSignal.h
         SshSessionHandler.h
 )
 target_link_libraries(proxy_over_ssh PRIVATE
@@ -75,10 +80,10 @@ target_link_libraries(proxy_over_ssh PRIVATE
 #target_link_options(proxy_over_ssh PUBLIC -fsanitize=address)
 target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion -Wsign-conversion -Wnull-dereference -Wno-unused-variable -Wno-unused-parameter -Wno-unused-private-field -Werror=uninitialized -fno-omit-frame-pointer)
 
-if(ANDROID)
+if (ANDROID)
     message("ANDROID_ABI=${ANDROID_ABI}")
     message("ANDROID_NDK=${ANDROID_NDK}")
     message("ANDROID_NATIVE_API_LEVEL=${ANDROID_NATIVE_API_LEVEL}")
     message("ANDROID_PLATFORM=${ANDROID_PLATFORM}")
     target_link_libraries(proxy_over_ssh PRIVATE dl z log android)
-endif()
+endif ()
