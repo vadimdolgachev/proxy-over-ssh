@@ -81,6 +81,17 @@ uint32_t SshSocket::computePollEvents(const int directions, const uint32_t defau
 }
 
 ResultCode SshSocket::tryConnectNonBlocking() {
+    if (sessionPool != nullptr && sessionHandle == std::nullopt) {
+        if (auto opt = sessionPool->acquire()) {
+            sessionHandle = std::move(*opt);
+            if (sessionHandle->tcpSocket != nullptr) {
+                stateMachine.setState(State::SSH_AUTHENTICATED);
+            } else {
+                sessionHandle = std::nullopt;
+            }
+        }
+    }
+
     while (stateMachine.getState() != State::CHANNEL_CREATED) {
         const auto rc = advanceConnection();
         if (rc == ResultCode::ErrAgain) {
@@ -119,17 +130,6 @@ SshSocket::~SshSocket() {
 }
 
 ResultCode SshSocket::tryTcpConnect() {
-    if (sessionPool != nullptr && sessionHandle == std::nullopt) {
-        if (auto borrowed = sessionPool->borrow()) {
-            sessionHandle = borrowed.take();
-            if (sessionHandle->tcpSocket != nullptr) {
-                stateMachine.setState(State::SSH_AUTHENTICATED);
-                return ResultCode::Ok;
-            }
-            sessionHandle = std::nullopt;
-        }
-    }
-
     if (sessionHandle == std::nullopt) {
         sessionHandle = SshSessionHandler{
             .sshSession = nullptr,
@@ -250,18 +250,16 @@ SshConnectAwaiter SshSocket::connect(const Endpoint &targetEndpoint_) {
 CoroTask<ResultCode> SshSocket::connectAsync(const Endpoint &targetEndpoint_) {
     targetEndpoint = targetEndpoint_;
 
-    while (stateMachine.getState() != State::CHANNEL_CREATED) {
-        const auto rc = advanceConnection();
-        if (rc == ResultCode::ErrAgain) {
-            SshConnectAwaiter awaiter{shared_from_this(), targetEndpoint};
-            co_await awaiter;
-            continue;
+    while (true) {
+        const auto rc = tryConnectNonBlocking();
+        if (rc == ResultCode::Ok) {
+            co_return ResultCode::Ok;
         }
-        if (rc != ResultCode::Ok) {
+        if (rc != ResultCode::ErrAgain) {
             co_return rc;
         }
+        co_await SshConnectAwaiter{shared_from_this(), targetEndpoint};
     }
-    co_return ResultCode::Ok;
 }
 
 CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer) {

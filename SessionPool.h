@@ -33,38 +33,6 @@ public:
 
     void invalidate(const SshSessionHandler &handle);
 
-    // RAII wrapper for a session borrowed from the pool.
-    // Automatically releases the session back to the pool on destruction,
-    // unless the session has been taken via take().
-    class BorrowedSession {
-    public:
-        BorrowedSession(SessionPool &pool_, SshSessionHandler session_);
-
-        ~BorrowedSession();
-
-        BorrowedSession(BorrowedSession &&other) noexcept;
-
-        BorrowedSession &operator=(BorrowedSession &&other) = delete;
-
-        BorrowedSession(const BorrowedSession &) = delete;
-
-        BorrowedSession &operator=(const BorrowedSession &) = delete;
-
-        SshSessionHandler &getSession();
-
-        const SshSessionHandler &getSession() const;
-
-        explicit operator bool() const;
-
-        SshSessionHandler take();
-
-    private:
-        SessionPool &pool;
-        std::optional<SshSessionHandler> session;
-    };
-
-    BorrowedSession borrow();
-
 private:
     enum class ValidationResult {
         VALID,

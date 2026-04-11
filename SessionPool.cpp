@@ -35,38 +35,6 @@ void SessionPool::invalidate(const SshSessionHandler &handle) {
     }
 }
 
-SessionPool::BorrowedSession::BorrowedSession(SessionPool &pool_, SshSessionHandler session_) : pool(pool_),
-    session(std::move(session_)) {
-}
-
-SessionPool::BorrowedSession::~BorrowedSession() {
-    if (session.has_value()) {
-        pool.release(std::move(session.value()));
-    }
-}
-
-SessionPool::BorrowedSession::BorrowedSession(BorrowedSession &&other) noexcept : pool(other.pool),
-    session(std::exchange(other.session, std::nullopt)) {
-}
-
-SshSessionHandler &SessionPool::BorrowedSession::getSession() {
-    return session.value();
-}
-
-const SshSessionHandler &SessionPool::BorrowedSession::getSession() const {
-    return session.value();
-}
-
-SessionPool::BorrowedSession::operator bool() const {
-    return session.has_value();
-}
-
-SshSessionHandler SessionPool::BorrowedSession::take() {
-    SshSessionHandler s = std::move(session.value());
-    session = std::nullopt;
-    return s;
-}
-
 std::optional<SshSessionHandler> SessionPool::acquire() {
     std::lock_guard lock(mutex);
     log_v("SessionPool: pool size={}\n", sessions.size());
@@ -86,13 +54,6 @@ std::optional<SshSessionHandler> SessionPool::acquire() {
     }
     log_v("SessionPool: No session available in pool\n");
     return std::nullopt;
-}
-
-SessionPool::BorrowedSession SessionPool::borrow() {
-    if (auto opt = acquire()) {
-        return {*this, std::move(*opt)};
-    }
-    return BorrowedSession(*this, SshSessionHandler{});
 }
 
 void SessionPool::release(SshSessionHandler session) {
