@@ -18,22 +18,20 @@
 #include "SessionPool.h"
 
 
-ResultCode SshSocket::handleLibSsh2Result(int rc, const char *operation, const SshConStateMachine::State successState) {
+ResultCode SshSocket::handleLibSsh2Result(int rc, const char *operation) {
     if (rc == LIBSSH2_ERROR_EAGAIN) {
         if (sessionHandle && sessionHandle->sshSession) {
             pendingDirections = sessionHandle->sshSession->blockDirections();
         } else {
-            pendingDirections = LIBSSH2_SESSION_BLOCK_OUTBOUND; // fallback for TCP connect
+            pendingDirections = LIBSSH2_SESSION_BLOCK_OUTBOUND;
         }
         return ResultCode::ErrAgain;
     }
     if (rc != 0) {
         sessionHandle = std::nullopt;
         SshError::logError(operation, rc);
-        stateMachine.setState(State::ERROR);
         return SshError::libSsh2ToResultCode(rc);
     }
-    stateMachine.setState(successState);
     pendingDirections = 0;
     return ResultCode::Ok;
 }
@@ -48,10 +46,8 @@ ResultCode SshSocket::handleLibSsh2ChannelResult(const LIBSSH2_CHANNEL *const ch
         }
         sessionHandle = std::nullopt;
         SshError::logError(operation, lastErr, host);
-        stateMachine.setState(State::ERROR);
         return SshError::libSsh2ToResultCode(lastErr);
     }
-    stateMachine.setState(State::CHANNEL_CREATED);
     pendingDirections = 0;
     return ResultCode::Ok;
 }
@@ -85,14 +81,14 @@ ResultCode SshSocket::tryConnectNonBlocking() {
         if (auto opt = sessionPool->acquire()) {
             sessionHandle = std::move(*opt);
             if (sessionHandle->tcpSocket != nullptr) {
-                stateMachine.setState(State::SSH_AUTHENTICATED);
+                connectionState = State::SSH_AUTHENTICATED;
             } else {
                 sessionHandle = std::nullopt;
             }
         }
     }
 
-    while (stateMachine.getState() != State::CHANNEL_CREATED) {
+    while (connectionState != State::CHANNEL_CREATED) {
         const auto rc = advanceConnection();
         if (rc == ResultCode::ErrAgain) {
             return ResultCode::ErrAgain;
@@ -150,7 +146,7 @@ ResultCode SshSocket::tryTcpConnect() {
 
     if (const int rc = ::connect(fd, reinterpret_cast<const sockaddr *>(&storage), len);
         rc == 0) {
-        stateMachine.setState(State::TCP_CONNECTED);
+        connectionState = State::TCP_CONNECTED;
         return ResultCode::Ok;
     }
 
@@ -168,7 +164,7 @@ ResultCode SshSocket::tryTcpConnect() {
         if (sockErr != 0) {
             return ResultCode::ErrIO;
         }
-        stateMachine.setState(State::TCP_CONNECTED);
+        connectionState = State::TCP_CONNECTED;
         return ResultCode::Ok;
     }
 
@@ -176,7 +172,49 @@ ResultCode SshSocket::tryTcpConnect() {
 }
 
 ResultCode SshSocket::advanceConnection() {
-    return stateMachine.advance(*this, &pendingDirections);
+    switch (connectionState) {
+        case State::DISCONNECTED: {
+            const auto rc = tryTcpConnect();
+            if (rc == ResultCode::ErrAgain) {
+                pendingDirections = LIBSSH2_SESSION_BLOCK_OUTBOUND;
+                return ResultCode::ErrAgain;
+            }
+            connectionState = rc == ResultCode::Ok ? State::TCP_CONNECTED : State::ERROR;
+            return rc;
+        }
+        case State::TCP_CONNECTED: {
+            const auto rc = performHandshake();
+            if (rc == ResultCode::Ok) {
+                connectionState = State::SSH_HANDSHAKE;
+            } else if (rc != ResultCode::ErrAgain) {
+                connectionState = State::ERROR;
+            }
+            return rc;
+        }
+        case State::SSH_HANDSHAKE: {
+            const auto rc = performAuthentication();
+            if (rc == ResultCode::Ok) {
+                connectionState = State::SSH_AUTHENTICATED;
+            } else if (rc != ResultCode::ErrAgain) {
+                connectionState = State::ERROR;
+            }
+            return rc;
+        }
+        case State::SSH_AUTHENTICATED: {
+            const auto rc = createChannel();
+            if (rc == ResultCode::Ok) {
+                connectionState = State::CHANNEL_CREATED;
+            } else if (rc != ResultCode::ErrAgain) {
+                connectionState = State::ERROR;
+            }
+            return rc;
+        }
+        case State::CHANNEL_CREATED:
+            return ResultCode::Ok;
+        case State::ERROR:
+            return ResultCode::ErrUnknown;
+    }
+    return ResultCode::ErrUnknown;
 }
 
 ResultCode SshSocket::performHandshake() {
@@ -184,13 +222,12 @@ ResultCode SshSocket::performHandshake() {
         try {
             sessionHandle->sshSession = std::make_unique<SshSession>();
         } catch (const std::exception &e) {
-            stateMachine.setState(State::ERROR);
             return ResultCode::ErrUnknown;
         }
     }
 
     const int rc = sessionHandle->sshSession->handshake(sessionHandle->tcpSocket);
-    return handleLibSsh2Result(rc, "performHandshake", State::SSH_HANDSHAKE);
+    return handleLibSsh2Result(rc, "performHandshake");
 }
 
 ResultCode SshSocket::performAuthentication() {
@@ -219,7 +256,7 @@ ResultCode SshSocket::performAuthentication() {
         return ResultCode::ErrInvalidPrivateKey;
     }
 
-    return handleLibSsh2Result(rc, "performAuthentication", State::SSH_AUTHENTICATED);
+    return handleLibSsh2Result(rc, "performAuthentication");
 }
 
 ResultCode SshSocket::createChannel() {
@@ -357,7 +394,7 @@ void SshSocket::close() noexcept {
         return;
     }
 
-    if (sessionPool != nullptr && stateMachine.getState() != State::ERROR) {
+    if (sessionPool != nullptr && connectionState != State::ERROR) {
         sessionPool->release(std::move(sessionHandle.value()));
     } else {
         if (sessionHandle->tcpSocket != nullptr) {
@@ -369,7 +406,7 @@ void SshSocket::close() noexcept {
     }
 
     sessionHandle = std::nullopt;
-    stateMachine.setState(State::DISCONNECTED);
+    connectionState = State::DISCONNECTED;
     pendingDirections = 0;
 }
 
@@ -379,7 +416,7 @@ SshConnectAwaiter::SshConnectAwaiter(std::shared_ptr<SshSocket> sshSocket_, Endp
 }
 
 bool SshConnectAwaiter::await_ready() const noexcept {
-    if (sshSocket->stateMachine.getState() == SshConStateMachine::State::CHANNEL_CREATED) {
+    if (sshSocket->connectionState == SshSocket::State::CHANNEL_CREATED) {
         return true;
     }
 

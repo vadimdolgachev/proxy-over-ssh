@@ -17,7 +17,6 @@
 #include "SSHProxy.h"
 #include "SessionPool.h"
 #include "SshSessionHandler.h"
-#include "SshConStateMachine.h"
 
 class SshSocket;
 struct SshConnectAwaiter;
@@ -25,10 +24,16 @@ struct SshFdWaitAwaiter;
 struct SshSocketAwaiterBase;
 
 class SshSocket : public IBackendSocket,
-                  public std::enable_shared_from_this<SshSocket>,
-                  SshConStateMachine::Context {
+                  public std::enable_shared_from_this<SshSocket> {
 public:
-    using State = SshConStateMachine::State;
+    enum class State {
+        DISCONNECTED,
+        TCP_CONNECTED,
+        SSH_HANDSHAKE,
+        SSH_AUTHENTICATED,
+        CHANNEL_CREATED,
+        ERROR
+    };
 
     SshSocket(SSHConfig sshConfig_, const std::shared_ptr<SessionPool> &sessionPool_);
 
@@ -50,14 +55,6 @@ public:
 
     [[nodiscard]] bool isEof() const noexcept override;
 
-    [[nodiscard]] ResultCode tryTcpConnect() override;
-
-    [[nodiscard]] ResultCode performHandshake() override;
-
-    [[nodiscard]] ResultCode performAuthentication() override;
-
-    [[nodiscard]] ResultCode createChannel() override;
-
     void close() noexcept override;
 
 private:
@@ -65,13 +62,21 @@ private:
     friend struct SshFdWaitAwaiter;
     friend struct SshSocketAwaiterBase;
 
+    ResultCode tryTcpConnect();
+
+    ResultCode performHandshake();
+
+    ResultCode performAuthentication();
+
+    ResultCode createChannel();
+
     int getBlockDirections() const;
 
     static uint32_t computePollEvents(int directions, uint32_t defaultEvents);
 
     ResultCode advanceConnection();
 
-    ResultCode handleLibSsh2Result(int rc, const char *operation, SshConStateMachine::State successState);
+    ResultCode handleLibSsh2Result(int rc, const char *operation);
 
     ResultCode handleLibSsh2ChannelResult(const LIBSSH2_CHANNEL *channel, const char *operation,
                                           const std::string &host);
@@ -84,7 +89,7 @@ private:
     std::optional<SshSessionHandler> sessionHandle;
     LIBSSH2_CHANNEL *libSsh2Channel = nullptr;
     int pendingDirections = 0;
-    SshConStateMachine stateMachine;
+    State connectionState = State::DISCONNECTED;
     Endpoint targetEndpoint;
 };
 

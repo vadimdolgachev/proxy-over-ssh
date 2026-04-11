@@ -34,14 +34,6 @@
 #include "CompletionSignal.h"
 
 struct ClientContextCoro final {
-    enum class State {
-        HANDSHAKE,
-        REQUEST,
-        SSH_SOCKET_CONNECT,
-        FORWARDING,
-        CLOSED
-    };
-
     ClientContextCoro(Endpoint endpoint_, SocketPtr socket_)
         : endpoint(std::move(endpoint_)),
           socket(std::move(socket_)) {
@@ -63,17 +55,10 @@ struct ClientContextCoro final {
         }
     }
 
-    void setState(const State newState) noexcept {
-        state = newState;
-    }
-
     Endpoint endpoint;
     Endpoint targetEndpoint;
     SocketPtr socket;
     std::vector<uint8_t> buffer;
-
-private:
-    State state = State::HANDSHAKE;
 };
 
 namespace {
@@ -173,8 +158,6 @@ CoroTask<void> handleSocks5Handshake(const std::shared_ptr<ClientContextCoro> cl
     if (selectedMethod == 0xFF) {
         throw std::runtime_error("No acceptable SOCKS5 authentication method");
     }
-
-    clientCtx->setState(ClientContextCoro::State::REQUEST);
 }
 
 static CoroTask<void> writeAll(const SocketPtr &socket, std::span<const uint8_t> data) {
@@ -397,7 +380,6 @@ CoroTask<void> handleSocks5Request(const std::shared_ptr<ClientContextCoro> clie
         throw std::runtime_error("Address not allowed");
     }
     clientCtx->targetEndpoint = req.targetEndpoint;
-    clientCtx->setState(ClientContextCoro::State::SSH_SOCKET_CONNECT);
 }
 
 static CoroTask<void> sendSocks5Success(const std::shared_ptr<ClientContextCoro> clientCtx) {
@@ -435,14 +417,6 @@ struct ForwardCoordinator final {
         idleTimer.arm();
     }
 
-    void resetIdleTimer() {
-        idleTimer.arm();
-    }
-
-    void signalCompletion() {
-        completionSignal.signal();
-    }
-
     void onDirectionDone(const bool isClientDirection) {
         auto &self = isClientDirection ? clientReadDone : backendReadDone;
         const auto &other = isClientDirection ? backendReadDone : clientReadDone;
@@ -459,7 +433,7 @@ struct ForwardCoordinator final {
         if (other.load(std::memory_order_acquire)) {
             closeAll();
         }
-        signalCompletion();
+        completionSignal.signal();
     }
 
     void closeAll() {
@@ -482,15 +456,6 @@ struct ForwardCoordinator final {
         if (client != nullptr && client->socket != nullptr) {
             client->socket->close();
         }
-    }
-
-    [[nodiscard]] bool isBothDone() const {
-        return clientReadDone.load(std::memory_order_relaxed) &&
-               backendReadDone.load(std::memory_order_relaxed);
-    }
-
-    void drainCompletion() const {
-        completionSignal.drain();
     }
 
     bool checkIdleTimeout() {
@@ -525,7 +490,7 @@ static CoroTask<void> forwardDirection(const std::shared_ptr<ForwardCoordinator>
                 break;
             }
 
-            state->resetIdleTimer();
+            state->idleTimer.arm();
 
             size_t written = 0;
             while (written < n) {
@@ -537,7 +502,7 @@ static CoroTask<void> forwardDirection(const std::shared_ptr<ForwardCoordinator>
                     break;
                 }
                 written += chunk;
-                state->resetIdleTimer();
+                state->idleTimer.arm();
             }
         }
     } catch (const std::exception &e) {
@@ -584,8 +549,8 @@ static CoroTask<void> forwardBackendToClient(const std::shared_ptr<ForwardCoordi
 
 struct MultiFdAwaiter final : SchedulerAware<EpollScheduler> {
     struct FdInfo final {
-        [[maybe_unused]] int fd;
-        [[maybe_unused]] uint32_t events;
+        int fd;
+        uint32_t events;
     };
 
     explicit MultiFdAwaiter(std::vector<FdInfo> fds_) : fds(std::move(fds_)) {
@@ -623,8 +588,6 @@ private:
 
 static CoroTask<void> forwardData(const std::shared_ptr<ClientContextCoro> clientCtx,
                                   const BackendSocketPtr backendSocket) {
-    clientCtx->setState(ClientContextCoro::State::FORWARDING);
-
     const auto state = std::make_shared<ForwardCoordinator>(clientCtx, backendSocket);
 
     auto *scheduler = co_await GetScheduler{};
@@ -636,7 +599,8 @@ static CoroTask<void> forwardData(const std::shared_ptr<ClientContextCoro> clien
     clientToBackend.detach(*scheduler);
     backendToClient.detach(*scheduler);
 
-    while (!state->isBothDone()) {
+    while (!(state->clientReadDone.load(std::memory_order_relaxed) &&
+             state->backendReadDone.load(std::memory_order_relaxed))) {
         const auto readyFds = co_await MultiFdAwaiter{
             {
                 {state->completionSignal.getFd(), EPOLLIN},
@@ -646,14 +610,12 @@ static CoroTask<void> forwardData(const std::shared_ptr<ClientContextCoro> clien
 
         for (const int fd: readyFds) {
             if (fd == state->completionSignal.getFd()) {
-                state->drainCompletion();
+                state->completionSignal.drain();
             } else if (fd == state->idleTimer.getFd() && state->checkIdleTimeout()) {
                 break;
             }
         }
     }
-
-    clientCtx->setState(ClientContextCoro::State::CLOSED);
 }
 
 static CoroTask<void> handleClient(BackendFactory backendFactory,

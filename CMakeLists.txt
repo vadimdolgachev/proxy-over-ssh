@@ -62,8 +62,6 @@ add_executable(proxy_over_ssh main.cpp
         Socket.h
         SshSocket.cpp
         SshSocket.h
-        SshConStateMachine.cpp
-        SshConStateMachine.h
         Endpoint.cpp
         Endpoint.h
         SessionPool.cpp
