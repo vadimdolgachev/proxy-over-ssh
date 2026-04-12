@@ -17,12 +17,12 @@ public:
         [[maybe_unused]] ssize_t r = write(fd.get(), &val, sizeof(val));
     }
 
-    void drain() const {
+    void drain() {
         uint64_t val;
         [[maybe_unused]] ssize_t r = read(fd.get(), &val, sizeof(val));
     }
 
-    int getFd() const {
+    [[nodiscard]] int getFd() const {
         return fd.get();
     }
 

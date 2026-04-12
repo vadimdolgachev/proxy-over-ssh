@@ -18,8 +18,6 @@ SessionPool::SessionPool(const size_t maxSessions_) : maxSessions(maxSessions_) 
 }
 
 SessionPool::~SessionPool() {
-    std::lock_guard lock(mutex);
-    log_d("SessionPool destroying {} sessions\n", sessions.size());
     cleanup();
 }
 
@@ -41,7 +39,7 @@ std::optional<SshSessionHandler> SessionPool::acquire() {
     while (!sessions.empty()) {
         auto handle = std::move(sessions.back());
         sessions.pop_back();
-        const ValidationResult result = validateSessionDetailed(handle);
+        const auto result = validateSessionDetailed(handle);
         if (result == ValidationResult::VALID) {
             handle.lastUsed = std::chrono::steady_clock::now();
             return handle;

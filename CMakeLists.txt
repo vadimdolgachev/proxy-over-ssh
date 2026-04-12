@@ -76,8 +76,13 @@ target_link_libraries(proxy_over_ssh PRIVATE
         OpenSSL::SSL
         libssh2
 )
-#target_link_options(proxy_over_ssh PUBLIC -fsanitize=address)
 target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion -Wsign-conversion -Wnull-dereference -Wno-unused-variable -Wno-unused-parameter -Wno-unused-private-field -Werror=uninitialized -fno-omit-frame-pointer)
+
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    #target_link_options(proxy_over_ssh PUBLIC -fsanitize=address)
+    target_compile_options(proxy_over_ssh PRIVATE -fsanitize=thread)
+    target_link_options(proxy_over_ssh PRIVATE -fsanitize=thread)
+endif ()
 
 if (ANDROID)
     message("ANDROID_ABI=${ANDROID_ABI}")

@@ -451,7 +451,7 @@ bool SshFdWaitAwaiter::await_ready() const noexcept {
 }
 
 void SshFdWaitAwaiter::await_suspend(const std::coroutine_handle<> h) {
-    scheduleResume(h, EpollScheduler::PollEvents::EPOLLIN | EpollScheduler::PollEvents::EPOLLOUT);
+    scheduleResume(h, EpollScheduler::PollEvents::EPOLLIN);
 }
 
 void SshFdWaitAwaiter::await_resume() noexcept {

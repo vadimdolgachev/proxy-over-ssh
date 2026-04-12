@@ -33,6 +33,13 @@ void Socket::setReusePort(const bool reusePort) {
     }
 }
 
+void Socket::setReuseAddr(const bool reuseAddr) {
+    const int reuse = reuseAddr ? 1 : 0;
+    if (setsockopt(fd_.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        throw std::system_error(errno, std::system_category(), "SO_REUSEADDR failed");
+    }
+}
+
 void Socket::close() noexcept {
     fd_.reset(-1);
 }

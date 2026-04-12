@@ -96,6 +96,8 @@ public:
 
     void setReusePort(bool reusePort);
 
+    void setReuseAddr(bool reuseAddr);
+
     void close() noexcept;
 
     [[nodiscard]] int fd() const noexcept;

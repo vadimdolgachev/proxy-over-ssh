@@ -646,10 +646,10 @@ static CoroTask<void> handleClient(BackendFactory backendFactory,
 
 CoroTask<void> startMainLoop(const ProxyConfig config) {
     Socket serverSocket;
-    serverSocket.setReusePort(true);
-    log_d("listen port: {}\n", config.listenPort);
+    serverSocket.setReuseAddr(true);
+    log_d("Listening port: {}\n", config.listenPort);
     if (!serverSocket.bind(Endpoint(config.listenPort))) {
-        throw std::runtime_error("Failed to bind server socket");
+        throw std::runtime_error(std::format("Failed to bind server socket on port {}: {}", config.listenPort, std::strerror(errno)));
     }
 
     auto *scheduler = co_await GetScheduler{};
@@ -693,16 +693,18 @@ void SSHProxy::waitForFinish() {
 }
 
 void SSHProxy::mainLoop(const std::stop_token &stopToken) {
-    log_d("SOCKS5 proxy started on port: {}\n", config.value().listenPort);
-    log_d("Proxy started. Press Ctrl+C to stop...\n");
-
-    const auto isStopRequested = [stopToken, &flag = stopSignalFlag]() {
-        return stopToken.stop_requested() || flag.load(std::memory_order_relaxed);
-    };
-
-    EpollScheduler sched(isStopRequested);
-    const auto task = startMainLoop(config.value());
-    task.start(sched);
-    sched.run();
-    log_d("Proxy finished\n");
+    try {
+        const auto isStopRequested = [stopToken, &flag = stopSignalFlag]() {
+            return stopToken.stop_requested() || flag.load(std::memory_order_relaxed);
+        };
+        EpollScheduler sched(isStopRequested);
+        auto task = startMainLoop(config.value());
+        task.start(sched);
+        log_d("SOCKS5 proxy started on port: {}\n", config.value().listenPort);
+        log_d("Proxy started. Press Ctrl+C to stop...\n");
+        sched.run();
+        log_d("Proxy finished\n");
+    } catch (std::exception &e) {
+        log_d("Exception: {}\n", e.what());
+    }
 }
