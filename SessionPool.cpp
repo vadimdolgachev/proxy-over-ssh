@@ -2,14 +2,14 @@
 // Created by vadim on 21.03.2026.
 //
 
-#include "SessionPool.h"
+#include <ranges>
 
 #include <libssh2.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <ranges>
 
+#include "SessionPool.h"
 #include "Logger.h"
 #include "Socket.h"
 
@@ -37,15 +37,13 @@ void SessionPool::invalidate(const SshSessionHandler &handle) {
 
 std::optional<SshSessionHandler> SessionPool::acquire() {
     std::lock_guard lock(mutex);
-    log_v("SessionPool: pool size={}\n", sessions.size());
+    log_v("SessionPool: acquire, size={}\n", sessions.size());
     while (!sessions.empty()) {
         auto handle = std::move(sessions.back());
         sessions.pop_back();
         const ValidationResult result = validateSessionDetailed(handle);
         if (result == ValidationResult::VALID) {
             handle.lastUsed = std::chrono::steady_clock::now();
-            handle.lastHealthCheck = std::chrono::steady_clock::now();
-            handle.failedHealthChecks = 0;
             return handle;
         }
         log_v("SessionPool: Discarding invalid session (socket={}, reason={})\n",
@@ -56,19 +54,17 @@ std::optional<SshSessionHandler> SessionPool::acquire() {
     return std::nullopt;
 }
 
-void SessionPool::release(SshSessionHandler session) {
+void SessionPool::release(SshSessionHandler handler) {
     std::lock_guard lock(mutex);
-    if (session.sshSession == nullptr || session.tcpSocket == nullptr) {
+    if (handler.sshSession == nullptr || handler.tcpSocket == nullptr) {
         log_v("SessionPool: Discarding empty session\n");
         return;
     }
-    session.lastHealthCheck = std::chrono::steady_clock::now();
-    session.failedHealthChecks = 0;
 
     if (sessions.size() > maxSessions) {
         sessions.pop_front();
     }
-    sessions.push_back(std::move(session));
+    sessions.push_back(std::move(handler));
 }
 
 void SessionPool::cleanup() {
@@ -116,11 +112,7 @@ SessionPool::ValidationResult SessionPool::validateSessionDetailed(const SshSess
     return ValidationResult::VALID;
 }
 
-bool SessionPool::validateSession(const SshSessionHandler &handle) {
-    return validateSessionDetailed(handle) == ValidationResult::VALID;
-}
-
-const char *SessionPool::validationResultToString(ValidationResult result) {
+const char *SessionPool::validationResultToString(const ValidationResult result) {
     switch (result) {
         case ValidationResult::VALID: return "VALID";
         case ValidationResult::NULL_COMPONENTS: return "NULL_COMPONENTS";
@@ -128,8 +120,6 @@ const char *SessionPool::validationResultToString(ValidationResult result) {
         case ValidationResult::SOCKET_OPT_FAILED: return "SOCKET_OPT_FAILED";
         case ValidationResult::SOCKET_ERROR: return "SOCKET_ERROR";
         case ValidationResult::SSH_KEEPALIVE_FAILED: return "SSH_KEEPALIVE_FAILED";
-        case ValidationResult::SSH_SESSION_DEAD: return "SSH_SESSION_DEAD";
-        case ValidationResult::TIMEOUT: return "TIMEOUT";
         default: return "UNKNOWN";
     }
 }

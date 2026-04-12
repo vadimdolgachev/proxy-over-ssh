@@ -8,68 +8,37 @@
 #include <libssh2.h>
 
 #include "Socket.h"
-#include "Constants.h"
 
 class SshSession final {
 public:
-    SshSession() : libssh2Session(libssh2_session_init()) {
-        if (libssh2Session == nullptr) {
-            throw std::runtime_error("libssh2_session_init() failed");
-        }
-        libssh2_session_set_blocking(libssh2Session, 0);
-        libssh2_keepalive_config(libssh2Session, 1, Constants::SSH_KEEPALIVE_INTERVAL_SEC);
-    }
+    SshSession();
 
-    ~SshSession() {
-        if (libssh2Session != nullptr) {
-            libssh2_session_free(libssh2Session);
-        }
-    }
+    ~SshSession();
 
     SshSession(const SshSession &handler) = delete;
 
     SshSession &operator=(const SshSession &handler) = delete;
 
-    SshSession(SshSession &&handler) noexcept : libssh2Session(std::exchange(handler.libssh2Session, nullptr)) {
-    }
+    SshSession(SshSession &&handler) noexcept;
 
-    SshSession &operator=(SshSession &&handler) noexcept {
-        if (&handler != this) {
-            if (libssh2Session != nullptr) {
-                libssh2_session_free(libssh2Session);
-            }
-            libssh2Session = std::exchange(handler.libssh2Session, nullptr);
-        }
-        return *this;
-    }
+    SshSession &operator=(SshSession &&handler) noexcept;
 
-    [[nodiscard]] int handshake(const SocketPtr &socket) noexcept {
-        return libssh2_session_handshake(libssh2Session, socket->fd());
-    }
+    [[nodiscard]] int handshake(const SocketPtr &socket) noexcept;
 
-    int disconnect() noexcept {
-        return libssh2_session_disconnect(libssh2Session, "Normal shutdown");
-    }
+    [[nodiscard]] int disconnect() noexcept;
 
-    [[nodiscard]] int blockDirections() noexcept {
-        return libssh2_session_block_directions(libssh2Session);
-    }
+    [[nodiscard]] int blockDirections() noexcept;
 
-    [[nodiscard]] LIBSSH2_SESSION *raw() const noexcept {
-        return libssh2Session;
-    }
+    [[nodiscard]] LIBSSH2_SESSION *raw() const noexcept;
 
 private:
-    LIBSSH2_SESSION *libssh2Session;
+    LIBSSH2_SESSION *libSsh2Session;
 };
 
 struct SshSessionHandler final {
     std::unique_ptr<SshSession> sshSession;
     SocketPtr tcpSocket;
     std::chrono::steady_clock::time_point lastUsed;
-    std::chrono::steady_clock::time_point lastHealthCheck;
-    int failedHealthChecks = 0;
-    bool keepaliveConfigured = true;
 };
 
 #endif //PROXY_OVER_SSH_SSHSESSIONHANDLER_H

@@ -69,6 +69,7 @@ add_executable(proxy_over_ssh main.cpp
         IdleTimer.h
         CompletionSignal.h
         SshSessionHandler.h
+        SshSessionHandler.cpp
 )
 target_link_libraries(proxy_over_ssh PRIVATE
         OpenSSL::Crypto

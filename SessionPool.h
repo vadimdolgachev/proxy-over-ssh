@@ -27,7 +27,7 @@ public:
 
     std::optional<SshSessionHandler> acquire();
 
-    void release(SshSessionHandler session);
+    void release(SshSessionHandler handler);
 
     void cleanup();
 
@@ -40,14 +40,10 @@ private:
         INVALID_SOCKET_FD,
         SOCKET_OPT_FAILED,
         SOCKET_ERROR,
-        SSH_KEEPALIVE_FAILED,
-        SSH_SESSION_DEAD,
-        TIMEOUT
+        SSH_KEEPALIVE_FAILED
     };
 
     static ValidationResult validateSessionDetailed(const SshSessionHandler &handle);
-
-    static bool validateSession(const SshSessionHandler &handle);
 
     static const char *validationResultToString(ValidationResult result);
 

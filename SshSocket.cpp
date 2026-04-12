@@ -131,9 +131,6 @@ ResultCode SshSocket::tryTcpConnect() {
             .sshSession = nullptr,
             .tcpSocket = std::make_unique<Socket>(),
             .lastUsed = std::chrono::steady_clock::now(),
-            .lastHealthCheck = std::chrono::steady_clock::now(),
-            .failedHealthChecks = 0,
-            .keepaliveConfigured = true,
         };
     }
 
