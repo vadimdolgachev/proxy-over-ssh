@@ -4,10 +4,8 @@
 
 #include <ranges>
 
-#include <libssh2.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <fcntl.h>
 
 #include "SessionPool.h"
 #include "Logger.h"
@@ -88,23 +86,15 @@ SessionPool::ValidationResult SessionPool::validateSessionDetailed(const SshSess
         return ValidationResult::SOCKET_ERROR;
     }
 
-    const int originalFlags = fcntl(handle.tcpSocket->fd(), F_GETFL, 0);
-    if (originalFlags == -1) {
-        return ValidationResult::SOCKET_OPT_FAILED;
+    // Check if socket is still connected using peek read
+    char buf;
+    const ssize_t r = recv(handle.tcpSocket->fd(), &buf, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (r == 0) {
+        return ValidationResult::SOCKET_CLOSED;
     }
-    if (fcntl(handle.tcpSocket->fd(), F_SETFL, originalFlags | O_NONBLOCK) == -1) {
-        return ValidationResult::SOCKET_OPT_FAILED;
-    }
-
-    const int keepaliveResult = libssh2_keepalive_send(handle.sshSession->raw(), nullptr);
-
-    fcntl(handle.tcpSocket->fd(), F_SETFL, originalFlags);
-
-    if (keepaliveResult == LIBSSH2_ERROR_EAGAIN) {
-        return ValidationResult::VALID;
-    }
-    if (keepaliveResult < 0) {
-        return ValidationResult::SSH_KEEPALIVE_FAILED;
+    // r > 0 means data available (still connected), r < 0 with EAGAIN means no data but connected
+    if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        return ValidationResult::SOCKET_ERROR;
     }
 
     return ValidationResult::VALID;
@@ -117,7 +107,7 @@ const char *SessionPool::validationResultToString(const ValidationResult result)
         case ValidationResult::INVALID_SOCKET_FD: return "INVALID_SOCKET_FD";
         case ValidationResult::SOCKET_OPT_FAILED: return "SOCKET_OPT_FAILED";
         case ValidationResult::SOCKET_ERROR: return "SOCKET_ERROR";
-        case ValidationResult::SSH_KEEPALIVE_FAILED: return "SSH_KEEPALIVE_FAILED";
+        case ValidationResult::SOCKET_CLOSED: return "SOCKET_CLOSED";
         default: return "UNKNOWN";
     }
 }

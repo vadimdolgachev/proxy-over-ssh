@@ -2,12 +2,13 @@
 #define PROXY_OVER_SSH_COROTASK_H
 
 #include <algorithm>
-#include <stop_token>
 #include <chrono>
 #include <condition_variable>
 #include <coroutine>
 #include <cerrno>
+#include <exception>
 #include <mutex>
+#include <stop_token>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -65,13 +66,20 @@ class EpollScheduler final {
         explicit ThreadPool(const size_t numThreads) {
             workers.reserve(numThreads);
             for (size_t i = 0; i < numThreads; ++i) {
-                workers.emplace_back(&ThreadPool::worker, this);
+                workers.emplace_back([this](const std::stop_token &stopToken_) {
+                    worker(stopToken_);
+                });
             }
         }
     };
 
 public:
-    using PollEvents = EPOLL_EVENTS;
+    using PollEvents = uint32_t;
+    static constexpr PollEvents PollIn = EPOLLIN;
+    static constexpr PollEvents PollOut = EPOLLOUT;
+    static constexpr PollEvents PollErr = EPOLLERR;
+    static constexpr PollEvents PollHUp = EPOLLHUP;
+    static constexpr PollEvents PollRdHUp = EPOLLRDHUP;
 
     explicit EpollScheduler(std::function<bool()> stopToken_)
         : epollFd(epoll_create1(EPOLL_CLOEXEC)),
@@ -263,7 +271,7 @@ struct TimerAwaiter final : SchedulerAware<EpollScheduler> {
     void await_suspend(const std::coroutine_handle<> h) {
         coroHandle = h;
         timer.arm(delay);
-        this->getScheduler()->add(EpollScheduler::PollEvents::EPOLLIN, timer.getFd(), h);
+        this->getScheduler()->add(EpollScheduler::PollIn, timer.getFd(), h);
     }
 
     void await_resume() noexcept {

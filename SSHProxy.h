@@ -28,7 +28,7 @@ struct ProxyConfig final {
 
 class SSHProxy {
 public:
-    explicit SSHProxy(const std::atomic_bool &stopSignalFlag_);
+    explicit SSHProxy(std::atomic_bool &stopSignalFlag_);
 
     ~SSHProxy();
 
@@ -43,7 +43,7 @@ private:
 
     std::optional<ProxyConfig> config;
     std::optional<std::jthread> mainThread;
-    const std::atomic_bool &stopSignalFlag;
+    std::atomic_bool &stopSignalFlag;
 };
 
 #endif // PROXY_OVER_SSH_SSHEPROXY_H

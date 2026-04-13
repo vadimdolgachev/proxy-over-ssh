@@ -7,6 +7,7 @@
 
 #include <span>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 #include "libssh2.h"
@@ -91,6 +92,7 @@ private:
     int pendingDirections = 0;
     State connectionState = State::DISCONNECTED;
     Endpoint targetEndpoint;
+    std::mutex sshMutex;
 };
 
 struct SshSocketAwaiterBase : SchedulerAware<EpollScheduler> {
@@ -107,7 +109,7 @@ protected:
     void scheduleResume(const std::coroutine_handle<> h, const uint32_t defaultEvents) {
         assert(this->getScheduler() != nullptr);
         uint32_t events = computePollEvents(defaultEvents);
-        events |= EpollScheduler::PollEvents::EPOLLERR | EpollScheduler::PollEvents::EPOLLHUP;
+        events |= EpollScheduler::PollErr | EpollScheduler::PollHUp;
         this->getScheduler()->add(events, sshSocket->fd(), h);
     }
 

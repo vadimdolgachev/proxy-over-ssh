@@ -2,10 +2,6 @@
 // Created by vadim on 31.10.2025.
 //
 
-#include "SSHProxy.h"
-
-#include <unistd.h>
-#include <cstring>
 #include <expected>
 #include <format>
 #include <thread>
@@ -17,12 +13,12 @@
 #include <limits>
 
 #include <sys/socket.h>
-#include <sys/eventfd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
 #include <libssh2.h>
 
+#include "SSHProxy.h"
 #include "BackendSocket.h"
 #include "CoroTask.h"
 #include "Logger.h"
@@ -365,20 +361,6 @@ struct Socks5Response final {
 
 CoroTask<void> handleSocks5Request(const std::shared_ptr<ClientContextCoro> clientCtx) {
     const auto req = co_await Socks5Request::readRequest(clientCtx);
-
-    if (req.targetEndpoint.isIPv6()) {
-        Socks5Response response;
-        response.rep = Socks5::Rep::AddressTypeNotSupported;
-        response.atyp = Socks5::Atyp::IpV4;
-        response.bndAddr = {0, 0, 0, 0};
-        response.bndPort = 0;
-
-        std::vector<uint8_t> buffer;
-        response.serializeTo(buffer);
-        co_await writeAll(clientCtx->socket, {buffer.data(), buffer.size()});
-        clientCtx->socket->close();
-        throw std::runtime_error("Address not allowed");
-    }
     clientCtx->targetEndpoint = req.targetEndpoint;
 }
 
@@ -419,20 +401,8 @@ struct ForwardCoordinator final {
 
     void onDirectionDone(const bool isClientDirection) {
         auto &self = isClientDirection ? clientReadDone : backendReadDone;
-        const auto &other = isClientDirection ? backendReadDone : clientReadDone;
         self.store(true, std::memory_order_release);
-
-        if (scheduler != nullptr) {
-            if (isClientDirection && client != nullptr && client->socket != nullptr) {
-                scheduler->forceRemoveFd(client->socket->fd());
-            } else if (!isClientDirection && backend != nullptr) {
-                scheduler->forceRemoveFd(backend->fd());
-            }
-        }
-
-        if (other.load(std::memory_order_acquire)) {
-            closeAll();
-        }
+        closeAll();
         completionSignal.signal();
     }
 
@@ -649,7 +619,8 @@ CoroTask<void> startMainLoop(const ProxyConfig config) {
     serverSocket.setReuseAddr(true);
     log_d("Listening port: {}\n", config.listenPort);
     if (!serverSocket.bind(Endpoint(config.listenPort))) {
-        throw std::runtime_error(std::format("Failed to bind server socket on port {}: {}", config.listenPort, std::strerror(errno)));
+        throw std::runtime_error(std::format("Failed to bind server socket on port {}: {}", config.listenPort,
+                                             std::strerror(errno)));
     }
 
     auto *scheduler = co_await GetScheduler{};
@@ -663,7 +634,7 @@ CoroTask<void> startMainLoop(const ProxyConfig config) {
     }
 }
 
-SSHProxy::SSHProxy(const std::atomic_bool &stopSignalFlag_) : stopSignalFlag(stopSignalFlag_) {
+SSHProxy::SSHProxy(std::atomic_bool &stopSignalFlag_) : stopSignalFlag(stopSignalFlag_) {
     libssh2_init(0);
 }
 
@@ -677,7 +648,7 @@ void SSHProxy::start(const ProxyConfig &proxyConfig) {
         throw std::runtime_error("Already started");
     }
     this->config = proxyConfig;
-    mainThread = std::jthread(&SSHProxy::mainLoop, this);
+    mainThread = std::jthread([this](const std::stop_token &st) { mainLoop(st); });
 }
 
 void SSHProxy::requestStop() noexcept {

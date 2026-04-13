@@ -8,12 +8,10 @@
 #include <cerrno>
 #include <cassert>
 #include <span>
-#include <cstring>
 #include <utility>
 
 #include <sys/socket.h>
 #include <poll.h>
-#include <unistd.h>
 #include <sys/epoll.h>
 
 Socket::Socket() : fd_(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)) {
@@ -96,7 +94,7 @@ bool ListenSocketAwaiter::await_ready() const noexcept {
 
 void ListenSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
     assert(this->getScheduler() != nullptr);
-    this->getScheduler()->add(EpollScheduler::PollEvents::EPOLLIN, fd, h);
+    this->getScheduler()->add(EpollScheduler::PollIn, fd, h);
 }
 
 AcceptedSocket ListenSocketAwaiter::await_resume() {
@@ -170,7 +168,7 @@ bool ReadSocketAwaiter::await_ready() const noexcept {
 
 void ReadSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
     assert(this->getScheduler() != nullptr);
-    this->getScheduler()->add(EpollScheduler::PollEvents::EPOLLIN, socket->fd(), h);
+    this->getScheduler()->add(EpollScheduler::PollIn, socket->fd(), h);
 }
 
 size_t ReadSocketAwaiter::await_resume() {
@@ -231,7 +229,7 @@ bool WriteSocketAwaiter::await_ready() const noexcept {
 
 void WriteSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
     assert(this->getScheduler() != nullptr);
-    this->getScheduler()->add(EpollScheduler::PollEvents::EPOLLOUT, socket->fd(), h);
+    this->getScheduler()->add(EpollScheduler::PollOut, socket->fd(), h);
 }
 
 size_t WriteSocketAwaiter::await_resume() {
@@ -314,7 +312,7 @@ bool ConnectSocketAwaiter::await_ready() const noexcept {
 
 void ConnectSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
     assert(this->getScheduler() != nullptr);
-    this->getScheduler()->add(EpollScheduler::PollEvents::EPOLLOUT | EPOLLERR, socket->fd(), h);
+    this->getScheduler()->add(EpollScheduler::PollOut | EpollScheduler::PollErr, socket->fd(), h);
 }
 
 void ConnectSocketAwaiter::await_resume() {

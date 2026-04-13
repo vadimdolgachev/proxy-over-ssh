@@ -21,8 +21,8 @@ public:
 
     void arm(const std::chrono::nanoseconds delay) const {
         itimerspec spec{};
-        spec.it_value.tv_sec = delay.count() / Constants::NANOSECONDS_PER_SECOND;
-        spec.it_value.tv_nsec = delay.count() % Constants::NANOSECONDS_PER_SECOND;
+        spec.it_value.tv_sec = static_cast<time_t>(delay.count() / Constants::NANOSECONDS_PER_SECOND);
+        spec.it_value.tv_nsec = static_cast<long>(delay.count() % Constants::NANOSECONDS_PER_SECOND);
         timerfd_settime(fd.get(), 0, &spec, nullptr);
     }
 

@@ -40,7 +40,7 @@ private:
         INVALID_SOCKET_FD,
         SOCKET_OPT_FAILED,
         SOCKET_ERROR,
-        SSH_KEEPALIVE_FAILED
+        SOCKET_CLOSED
     };
 
     static ValidationResult validateSessionDetailed(const SshSessionHandler &handle);

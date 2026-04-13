@@ -17,7 +17,6 @@
 #include "Types.h"
 #include "SessionPool.h"
 
-
 ResultCode SshSocket::handleLibSsh2Result(int rc, const char *operation) {
     if (rc == LIBSSH2_ERROR_EAGAIN) {
         if (sessionHandle && sessionHandle->sshSession) {
@@ -65,10 +64,10 @@ int SshSocket::getBlockDirections() const {
 uint32_t SshSocket::computePollEvents(const int directions, const uint32_t defaultEvents) {
     uint32_t events = 0;
     if (directions & LIBSSH2_SESSION_BLOCK_INBOUND) {
-        events |= EpollScheduler::PollEvents::EPOLLIN;
+        events |= EpollScheduler::PollIn;
     }
     if (directions & LIBSSH2_SESSION_BLOCK_OUTBOUND) {
-        events |= EpollScheduler::PollEvents::EPOLLOUT;
+        events |= EpollScheduler::PollOut;
     }
     if (events == 0) {
         events = defaultEvents;
@@ -302,14 +301,24 @@ CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer) {
             co_return 0;
         }
 
-        const ssize_t n = libssh2_channel_read(libSsh2Channel,
-                                               reinterpret_cast<char *>(buffer.data()),
-                                               buffer.size());
+        ssize_t n;
+        bool eof;
+        {
+            std::lock_guard lock(sshMutex);
+            n = libssh2_channel_read(libSsh2Channel,
+                                     reinterpret_cast<char *>(buffer.data()),
+                                     buffer.size());
+            eof = n <= 0 && libssh2_channel_eof(libSsh2Channel) != 0;
+            if (sessionHandle && sessionHandle->sshSession) {
+                libssh2_keepalive_send(sessionHandle->sshSession->raw(), nullptr);
+            }
+        }
+
         if (n > 0) {
             co_return static_cast<size_t>(n);
         }
 
-        if (libssh2_channel_eof(libSsh2Channel)) {
+        if (eof) {
             co_return 0;
         }
 
@@ -326,8 +335,12 @@ CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer) {
         if (n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
             co_return 0;
         }
-
-        throw std::runtime_error("SSH channel read error: " + std::to_string(n));
+        int sockErr = 0;
+        socklen_t sockErrLen = sizeof(sockErr);
+        getsockopt(fd(), SOL_SOCKET, SO_ERROR, &sockErr, &sockErrLen);
+        throw std::runtime_error("SSH channel read error: " + std::to_string(n)
+                                 + ", socket: " + std::to_string(sockErr)
+                                 + " (" + std::strerror(sockErr) + ")");
     }
 }
 
@@ -337,15 +350,25 @@ CoroTask<size_t> SshSocket::writeAsync(const std::span<const uint8_t> data) {
             co_return 0;
         }
 
-        const ssize_t n = libssh2_channel_write(libSsh2Channel,
-                                                reinterpret_cast<const char *>(data.data()),
-                                                data.size());
+        ssize_t n;
+        bool eof;
+        {
+            std::lock_guard lock(sshMutex);
+            n = libssh2_channel_write(libSsh2Channel,
+                                      reinterpret_cast<const char *>(data.data()),
+                                      data.size());
+            eof = n == LIBSSH2_ERROR_EAGAIN && libssh2_channel_eof(libSsh2Channel) != 0;
+            if (sessionHandle && sessionHandle->sshSession) {
+                libssh2_keepalive_send(sessionHandle->sshSession->raw(), nullptr);
+            }
+        }
+
         if (n > 0) {
             co_return static_cast<size_t>(n);
         }
 
         if (n == LIBSSH2_ERROR_EAGAIN) {
-            if (libssh2_channel_eof(libSsh2Channel)) {
+            if (eof) {
                 co_return 0;
             }
             co_await SshFdWaitAwaiter{shared_from_this()};
@@ -357,7 +380,12 @@ CoroTask<size_t> SshSocket::writeAsync(const std::span<const uint8_t> data) {
         }
 
         if (n < 0) {
-            throw std::runtime_error("SSH channel write error: " + std::to_string(n));
+            int sockErr = 0;
+            socklen_t sockErrLen = sizeof(sockErr);
+            getsockopt(fd(), SOL_SOCKET, SO_ERROR, &sockErr, &sockErrLen);
+            throw std::runtime_error("SSH channel write error: " + std::to_string(n)
+                                     + ", socket: " + std::to_string(sockErr)
+                                     + " (" + std::strerror(sockErr) + ")");
         }
 
         co_return 0;
@@ -382,6 +410,7 @@ bool SshSocket::isEof() const noexcept {
 
 void SshSocket::close() noexcept {
     if (libSsh2Channel != nullptr) {
+        std::lock_guard lock(sshMutex);
         libssh2_channel_close(libSsh2Channel);
         libssh2_channel_free(libSsh2Channel);
         libSsh2Channel = nullptr;
@@ -432,10 +461,10 @@ bool SshConnectAwaiter::await_ready() const noexcept {
     return true;
 }
 
-void SshConnectAwaiter::await_suspend(std::coroutine_handle<> h) {
+void SshConnectAwaiter::await_suspend(const std::coroutine_handle<> h) {
     assert(this->getScheduler() != nullptr);
-    uint32_t events = computePollEvents(EpollScheduler::PollEvents::EPOLLIN);
-    events |= EpollScheduler::PollEvents::EPOLLERR | EpollScheduler::PollEvents::EPOLLHUP | EPOLLRDHUP;
+    uint32_t events = computePollEvents(EpollScheduler::PollIn);
+    events |= EpollScheduler::PollErr | EpollScheduler::PollHUp | EpollScheduler::PollRdHUp;
     this->getScheduler()->add(events, sshSocket->fd(), h);
 }
 
@@ -451,7 +480,7 @@ bool SshFdWaitAwaiter::await_ready() const noexcept {
 }
 
 void SshFdWaitAwaiter::await_suspend(const std::coroutine_handle<> h) {
-    scheduleResume(h, EpollScheduler::PollEvents::EPOLLIN);
+    scheduleResume(h, EpollScheduler::PollIn);
 }
 
 void SshFdWaitAwaiter::await_resume() noexcept {

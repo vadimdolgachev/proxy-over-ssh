@@ -32,14 +32,14 @@ Endpoint::Endpoint(const std::string &host, uint16_t port) {
     storage = HostnameAddr{host, port};
 }
 
-Endpoint::Endpoint(const sockaddr_storage &storage_, socklen_t len) {
-    if (len >= sizeof(sockaddr_in6) && storage_.ss_family == AF_INET6) {
+Endpoint::Endpoint(const sockaddr_storage &storage, const socklen_t len) {
+    if (len >= static_cast<int>(sizeof(sockaddr_in6)) && storage.ss_family == AF_INET6) {
         sockaddr_in6 addr6{};
-        std::memcpy(&addr6, &storage_, sizeof(sockaddr_in6));
+        std::memcpy(&addr6, &storage, sizeof(sockaddr_in6));
         this->storage = IPv6Addr{addr6};
-    } else if (len >= sizeof(sockaddr_in) && storage_.ss_family == AF_INET) {
+    } else if (len >= static_cast<int>(sizeof(sockaddr_in)) && storage.ss_family == AF_INET) {
         sockaddr_in addr{};
-        std::memcpy(&addr, &storage_, sizeof(sockaddr_in));
+        std::memcpy(&addr, &storage, sizeof(sockaddr_in));
         this->storage = IPv4Addr{addr};
     } else {
         throw std::runtime_error("Invalid sockaddr_storage or length");
