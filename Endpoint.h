@@ -30,7 +30,7 @@ public:
 
     Endpoint(const std::string &host, uint16_t port);
 
-    Endpoint(const sockaddr_storage &storage, socklen_t len);
+    Endpoint(const sockaddr_storage &storage_, socklen_t len);
 
     [[nodiscard]] Type type() const noexcept;
 
