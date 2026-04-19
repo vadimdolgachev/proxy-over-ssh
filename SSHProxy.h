@@ -12,6 +12,7 @@
 #include <functional>
 
 #include "BackendSocket.h"
+#include "CancellationToken.h"
 
 struct SSHConfig final {
     std::string username;
@@ -28,7 +29,7 @@ struct ProxyConfig final {
 
 class SSHProxy {
 public:
-    explicit SSHProxy(std::atomic_bool &stopSignalFlag_);
+    explicit SSHProxy(CancellationTokenSource &cts_);
 
     ~SSHProxy();
 
@@ -39,11 +40,11 @@ public:
     void waitForFinish();
 
 private:
-    void mainLoop(const std::stop_token &stopToken);
+    void mainLoop();
 
     std::optional<ProxyConfig> config;
     std::optional<std::jthread> mainThread;
-    std::atomic_bool &stopSignalFlag;
+    CancellationTokenSource &cts;
 };
 
 #endif // PROXY_OVER_SSH_SSHEPROXY_H

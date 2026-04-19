@@ -12,17 +12,17 @@ public:
         fd.reset(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
     }
 
-    void signal() {
+    void signal() noexcept {
         constexpr uint64_t val = 1;
         [[maybe_unused]] ssize_t r = write(fd.get(), &val, sizeof(val));
     }
 
-    void drain() {
+    void drain() noexcept {
         uint64_t val;
         [[maybe_unused]] ssize_t r = read(fd.get(), &val, sizeof(val));
     }
 
-    [[nodiscard]] int getFd() const {
+    [[nodiscard]] int getFd() const noexcept {
         return fd.get();
     }
 

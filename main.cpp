@@ -1,17 +1,18 @@
 #include <algorithm>
-#include <expected>
-#include <unordered_map>
-#include <string_view>
 #include <charconv>
 #include <csignal>
+#include <expected>
 #include <format>
 #include <memory>
+#include <string_view>
+#include <unordered_map>
 
 #include "BackendSocket.h"
+#include "CancellationToken.h"
 #include "Logger.h"
 #include "SSHProxy.h"
-#include "SshSocket.h"
 #include "SessionPool.h"
+#include "SshSocket.h"
 
 namespace {
     std::string parsePrivateKey(const std::string_view privateKey) {
@@ -72,9 +73,7 @@ namespace {
             }
 
             std::uint16_t value{};
-            auto [ptr, ec] = std::from_chars(v->data(),
-                                             v->data() + v->size(),
-                                             value);
+            auto [ptr, ec] = std::from_chars(v->data(), v->data() + v->size(), value);
 
             if (ec != std::errc{}) {
                 return std::unexpected("Invalid integer value for " + std::string(key));
@@ -125,12 +124,12 @@ namespace {
         };
     }
 
-    std::atomic_bool stopSignalFlag = false;
+    CancellationTokenSource cancellationTokenSource;
 } // namespace
 
 
 extern "C" void onSignalTerm(int) {
-    stopSignalFlag.store(true, std::memory_order_relaxed);
+    cancellationTokenSource.requestStop();
 }
 
 int main(const int argc, char **argv) {
@@ -141,12 +140,12 @@ int main(const int argc, char **argv) {
             return std::make_shared<SshSocket>(sshConfig, sessionPool);
         };
 
-        ProxyConfig proxyConfig{
+        ProxyConfig proxyConfig {
             .backendFactory = factory,
             .listenPort = appConfig->listenPort,
         };
 
-        const auto proxy = std::make_unique<SSHProxy>(stopSignalFlag);
+        auto proxy = std::make_unique<SSHProxy>(cancellationTokenSource);
         proxy->start(proxyConfig);
         proxy->waitForFinish();
     } else {

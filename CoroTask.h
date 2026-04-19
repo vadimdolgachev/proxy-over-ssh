@@ -2,29 +2,30 @@
 #define PROXY_OVER_SSH_COROTASK_H
 
 #include <algorithm>
+#include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <coroutine>
-#include <cerrno>
 #include <exception>
+#include <functional>
 #include <mutex>
+#include <ranges>
 #include <stop_token>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <utility>
-#include <cassert>
-#include <functional>
-#include <ranges>
-#include <system_error>
 #include <vector>
 
 #include <sys/epoll.h>
 
-#include "Logger.h"
-#include "FdUtils.h"
-#include "Timer.h"
-#include "Constants.h"
+#include "CancellationToken.h"
 #include "CompletionSignal.h"
+#include "Constants.h"
+#include "FdUtils.h"
+#include "Logger.h"
+#include "Timer.h"
 
 class Endpoint;
 class Socket;
@@ -35,25 +36,27 @@ class EpollScheduler final {
         std::coroutine_handle<> h;
     };
 
-    struct ThreadPool final {
+    class ThreadPool final {
         std::mutex queueMutex;
         std::condition_variable_any cv;
-        std::vector<std::coroutine_handle<> > queue;
+        std::vector<std::coroutine_handle<>> queue;
         std::vector<std::jthread> workers;
 
-        void enqueue(const std::coroutine_handle<> h) { {
+    public:
+        void enqueue(const std::coroutine_handle<> h) {
+            {
                 std::lock_guard lock(queueMutex);
                 queue.push_back(h);
             }
             cv.notify_one();
         }
 
-        void worker(const std::stop_token &stopToken_) {
-            while (true) {
+        void worker(const std::stop_token &st) {
+            while (!st.stop_requested()) {
                 std::coroutine_handle<> h;
                 {
                     std::unique_lock lock(queueMutex);
-                    if (!cv.wait(lock, stopToken_, [&] { return !queue.empty(); })) {
+                    if (!cv.wait(lock, st, [&] { return !queue.empty(); })) {
                         return;
                     }
                     h = queue.back();
@@ -63,12 +66,22 @@ class EpollScheduler final {
             }
         }
 
+        void stopAndWait() {
+            for (auto &worker: workers) {
+                worker.request_stop();
+            }
+            for (auto &worker: workers) {
+                if (worker.joinable()) {
+                    worker.join();
+                }
+            }
+            log_v("ThreadPool: finished\n");
+        }
+
         explicit ThreadPool(const size_t numThreads) {
             workers.reserve(numThreads);
             for (size_t i = 0; i < numThreads; ++i) {
-                workers.emplace_back([this](const std::stop_token &stopToken_) {
-                    worker(stopToken_);
-                });
+                workers.emplace_back([this](const auto &st) { worker(st); });
             }
         }
     };
@@ -81,9 +94,9 @@ public:
     static constexpr PollEvents PollHUp = EPOLLHUP;
     static constexpr PollEvents PollRdHUp = EPOLLRDHUP;
 
-    explicit EpollScheduler(std::function<bool()> stopToken_)
-        : epollFd(epoll_create1(EPOLL_CLOEXEC)),
-          stopToken(std::move(stopToken_)) {
+    explicit EpollScheduler(const CancellationTokenSource &cts_) :
+        epollFd(epoll_create1(EPOLL_CLOEXEC)),
+        cts(cts_) {
         if (epollFd.get() < 0) {
             throw std::runtime_error("Epoll creation failed");
         }
@@ -157,11 +170,13 @@ public:
 
     void run() {
         std::array<epoll_event, Constants::EPOLL_BATCH_SIZE> events = {};
+        const auto cancellationToken = getCancellationTokenSource().getToken();
 
-        while (stopToken ? !stopToken() : true) {
+        while (!cancellationToken.isStopped()) {
             if (const int size = epoll_wait(epollFd.get(), events.data(), events.size(), Constants::EPOLL_TIMEOUT_MS);
                 size > 0) {
-                pendingResumes.clear(); {
+                pendingResumes.clear();
+                {
                     std::lock_guard lock(schedulerMutex);
                     for (size_t i = 0; i < static_cast<size_t>(size); ++i) {
                         const int eventFd = events[i].data.fd;
@@ -200,6 +215,12 @@ public:
                 }
             }
         }
+
+        threadPool->stopAndWait();
+    }
+
+    [[nodiscard]] const CancellationTokenSource &getCancellationTokenSource() const {
+        return cts;
     }
 
 private:
@@ -240,9 +261,9 @@ private:
     CompletionSignal wakeupSignal;
     std::mutex schedulerMutex;
     FdStates fdStates;
-    std::vector<std::coroutine_handle<> > pendingResumes;
+    std::vector<std::coroutine_handle<>> pendingResumes;
     std::unique_ptr<ThreadPool> threadPool;
-    std::function<bool()> stopToken;
+    const CancellationTokenSource &cts;
 };
 
 template<typename T>
@@ -256,12 +277,18 @@ struct SchedulerAware {
         return sched;
     }
 
+    [[nodiscard]] CancellationToken getCancellationToken() const {
+        return getScheduler()->getCTS()->getToken();
+    }
+
 private:
     T *sched = nullptr;
+    const CancellationTokenSource *cancellationTokenSource = nullptr;
 };
 
 struct TimerAwaiter final : SchedulerAware<EpollScheduler> {
-    explicit TimerAwaiter(const std::chrono::nanoseconds delay_) : delay(delay_) {
+    explicit TimerAwaiter(const std::chrono::nanoseconds delay_) :
+        delay(delay_) {
     }
 
     [[nodiscard]] bool await_ready() const noexcept {
@@ -345,7 +372,7 @@ struct PromiseValue : PromiseBase<Base> {
     }
 };
 
-struct GetScheduler : SchedulerAware<EpollScheduler> {
+struct GetScheduler final : SchedulerAware<EpollScheduler> {
     [[nodiscard]] bool await_ready() const noexcept {
         return true;
     }
@@ -355,6 +382,19 @@ struct GetScheduler : SchedulerAware<EpollScheduler> {
 
     [[nodiscard]] EpollScheduler *await_resume() const noexcept {
         return this->getScheduler();
+    }
+};
+
+struct GetCancellationToken : SchedulerAware<EpollScheduler> {
+    [[nodiscard]] bool await_ready() const noexcept {
+        return true;
+    }
+
+    void await_suspend(std::coroutine_handle<>) noexcept {
+    }
+
+    [[nodiscard]] CancellationToken await_resume() const noexcept {
+        return getScheduler()->getCancellationTokenSource().getToken();
     }
 };
 
@@ -400,9 +440,7 @@ template<typename T>
 class CoroTask final {
 public:
     template<typename promise_type>
-    using PromiseBase = std::conditional_t<std::is_void_v<T>,
-        PromiseVoid<promise_type>,
-        PromiseValue<T, promise_type> >;
+    using PromiseBase = std::conditional_t<std::is_void_v<T>, PromiseVoid<promise_type>, PromiseValue<T, promise_type>>;
 
     struct promise_type final : PromiseBase<promise_type> {
         CoroTask get_return_object() {
@@ -414,11 +452,12 @@ public:
         CoroTaskAwaiterVoid<promise_type>,
         CoroTaskAwaiter<promise_type, T> >;
 
-    explicit CoroTask(const std::coroutine_handle<promise_type> h) : handle(h) {
+    explicit CoroTask(const std::coroutine_handle<promise_type> h) :
+        handle(h) {
     }
 
-    CoroTask(CoroTask &&other) noexcept
-        : handle(std::exchange(other.handle, {})) {
+    CoroTask(CoroTask &&other) noexcept :
+        handle(std::exchange(other.handle, {})) {
     }
 
     CoroTask(CoroTask &) = delete;

@@ -70,6 +70,8 @@ add_executable(proxy_over_ssh main.cpp
         CompletionSignal.h
         SshSessionHandler.h
         SshSessionHandler.cpp
+        CancellationToken.cpp
+        CancellationToken.h
 )
 target_link_libraries(proxy_over_ssh PRIVATE
         OpenSSL::Crypto
@@ -78,9 +80,13 @@ target_link_libraries(proxy_over_ssh PRIVATE
 )
 target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion -Wsign-conversion -Wnull-dereference -Wno-unused-variable -Wno-unused-parameter -Wno-unused-private-field -Werror=uninitialized -fno-omit-frame-pointer)
 
-if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-    #target_link_options(proxy_over_ssh PUBLIC -fsanitize=address)
-    target_compile_options(proxy_over_ssh PRIVATE -fsanitize=thread)
+if (CMAKE_BUILD_TYPE STREQUAL "DebugAddrSan")
+    target_link_options(proxy_over_ssh PRIVATE -g -Og -fsanitize=address)
+    target_compile_options(proxy_over_ssh PRIVATE -fsanitize=address)
+elseif (CMAKE_BUILD_TYPE STREQUAL "DebugThrSan")
+    # Reduce ASLR Entropy:
+    # sudo sysctl vm.mmap_rnd_bits=30
+    target_compile_options(proxy_over_ssh PRIVATE -g -Og -fsanitize=thread)
     target_link_options(proxy_over_ssh PRIVATE -fsanitize=thread)
 endif ()
 

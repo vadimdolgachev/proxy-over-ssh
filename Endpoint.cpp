@@ -4,12 +4,12 @@
 
 #include "Endpoint.h"
 
+#include <arpa/inet.h>
+#include <array>
+#include <cstring>
 #include <iostream>
 #include <ostream>
-#include <arpa/inet.h>
 #include <stdexcept>
-#include <cstring>
-#include <array>
 #include <utility>
 
 Endpoint::Endpoint(const sockaddr_in &addr_) {
@@ -47,29 +47,33 @@ Endpoint::Endpoint(const sockaddr_storage &storage_, const socklen_t len) {
 }
 
 Endpoint::Type Endpoint::type() const noexcept {
-    return std::visit([](const auto &addr) {
-        using T = std::decay_t<decltype(addr)>;
-        if constexpr (std::is_same_v<T, IPv4Addr>) {
-            return Type::IPv4;
-        } else if constexpr (std::is_same_v<T, IPv6Addr>) {
-            return Type::IPv6;
-        } else if constexpr (std::is_same_v<T, HostnameAddr>) {
-            return Type::Hostname;
-        }
-    }, storage);
+    return std::visit(
+            [](const auto &addr) {
+                using T = std::decay_t<decltype(addr)>;
+                if constexpr (std::is_same_v<T, IPv4Addr>) {
+                    return Type::IPv4;
+                } else if constexpr (std::is_same_v<T, IPv6Addr>) {
+                    return Type::IPv6;
+                } else if constexpr (std::is_same_v<T, HostnameAddr>) {
+                    return Type::Hostname;
+                }
+            },
+            storage);
 }
 
 uint16_t Endpoint::port() const {
-    return std::visit([](const auto &addr) -> uint16_t {
-        using T = std::decay_t<decltype(addr)>;
-        if constexpr (std::is_same_v<T, IPv4Addr>) {
-            return ntohs(addr.sin_port);
-        } else if constexpr (std::is_same_v<T, IPv6Addr>) {
-            return ntohs(addr.sin6_port);
-        } else if constexpr (std::is_same_v<T, HostnameAddr>) {
-            return addr.port;
-        }
-    }, storage);
+    return std::visit(
+            [](const auto &addr) -> uint16_t {
+                using T = std::decay_t<decltype(addr)>;
+                if constexpr (std::is_same_v<T, IPv4Addr>) {
+                    return ntohs(addr.sin_port);
+                } else if constexpr (std::is_same_v<T, IPv6Addr>) {
+                    return ntohs(addr.sin6_port);
+                } else if constexpr (std::is_same_v<T, HostnameAddr>) {
+                    return addr.port;
+                }
+            },
+            storage);
 }
 
 uint32_t Endpoint::ip() const {
