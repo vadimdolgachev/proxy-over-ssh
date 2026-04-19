@@ -146,7 +146,7 @@ int main(const int argc, char **argv) {
         };
 
         auto proxy = std::make_unique<SSHProxy>(cancellationTokenSource);
-        proxy->start(proxyConfig);
+        proxy->start(proxyConfig, std::nullopt, std::nullopt);
         proxy->waitForFinish();
     } else {
         log_e("Failed to parse arguments: {}\n", appConfig.error());

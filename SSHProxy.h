@@ -6,10 +6,10 @@
 #define PROXY_OVER_SSH_SSHEPROXY_H
 
 #include <atomic>
-#include <optional>
-#include <thread>
-#include <string>
 #include <functional>
+#include <optional>
+#include <string>
+#include <thread>
 
 #include "BackendSocket.h"
 #include "CancellationToken.h"
@@ -27,20 +27,26 @@ struct ProxyConfig final {
     std::uint16_t listenPort;
 };
 
+using StartCallback = std::function<void()>;
+using FinishCallback = std::function<void()>;
+using ErrorCallback = std::function<void(int)>;
+
 class SSHProxy {
 public:
     explicit SSHProxy(CancellationTokenSource &cts_);
 
     ~SSHProxy();
 
-    void start(const ProxyConfig &proxyConfig);
+    void start(const ProxyConfig &proxyConfig,
+               const std::optional<StartCallback> &startCb,
+               const std::optional<FinishCallback> &stopCb);
 
     void requestStop() noexcept;
 
     void waitForFinish();
 
 private:
-    void mainLoop();
+    void mainLoop(const std::optional<StartCallback> &startCb, const std::optional<FinishCallback> &stopCb);
 
     std::optional<ProxyConfig> config;
     std::optional<std::jthread> mainThread;

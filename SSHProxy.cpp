@@ -640,12 +640,14 @@ SSHProxy::~SSHProxy() {
     libssh2_exit();
 }
 
-void SSHProxy::start(const ProxyConfig &proxyConfig) {
+void SSHProxy::start(const ProxyConfig &proxyConfig,
+                     const std::optional<StartCallback> &startCb,
+                     const std::optional<FinishCallback> &stopCb) {
     if (mainThread != std::nullopt) {
         throw std::runtime_error("Already started");
     }
     this->config = proxyConfig;
-    mainThread = std::jthread([this] { mainLoop(); });
+    mainThread = std::jthread([this, startCb, stopCb] { mainLoop(startCb, stopCb); });
 }
 
 void SSHProxy::requestStop() noexcept {
@@ -659,15 +661,21 @@ void SSHProxy::waitForFinish() {
     }
 }
 
-void SSHProxy::mainLoop() {
+void SSHProxy::mainLoop(const std::optional<StartCallback> &startCb, const std::optional<FinishCallback> &stopCb) {
     try {
         EpollScheduler sched(cts);
         auto task = startServer(config.value());
         task.start(sched);
         log_d("SOCKS5 proxy started on port: {}\n", config.value().listenPort);
         log_d("Proxy started. Press Ctrl+C to stop...\n");
+        if (startCb) {
+            startCb.value()();
+        }
         sched.run();
         log_d("Proxy finished\n");
+        if (stopCb) {
+            stopCb.value()();
+        }
     } catch (std::exception &e) {
         log_d("Exception: {}\n", e.what());
     }
