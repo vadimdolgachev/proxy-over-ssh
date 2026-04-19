@@ -100,6 +100,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         proxy-over-ssh/SshSessionHandler.cpp
         proxy-over-ssh/Endpoint.cpp
         proxy-over-ssh/SessionPool.cpp
+        proxy-over-ssh/CancellationToken.cpp
         ${HEV_TUNNEL_SOURCES}
         ${HEV_CORE_SOURCES}
         ${YAML_SOURCES}

@@ -1,6 +1,16 @@
 package io.sshproxy.app
 
-class ProxyNative {
+import android.util.Log
+import androidx.annotation.Keep
+
+@Keep
+interface ProxyListener {
+    fun onStarted()
+    fun onFinished()
+    fun onError(code: Long, msg: String)
+}
+
+class ProxyNative: ProxyListener {
     private var handle = 0L
 
     private external fun nativeCreate(): Long
@@ -12,6 +22,8 @@ class ProxyNative {
     private external fun nativeDestroy(handle: Long)
     private external fun nativeStartTunnel(handle: Long, tunFd: Int, socksPort: Int)
     private external fun nativeStopTunnel(handle: Long)
+    external fun registerListener(listener: ProxyListener)
+    external fun unregisterListener()
 
     fun start(
         sshHost: String, sshPort: Int,
@@ -20,6 +32,7 @@ class ProxyNative {
         if (handle == 0L) {
             handle = nativeCreate()
         }
+        registerListener(this)
         nativeStart(handle, sshHost, sshPort, sshUsername, privateKeyData, listenPort)
     }
 
@@ -42,15 +55,29 @@ class ProxyNative {
     }
 
     fun destroy() {
+        unregisterListener()
         if (handle != 0L) {
             nativeDestroy(handle)
             handle = 0L
         }
     }
 
+    override fun onStarted() {
+        Log.d(TAG, "onStarted: ")
+    }
+
+    override fun onFinished() {
+        Log.d(TAG, "onFinished: ")
+    }
+
+    override fun onError(code: Long, msg: String) {
+        Log.d(TAG, "onError: $msg, $code")
+    }
+
     companion object {
         init {
             System.loadLibrary("proxyapp")
         }
+        const val TAG = "ProxyNative"
     }
 }

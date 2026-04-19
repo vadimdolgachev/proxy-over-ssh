@@ -196,6 +196,5 @@ class MainActivity : ComponentActivity() {
         }
         startService(intent)
         isProxyRunning = false
-        profileStore.setRunningProfileId(null)
     }
 }

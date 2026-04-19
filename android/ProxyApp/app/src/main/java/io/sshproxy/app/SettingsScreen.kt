@@ -1,7 +1,6 @@
 package io.sshproxy.app
 
-import android.content.pm.ApplicationInfo
-import android.content.pm.PackageManager
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -10,7 +9,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -65,7 +63,7 @@ fun SettingsScreen(
         pm.getInstalledApplications(0)
             .filter { it.packageName != ownPackage }
             .mapNotNull { appInfo ->
-                val label = appInfo.loadLabel(pm)?.toString() ?: return@mapNotNull null
+                val label = appInfo.loadLabel(pm).toString()
                 if (label == appInfo.packageName) return@mapNotNull null
                 AppInfo(name = label, packageName = appInfo.packageName)
             }
@@ -80,13 +78,17 @@ fun SettingsScreen(
 
     val selectedPackages = if (vpnAppMode == VpnAppMode.ALL_APPS) excludedPackages else includedPackages
 
+    BackHandler(enabled = true) {
+        onBack()
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Settings") },
                 navigationIcon = {
                     IconButton(onClick = {
-                        val port = socksPort.toIntOrNull() ?: 1080
+                        val port = socksPort.toIntOrNull() ?: 10803
                         onSaveSettings(
                             AppSettings(
                                 dnsAddress = dnsAddress,

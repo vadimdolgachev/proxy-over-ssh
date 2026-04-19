@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.VpnService
+import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
 
@@ -59,7 +60,13 @@ class ProxyService : VpnService() {
                 val notification = buildNotification(
                     if (vpnMode) "VPN proxy running" else "SOCKS5 proxy running on port $listenPort"
                 )
-                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startForeground(
+                        NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                    )
+                }
 
                 proxyNative.start(
                     intent.getStringExtra(EXTRA_HOST) ?: return START_NOT_STICKY,
@@ -71,11 +78,15 @@ class ProxyService : VpnService() {
 
                 if (vpnMode) {
                     val dnsAddress = intent.getStringExtra(EXTRA_DNS_ADDRESS) ?: "1.1.1.1"
-                    val vpnAppMode = intent.getStringExtra(EXTRA_VPN_APP_MODE) ?: VpnAppMode.ALL_APPS.name
-                    val excludedPkgs = intent.getStringArrayListExtra(EXTRA_EXCLUDED_PACKAGES) ?: emptyList()
-                    val includedPkgs = intent.getStringArrayListExtra(EXTRA_INCLUDED_PACKAGES) ?: emptyList()
+                    val vpnAppMode =
+                        intent.getStringExtra(EXTRA_VPN_APP_MODE) ?: VpnAppMode.ALL_APPS.name
+                    val excludedPkgs =
+                        intent.getStringArrayListExtra(EXTRA_EXCLUDED_PACKAGES) ?: emptyList()
+                    val includedPkgs =
+                        intent.getStringArrayListExtra(EXTRA_INCLUDED_PACKAGES) ?: emptyList()
 
-                    val tunFd = establishVpn(listenPort, dnsAddress, vpnAppMode, excludedPkgs, includedPkgs)
+                    val tunFd =
+                        establishVpn(dnsAddress, vpnAppMode, excludedPkgs, includedPkgs)
                     if (tunFd != null) {
                         proxyNative.startTunnel(tunFd, listenPort)
                     }
@@ -98,7 +109,6 @@ class ProxyService : VpnService() {
     }
 
     private fun establishVpn(
-        socksPort: Int,
         dnsAddress: String,
         vpnAppMode: String,
         excludedPackages: List<String>,
