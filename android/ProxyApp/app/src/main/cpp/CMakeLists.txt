@@ -3,7 +3,13 @@ project(proxyapp LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 23)
 
-include(proxy-over-ssh/cmake/CPM.cmake)
+get_filename_component(PROXY_OVER_SSH_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../.."
+    ABSOLUTE
+)
+message(STATUS "PROXY_OVER_SSH_DIR = ${PROXY_OVER_SSH_DIR}")
+
+include(${PROXY_OVER_SSH_DIR}/cmake/CPM.cmake)
 
 CPMAddPackage(
         NAME openssl-cmake
@@ -94,13 +100,13 @@ set(HEV_TASK_ASM "${HEV_DIR}/third-part/hev-task-system/src/kern/task/hev-task-e
 add_library(${CMAKE_PROJECT_NAME} SHARED
         sshproxy_jni.cpp
         hev-compat.c
-        proxy-over-ssh/SSHProxy.cpp
-        proxy-over-ssh/Socket.cpp
-        proxy-over-ssh/SshSocket.cpp
-        proxy-over-ssh/SshSessionHandler.cpp
-        proxy-over-ssh/Endpoint.cpp
-        proxy-over-ssh/SessionPool.cpp
-        proxy-over-ssh/CancellationToken.cpp
+        ${PROXY_OVER_SSH_DIR}/SSHProxy.cpp
+        ${PROXY_OVER_SSH_DIR}/Socket.cpp
+        ${PROXY_OVER_SSH_DIR}/SshSocket.cpp
+        ${PROXY_OVER_SSH_DIR}/SshSessionHandler.cpp
+        ${PROXY_OVER_SSH_DIR}/Endpoint.cpp
+        ${PROXY_OVER_SSH_DIR}/SessionPool.cpp
+        ${PROXY_OVER_SSH_DIR}/CancellationToken.cpp
         ${HEV_TUNNEL_SOURCES}
         ${HEV_CORE_SOURCES}
         ${YAML_SOURCES}
@@ -110,7 +116,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-        proxy-over-ssh
+        ${PROXY_OVER_SSH_DIR}
         ${HEV_DIR}/src
         ${HEV_DIR}/src/misc
         ${HEV_DIR}/src/core/include
