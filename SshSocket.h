@@ -5,10 +5,10 @@
 #ifndef PROXY_OVER_SSH_SSHSOCKET_H
 #define PROXY_OVER_SSH_SSHSOCKET_H
 
-#include <span>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 
 #include "libssh2.h"
 
@@ -44,13 +44,11 @@ public:
 
     ~SshSocket() override;
 
-    [[nodiscard]] SshConnectAwaiter connect(const Endpoint &targetEndpoint_);
+    [[nodiscard]] CoroTask<ResultCode> connectAsync(const Endpoint &targetEndpoint_, std::shared_ptr<CompletionSignal> cs) override;
 
-    [[nodiscard]] CoroTask<ResultCode> connectAsync(const Endpoint &targetEndpoint_) override;
+    [[nodiscard]] CoroTask<size_t> readAsync(std::span<uint8_t> buffer, std::shared_ptr<CompletionSignal> cs) override;
 
-    [[nodiscard]] CoroTask<size_t> readAsync(std::span<uint8_t> buffer) override;
-
-    [[nodiscard]] CoroTask<size_t> writeAsync(std::span<const uint8_t> data) override;
+    [[nodiscard]] CoroTask<size_t> writeAsync(std::span<const uint8_t> data, std::shared_ptr<CompletionSignal> cs) override;
 
     [[nodiscard]] int fd() const noexcept override;
 
@@ -79,7 +77,8 @@ private:
 
     ResultCode handleLibSsh2Result(int rc, const char *operation);
 
-    ResultCode handleLibSsh2ChannelResult(const LIBSSH2_CHANNEL *channel, const char *operation,
+    ResultCode handleLibSsh2ChannelResult(const LIBSSH2_CHANNEL *channel,
+                                          const char *operation,
                                           const std::string &host);
 
     ResultCode tryConnectNonBlocking();
@@ -97,27 +96,24 @@ private:
 
 struct SshSocketAwaiterBase : SchedulerAware<EpollScheduler> {
 protected:
-    explicit SshSocketAwaiterBase(std::shared_ptr<SshSocket> socket)
-        : sshSocket(std::move(socket)) {
-    }
+    SshSocketAwaiterBase(std::shared_ptr<SshSocket> socket,
+                         const std::shared_ptr<CompletionSignal> &cs_);
 
-    [[nodiscard]] uint32_t computePollEvents(const uint32_t defaultEvents) const {
-        const int directions = sshSocket->getBlockDirections();
-        return sshSocket->computePollEvents(directions, defaultEvents);
-    }
+    [[nodiscard]] uint32_t computePollEvents(uint32_t defaultEvents) const;
 
-    void scheduleResume(const std::coroutine_handle<> h, const uint32_t defaultEvents) {
-        assert(this->getScheduler() != nullptr);
-        uint32_t events = computePollEvents(defaultEvents);
-        events |= EpollScheduler::PollErr | EpollScheduler::PollHUp;
-        this->getScheduler()->add(events, sshSocket->fd(), h);
-    }
+    void onSuspend(std::coroutine_handle<> h, uint32_t defaultEvents);
+
+    void onResume();
 
     std::shared_ptr<SshSocket> sshSocket;
+    std::shared_ptr<CompletionSignal> cs;
+    std::coroutine_handle<> handle;
 };
 
 struct SshConnectAwaiter final : SshSocketAwaiterBase {
-    SshConnectAwaiter(std::shared_ptr<SshSocket> sshSocket_, Endpoint targetEndpoint_);
+    SshConnectAwaiter(std::shared_ptr<SshSocket> socket,
+                      Endpoint targetEndpoint_,
+                      const std::shared_ptr<CompletionSignal> &cs_);
 
     [[nodiscard]] bool await_ready() const noexcept;
 
@@ -131,9 +127,8 @@ private:
 };
 
 struct SshFdWaitAwaiter final : SshSocketAwaiterBase {
-    explicit SshFdWaitAwaiter(std::shared_ptr<SshSocket> socket)
-        : SshSocketAwaiterBase(std::move(socket)) {
-    }
+    SshFdWaitAwaiter(std::shared_ptr<SshSocket> socket,
+                     const std::shared_ptr<CompletionSignal> &cs_);
 
     [[nodiscard]] bool await_ready() const noexcept;
 
@@ -144,4 +139,4 @@ struct SshFdWaitAwaiter final : SshSocketAwaiterBase {
 
 using SshSocketPtr = std::shared_ptr<SshSocket>;
 
-#endif //PROXY_OVER_SSH_SSHSOCKET_H
+#endif // PROXY_OVER_SSH_SSHSOCKET_H

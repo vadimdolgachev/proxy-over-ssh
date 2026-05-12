@@ -3,16 +3,13 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
-#include <functional>
 #include <mutex>
 #include <ranges>
 #include <stop_token>
-#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -22,9 +19,7 @@
 
 #include "CancellationToken.h"
 #include "CompletionSignal.h"
-#include "Constants.h"
 #include "FdUtils.h"
-#include "Logger.h"
 #include "Timer.h"
 
 class Endpoint;
@@ -32,7 +27,7 @@ class Socket;
 
 class EpollScheduler final {
     struct CoroEntry final {
-        uint32_t events;
+        uint32_t events{};
         std::coroutine_handle<> h;
     };
 
@@ -43,47 +38,13 @@ class EpollScheduler final {
         std::vector<std::jthread> workers;
 
     public:
-        void enqueue(const std::coroutine_handle<> h) {
-            {
-                std::lock_guard lock(queueMutex);
-                queue.push_back(h);
-            }
-            cv.notify_one();
-        }
+        void enqueue(std::coroutine_handle<> h);
 
-        void worker(const std::stop_token &st) {
-            while (!st.stop_requested()) {
-                std::coroutine_handle<> h;
-                {
-                    std::unique_lock lock(queueMutex);
-                    if (!cv.wait(lock, st, [&] { return !queue.empty(); })) {
-                        return;
-                    }
-                    h = queue.back();
-                    queue.pop_back();
-                }
-                h.resume();
-            }
-        }
+        void worker(const std::stop_token &st);
 
-        void stopAndWait() {
-            for (auto &worker: workers) {
-                worker.request_stop();
-            }
-            for (auto &worker: workers) {
-                if (worker.joinable()) {
-                    worker.join();
-                }
-            }
-            log_v("ThreadPool: finished\n");
-        }
+        void stopAndWait();
 
-        explicit ThreadPool(const size_t numThreads) {
-            workers.reserve(numThreads);
-            for (size_t i = 0; i < numThreads; ++i) {
-                workers.emplace_back([this](const auto &st) { worker(st); });
-            }
-        }
+        explicit ThreadPool(size_t numThreads);
     };
 
 public:
@@ -94,134 +55,21 @@ public:
     static constexpr PollEvents PollHUp = EPOLLHUP;
     static constexpr PollEvents PollRdHUp = EPOLLRDHUP;
 
-    explicit EpollScheduler(const CancellationTokenSource &cts_) :
-        epollFd(epoll_create1(EPOLL_CLOEXEC)),
-        cts(cts_) {
-        if (epollFd.get() < 0) {
-            throw std::runtime_error("Epoll creation failed");
-        }
-
-        epoll_event ev = {};
-        ev.events = EPOLLIN;
-        ev.data.fd = wakeupSignal.getFd();
-        if (epoll_ctl(epollFd.get(), EPOLL_CTL_ADD, wakeupSignal.getFd(), &ev) < 0) {
-            throw std::runtime_error("Failed to register wakeup fd with epoll");
-        }
-
-        threadPool = std::make_unique<ThreadPool>(Constants::THREAD_POOL_SIZE);
-        pendingResumes.reserve(16);
-    }
+    explicit EpollScheduler(const CancellationTokenSource &cts_);
 
     EpollScheduler(const EpollScheduler &) = delete;
 
     EpollScheduler &operator=(const EpollScheduler &) = delete;
 
-    void add(const uint32_t events, const int fd, const std::coroutine_handle<> coro) {
-        std::lock_guard lock(schedulerMutex);
+    void add(uint32_t events, int fd, std::coroutine_handle<> coro);
 
-        auto &[coros, registeredEvents] = fdStates[fd];
-        coros.push_back({events, coro});
+    void remove(int fd, std::coroutine_handle<> coro);
 
-        const uint32_t desired = registeredEvents | events;
-        if (desired == registeredEvents) {
-            return;
-        }
+    void forceRemoveFd(int fd);
 
-        const int op = registeredEvents == 0 ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
-        epoll_event ev{};
-        ev.events = desired;
-        ev.data.fd = fd;
+    void run();
 
-        if (epoll_ctl(epollFd.get(), op, fd, &ev) < 0) {
-            const int err = errno;
-            coros.pop_back();
-            if (coros.empty()) {
-                fdStates.erase(fd);
-            }
-            throw std::system_error(err, std::system_category(), "Epoll add failed");
-        }
-        registeredEvents = desired;
-        wakeupSignal.signal();
-    }
-
-    void remove(const int fd, const std::coroutine_handle<> coro) {
-        std::lock_guard lock(schedulerMutex);
-
-        const auto it = fdStates.find(fd);
-        if (it == fdStates.end()) {
-            return;
-        }
-
-        auto &coros = it->second.coros;
-        const auto coroIt = std::ranges::find_if(coros, [&](const CoroEntry &e) {
-            return e.h == coro;
-        });
-        if (coroIt != coros.end()) {
-            coros.erase(coroIt);
-            updateEpollRegistration(it);
-        }
-    }
-
-    void forceRemoveFd(const int fd) {
-        std::lock_guard lock(schedulerMutex);
-        fdStates.erase(fd);
-        epoll_ctl(epollFd.get(), EPOLL_CTL_DEL, fd, nullptr);
-    }
-
-    void run() {
-        std::array<epoll_event, Constants::EPOLL_BATCH_SIZE> events = {};
-        const auto cancellationToken = getCancellationTokenSource().getToken();
-
-        while (!cancellationToken.isStopped()) {
-            if (const int size = epoll_wait(epollFd.get(), events.data(), events.size(), Constants::EPOLL_TIMEOUT_MS);
-                size > 0) {
-                pendingResumes.clear();
-                {
-                    std::lock_guard lock(schedulerMutex);
-                    for (size_t i = 0; i < static_cast<size_t>(size); ++i) {
-                        const int eventFd = events[i].data.fd;
-                        const uint32_t occurredEvents = events[i].events;
-
-                        if (eventFd == wakeupSignal.getFd()) {
-                            wakeupSignal.drain();
-                            continue;
-                        }
-
-                        auto fdIt = fdStates.find(eventFd);
-                        if (fdIt == fdStates.end()) {
-                            epoll_ctl(epollFd.get(), EPOLL_CTL_DEL, eventFd, nullptr);
-                            continue;
-                        }
-
-                        auto &coros = fdIt->second.coros;
-
-                        std::erase_if(coros, [&](const CoroEntry &e) {
-                            if (e.events & occurredEvents) {
-                                pendingResumes.push_back(e.h);
-                                return true;
-                            }
-                            return false;
-                        });
-
-                        updateEpollRegistration(fdIt);
-                    }
-                }
-
-                std::ranges::sort(pendingResumes);
-                pendingResumes.erase(std::ranges::unique(pendingResumes).begin(), pendingResumes.end());
-
-                for (const auto h: pendingResumes) {
-                    threadPool->enqueue(h);
-                }
-            }
-        }
-
-        threadPool->stopAndWait();
-    }
-
-    [[nodiscard]] const CancellationTokenSource &getCancellationTokenSource() const {
-        return cts;
-    }
+    [[nodiscard]] const CancellationTokenSource &getCancellationTokenSource() const;
 
 private:
     struct FdState {
@@ -231,31 +79,9 @@ private:
 
     using FdStates = std::unordered_map<int, FdState>;
 
-    static uint32_t calculateRemainingEvents(const FdState &state) {
-        uint32_t remaining = 0;
-        for (const auto &coro: state.coros) {
-            remaining |= coro.events;
-        }
-        return remaining;
-    }
+    static uint32_t calculateRemainingEvents(const FdState &state);
 
-    void updateEpollRegistration(const FdStates::iterator it) {
-        const int fd = it->first;
-        auto &state = it->second;
-
-        const uint32_t remaining = calculateRemainingEvents(state);
-
-        if (state.coros.empty()) {
-            epoll_ctl(epollFd.get(), EPOLL_CTL_DEL, fd, nullptr);
-            fdStates.erase(it);
-        } else if (remaining != state.registeredEvents) {
-            epoll_event ev{};
-            ev.events = remaining;
-            ev.data.fd = fd;
-            epoll_ctl(epollFd.get(), EPOLL_CTL_MOD, fd, &ev);
-            state.registeredEvents = remaining;
-        }
-    }
+    void updateEpollRegistration(FdStates::iterator it);
 
     const UniqueFd epollFd;
     CompletionSignal wakeupSignal;
@@ -409,7 +235,7 @@ struct CoroTaskAwaiterBase {
         handle.resume();
     }
 
-    std::coroutine_handle<Promise> handle = nullptr;
+    std::coroutine_handle<Promise> handle;
 };
 
 template<typename Promise, typename Resume>
@@ -448,22 +274,23 @@ public:
         }
     };
 
-    using Awaiter = std::conditional_t<std::is_void_v<T>,
-        CoroTaskAwaiterVoid<promise_type>,
-        CoroTaskAwaiter<promise_type, T> >;
+    using Awaiter =
+            std::conditional_t<std::is_void_v<T>, CoroTaskAwaiterVoid<promise_type>, CoroTaskAwaiter<promise_type, T>>;
 
     explicit CoroTask(const std::coroutine_handle<promise_type> h) :
         handle(h) {
     }
 
     CoroTask(CoroTask &&other) noexcept :
-        handle(std::exchange(other.handle, {})) {
+        handle(std::exchange(other.handle, nullptr)) {
     }
+
+    CoroTask &operator=(CoroTask &&other) noexcept = delete;
 
     CoroTask(CoroTask &) = delete;
 
     ~CoroTask() {
-        if (handle != nullptr) {
+        if (!detached && handle != nullptr) {
             handle.destroy();
         }
     }
@@ -475,16 +302,10 @@ public:
         handle.promise().setScheduler(&scheduler);
         handle.resume();
         if (handle.done()) {
-            const auto exception = std::move(handle.promise().exception);
-            handle.destroy();
-            handle = nullptr;
-            if (exception) {
+            if (const auto exception = std::move(handle.promise().exception)) {
                 std::rethrow_exception(exception);
             }
-            return;
         }
-        handle.promise().detached = true;
-        release();
     }
 
     void detach(EpollScheduler &scheduler) {
@@ -493,12 +314,8 @@ public:
         }
         handle.promise().setScheduler(&scheduler);
         handle.promise().detached = true;
+        detached = true;
         handle.resume();
-        if (!handle.done()) {
-            release();
-        } else {
-            handle = nullptr;
-        }
     }
 
     auto operator co_await() const noexcept {
@@ -509,12 +326,9 @@ public:
         handle.promise().setScheduler(s);
     }
 
-    std::coroutine_handle<promise_type> release() noexcept {
-        return std::exchange(handle, {});
-    }
-
 private:
-    std::coroutine_handle<promise_type> handle = nullptr;
+    std::coroutine_handle<promise_type> handle;
+    bool detached = false;
 };
 
 #endif // PROXY_OVER_SSH_COROTASK_H

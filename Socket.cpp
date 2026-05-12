@@ -44,7 +44,7 @@ void Socket::close() noexcept {
     fd_.reset(-1);
 }
 
-ConnectSocketAwaiter Socket::connect(Endpoint endpoint, CancellationToken ct) {
+ConnectSocketAwaiter Socket::connect(Endpoint endpoint, CancellationTokenOpt ct) {
     return {shared_from_this(), std::move(endpoint), std::move(ct)};
 }
 
@@ -103,6 +103,7 @@ void ListenSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
 }
 
 AcceptedSocket ListenSocketAwaiter::await_resume() {
+    this->getScheduler()->forceRemoveFd(ct.getFd());
     sockaddr_storage addr{};
     socklen_t socklen = sizeof(addr);
     const int socketFd = accept4(fd, reinterpret_cast<sockaddr *>(&addr), &socklen, SOCK_NONBLOCK);
@@ -129,18 +130,18 @@ AcceptedSocket ListenSocketAwaiter::await_resume() {
     return {std::make_shared<Socket>(socketFd), Endpoint(addr4)};
 }
 
-ReadSocketAwaiter Socket::read(std::span<unsigned char> buffer, CancellationToken ct) {
+ReadSocketAwaiter Socket::read(std::span<unsigned char> buffer, CancellationTokenOpt ct) {
     if (buffer.empty()) {
         throw std::runtime_error("Buffer is empty");
     }
     return {shared_from_this(), buffer, std::move(ct)};
 }
 
-WriteSocketAwaiter Socket::write(std::span<unsigned char> buffer, CancellationToken ct) {
+WriteSocketAwaiter Socket::write(std::span<unsigned char> buffer, CancellationTokenOpt ct) {
     return {shared_from_this(), buffer, std::move(ct)};
 }
 
-ReadSocketAwaiter::ReadSocketAwaiter(SocketPtr socket_, const std::span<unsigned char> buffer_, CancellationToken ct_) :
+ReadSocketAwaiter::ReadSocketAwaiter(SocketPtr socket_, const std::span<unsigned char> buffer_, CancellationTokenOpt ct_) :
     socket(std::move(socket_)),
     buffer(buffer_),
     ct(std::move(ct_)) {
@@ -168,7 +169,7 @@ bool ReadSocketAwaiter::await_ready() const noexcept {
         if (err == EINTR) {
             continue;
         }
-        if (err == EAGAIN || err == EWOULDBLOCK) {
+        if (err == EAGAIN) {
             return false;
         }
         peekErrno = err;
@@ -178,11 +179,16 @@ bool ReadSocketAwaiter::await_ready() const noexcept {
 
 void ReadSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
     assert(this->getScheduler() != nullptr);
-    // this->getScheduler()->add(EpollScheduler::PollIn, ct.getFd(), h);
+    if (ct) {
+        this->getScheduler()->add(EpollScheduler::PollIn, ct.value().getFd(), h);
+    }
     this->getScheduler()->add(EpollScheduler::PollIn, socket->fd(), h);
 }
 
 size_t ReadSocketAwaiter::await_resume() {
+    if (ct) {
+        this->getScheduler()->forceRemoveFd(ct.value().getFd());
+    }
     if (peekErrno != 0) {
         throw std::system_error(peekErrno, std::system_category(), "recv failed");
     }
@@ -194,7 +200,7 @@ size_t ReadSocketAwaiter::await_resume() {
         const ssize_t bytesRead = recv(socket->fd(), buffer.data(), buffer.size(), 0);
         if (bytesRead < 0) {
             if (errno == EAGAIN || errno == EINTR) {
-                if (ct.isStopped()) {
+                if (ct && ct.value().isStopped()) {
                     throw SocketCancelException{};
                 }
             }
@@ -207,7 +213,7 @@ size_t ReadSocketAwaiter::await_resume() {
     }
 }
 
-WriteSocketAwaiter::WriteSocketAwaiter(SocketPtr socket_, const std::span<unsigned char> buffer_, CancellationToken ct_) :
+WriteSocketAwaiter::WriteSocketAwaiter(SocketPtr socket_, const std::span<unsigned char> buffer_, CancellationTokenOpt ct_) :
     socket(std::move(socket_)),
     buffer(buffer_),
     ct(std::move(ct_)) {
@@ -243,11 +249,16 @@ bool WriteSocketAwaiter::await_ready() const noexcept {
 
 void WriteSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
     assert(this->getScheduler() != nullptr);
-    this->getScheduler()->add(EpollScheduler::PollIn, ct.getFd(), h);
+    if (ct) {
+        this->getScheduler()->add(EpollScheduler::PollIn, ct.value().getFd(), h);
+    }
     this->getScheduler()->add(EpollScheduler::PollOut, socket->fd(), h);
 }
 
 size_t WriteSocketAwaiter::await_resume() {
+    if (ct) {
+        this->getScheduler()->forceRemoveFd(ct.value().getFd());
+    }
     if (pollError) {
         throw std::system_error(pollErrno, std::system_category(), "poll failed");
     }
@@ -269,7 +280,7 @@ size_t WriteSocketAwaiter::await_resume() {
                 send(socket->fd(), buffer.data() + totalSent, buffer.size() - totalSent, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (sent < 0) {
             if (errno == EAGAIN || errno == EINTR) {
-                if (ct.isStopped()) {
+                if (ct && ct.value().isStopped()) {
                     throw SocketCancelException{};
                 }
             }
@@ -286,7 +297,7 @@ size_t WriteSocketAwaiter::await_resume() {
     return totalSent;
 }
 
-ConnectSocketAwaiter::ConnectSocketAwaiter(SocketPtr socket_, Endpoint endpoint_, CancellationToken ct_) :
+ConnectSocketAwaiter::ConnectSocketAwaiter(SocketPtr socket_, Endpoint endpoint_, CancellationTokenOpt ct_) :
     socket(std::move(socket_)),
     endpoint(std::move(endpoint_)),
     ct(std::move(ct_)) {
@@ -307,6 +318,9 @@ bool ConnectSocketAwaiter::await_ready() const noexcept {
 
             const int err = errno;
             if (err == EINTR) {
+                if (ct && ct.value().isStopped()) {
+                    throw SocketCancelException{};
+                }
                 continue;
             }
 
@@ -330,20 +344,24 @@ bool ConnectSocketAwaiter::await_ready() const noexcept {
 
 void ConnectSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
     assert(this->getScheduler() != nullptr);
-    this->getScheduler()->add(EpollScheduler::PollIn, ct.getFd(), h);
+    if (ct) {
+        this->getScheduler()->add(EpollScheduler::PollIn, ct.value().getFd(), h);
+    }
     this->getScheduler()->add(EpollScheduler::PollOut | EpollScheduler::PollErr, socket->fd(), h);
 }
 
 void ConnectSocketAwaiter::await_resume() {
-    if (ct.isStopped()) {
-        throw SocketCancelException{};
+    if (ct) {
+        this->getScheduler()->forceRemoveFd(ct.value().getFd());
     }
-
     if (connectErrno != 0) {
         throw std::system_error(connectErrno, std::system_category(), "connect failed");
     }
 
     if (connectPending) {
+        if (ct && ct.value().isStopped()) {
+            throw SocketCancelException{};
+        }
         int sockerr = 0;
         socklen_t sockerr_len = sizeof(sockerr);
         if (getsockopt(socket->fd(), SOL_SOCKET, SO_ERROR, &sockerr, &sockerr_len) < 0) {

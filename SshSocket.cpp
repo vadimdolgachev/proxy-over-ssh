@@ -2,22 +2,22 @@
 // Created by vadim on 28.01.2026.
 //
 
+#include <cerrno>
+#include <chrono>
 #include <libssh2.h>
 #include <stdexcept>
 #include <utility>
-#include <cerrno>
-#include <chrono>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
-#include "SshSocket.h"
 #include "Logger.h"
-#include "SshError.h"
-#include "Types.h"
 #include "SessionPool.h"
+#include "SshError.h"
+#include "SshSocket.h"
+#include "Types.h"
 
-ResultCode SshSocket::handleLibSsh2Result(int rc, const char *operation) {
+ResultCode SshSocket::handleLibSsh2Result(const int rc, const char *operation) {
     if (rc == LIBSSH2_ERROR_EAGAIN) {
         if (sessionHandle && sessionHandle->sshSession) {
             pendingDirections = sessionHandle->sshSession->blockDirections();
@@ -35,7 +35,8 @@ ResultCode SshSocket::handleLibSsh2Result(int rc, const char *operation) {
     return ResultCode::Ok;
 }
 
-ResultCode SshSocket::handleLibSsh2ChannelResult(const LIBSSH2_CHANNEL *const channel, const char *operation,
+ResultCode SshSocket::handleLibSsh2ChannelResult(const LIBSSH2_CHANNEL *const channel,
+                                                 const char *operation,
                                                  const std::string &host) {
     if (channel == nullptr) {
         const int lastErr = libssh2_session_last_errno(sessionHandle->sshSession->raw());
@@ -99,9 +100,9 @@ ResultCode SshSocket::tryConnectNonBlocking() {
     return ResultCode::Ok;
 }
 
-SshSocket::SshSocket(SSHConfig sshConfig_, const std::shared_ptr<SessionPool> &sessionPool_)
-    : sessionPool(sessionPool_),
-      sshConfig(std::move(sshConfig_)) {
+SshSocket::SshSocket(SSHConfig sshConfig_, const std::shared_ptr<SessionPool> &sessionPool_) :
+    sessionPool(sessionPool_),
+    sshConfig(std::move(sshConfig_)) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(sshConfig.port);
@@ -140,8 +141,7 @@ ResultCode SshSocket::tryTcpConnect() {
     const int fd = sessionHandle->tcpSocket->fd();
     auto [storage, len] = sshServerEndpoint.sockaddrStorage();
 
-    if (const int rc = ::connect(fd, reinterpret_cast<const sockaddr *>(&storage), len);
-        rc == 0) {
+    if (const int rc = connect(fd, reinterpret_cast<const sockaddr *>(&storage), len); rc == 0) {
         connectionState = State::TCP_CONNECTED;
         return ResultCode::Ok;
     }
@@ -263,7 +263,7 @@ ResultCode SshSocket::createChannel() {
     const auto host = targetEndpoint.host();
     const int port = targetEndpoint.port();
 
-    LIBSSH2_CHANNEL *channel = libssh2_channel_direct_tcpip_ex(sessionHandle->sshSession->raw(),
+    auto *const channel = libssh2_channel_direct_tcpip_ex(sessionHandle->sshSession->raw(),
                                                                host.c_str(),
                                                                port,
                                                                "127.0.0.1",
@@ -275,12 +275,7 @@ ResultCode SshSocket::createChannel() {
     return result;
 }
 
-SshConnectAwaiter SshSocket::connect(const Endpoint &targetEndpoint_) {
-    targetEndpoint = targetEndpoint_;
-    return {shared_from_this(), targetEndpoint};
-}
-
-CoroTask<ResultCode> SshSocket::connectAsync(const Endpoint &targetEndpoint_) {
+CoroTask<ResultCode> SshSocket::connectAsync(const Endpoint &targetEndpoint_, std::shared_ptr<CompletionSignal> cs) {
     targetEndpoint = targetEndpoint_;
 
     while (true) {
@@ -291,11 +286,11 @@ CoroTask<ResultCode> SshSocket::connectAsync(const Endpoint &targetEndpoint_) {
         if (rc != ResultCode::ErrAgain) {
             co_return rc;
         }
-        co_await SshConnectAwaiter{shared_from_this(), targetEndpoint};
+        co_await SshConnectAwaiter{shared_from_this(), targetEndpoint, cs};
     }
 }
 
-CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer) {
+CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer, const std::shared_ptr<CompletionSignal> cs) {
     while (true) {
         if (libSsh2Channel == nullptr) {
             co_return 0;
@@ -318,23 +313,15 @@ CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer) {
             co_return static_cast<size_t>(n);
         }
 
-        if (eof) {
+        if (eof || n == 0 || n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
             co_return 0;
         }
 
         if (n == LIBSSH2_ERROR_EAGAIN) {
-            co_await SshFdWaitAwaiter{shared_from_this()};
+            co_await SshFdWaitAwaiter{shared_from_this(), cs};
             continue;
         }
 
-        if (n == 0) {
-            co_await SshFdWaitAwaiter{shared_from_this()};
-            continue;
-        }
-
-        if (n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
-            co_return 0;
-        }
         int sockErr = 0;
         socklen_t sockErrLen = sizeof(sockErr);
         getsockopt(fd(), SOL_SOCKET, SO_ERROR, &sockErr, &sockErrLen);
@@ -344,7 +331,7 @@ CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer) {
     }
 }
 
-CoroTask<size_t> SshSocket::writeAsync(const std::span<const uint8_t> data) {
+CoroTask<size_t> SshSocket::writeAsync(const std::span<const uint8_t> data, std::shared_ptr<CompletionSignal> cs) {
     while (true) {
         if (libSsh2Channel == nullptr) {
             co_return 0;
@@ -371,7 +358,7 @@ CoroTask<size_t> SshSocket::writeAsync(const std::span<const uint8_t> data) {
             if (eof) {
                 co_return 0;
             }
-            co_await SshFdWaitAwaiter{shared_from_this()};
+            co_await SshFdWaitAwaiter{shared_from_this(), cs};
             continue;
         }
 
@@ -436,9 +423,39 @@ void SshSocket::close() noexcept {
     pendingDirections = 0;
 }
 
-SshConnectAwaiter::SshConnectAwaiter(std::shared_ptr<SshSocket> sshSocket_, Endpoint targetEndpoint_)
-    : SshSocketAwaiterBase(std::move(sshSocket_)),
-      targetEndpoint(std::move(targetEndpoint_)) {
+SshSocketAwaiterBase::SshSocketAwaiterBase(std::shared_ptr<SshSocket> socket,
+                                           const std::shared_ptr<CompletionSignal> &cs_) :
+    sshSocket(std::move(socket)),
+    cs(cs_) {
+}
+
+uint32_t SshSocketAwaiterBase::computePollEvents(const uint32_t defaultEvents) const {
+    const int directions = sshSocket->getBlockDirections();
+    return SshSocket::computePollEvents(directions, defaultEvents);
+}
+
+void SshSocketAwaiterBase::onSuspend(const std::coroutine_handle<> h, const uint32_t defaultEvents) {
+    assert(this->getScheduler() != nullptr);
+    handle = h;
+    uint32_t events = computePollEvents(defaultEvents);
+    events |= EpollScheduler::PollErr | EpollScheduler::PollHUp;
+    if (cs) {
+        this->getScheduler()->add(EpollScheduler::PollIn, cs->getFd(), h);
+    }
+    this->getScheduler()->add(events, sshSocket->fd(), h);
+}
+
+void SshSocketAwaiterBase::onResume() {
+    if (cs && handle) {
+        this->getScheduler()->remove(cs->getFd(), handle);
+    }
+}
+
+SshConnectAwaiter::SshConnectAwaiter(std::shared_ptr<SshSocket> socket,
+                                     Endpoint targetEndpoint_,
+                                     const std::shared_ptr<CompletionSignal> &cs_) :
+    SshSocketAwaiterBase(std::move(socket), cs_),
+    targetEndpoint(std::move(targetEndpoint_)) {
 }
 
 bool SshConnectAwaiter::await_ready() const noexcept {
@@ -462,17 +479,20 @@ bool SshConnectAwaiter::await_ready() const noexcept {
 }
 
 void SshConnectAwaiter::await_suspend(const std::coroutine_handle<> h) {
-    assert(this->getScheduler() != nullptr);
-    uint32_t events = computePollEvents(EpollScheduler::PollIn);
-    events |= EpollScheduler::PollErr | EpollScheduler::PollHUp | EpollScheduler::PollRdHUp;
-    this->getScheduler()->add(events, sshSocket->fd(), h);
+    onSuspend(h, EpollScheduler::PollIn | EpollScheduler::PollRdHUp);
 }
 
 void SshConnectAwaiter::await_resume() {
+    onResume();
     if (connectErrno != 0) {
         const auto rc = static_cast<ResultCode>(connectErrno);
         throw std::runtime_error("SSH connection failed: " + std::string(SshError::toString(rc)));
     }
+}
+
+SshFdWaitAwaiter::SshFdWaitAwaiter(std::shared_ptr<SshSocket> socket,
+                                   const std::shared_ptr<CompletionSignal> &cs_) :
+    SshSocketAwaiterBase(std::move(socket), cs_) {
 }
 
 bool SshFdWaitAwaiter::await_ready() const noexcept {
@@ -480,8 +500,9 @@ bool SshFdWaitAwaiter::await_ready() const noexcept {
 }
 
 void SshFdWaitAwaiter::await_suspend(const std::coroutine_handle<> h) {
-    scheduleResume(h, EpollScheduler::PollIn);
+    onSuspend(h, EpollScheduler::PollIn);
 }
 
 void SshFdWaitAwaiter::await_resume() noexcept {
+    onResume();
 }
