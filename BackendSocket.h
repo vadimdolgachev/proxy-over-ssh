@@ -17,11 +17,11 @@ class IBackendSocket {
 public:
     virtual ~IBackendSocket() = default;
 
-    virtual CoroTask<size_t> readAsync(std::span<uint8_t> buffer) = 0;
+    virtual CoroTask<size_t> readAsync(std::span<uint8_t> buffer, std::shared_ptr<CompletionSignal> cs) = 0;
 
-    virtual CoroTask<size_t> writeAsync(std::span<const uint8_t> data) = 0;
+    virtual CoroTask<size_t> writeAsync(std::span<const uint8_t> data, std::shared_ptr<CompletionSignal> cs) = 0;
 
-    virtual CoroTask<ResultCode> connectAsync(const Endpoint &target) = 0;
+    virtual CoroTask<ResultCode> connectAsync(const Endpoint &target, std::shared_ptr<CompletionSignal> cs) = 0;
 
     [[nodiscard]] virtual bool isEof() const = 0;
 

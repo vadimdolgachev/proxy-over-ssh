@@ -6,7 +6,9 @@
 
 #include "FdUtils.h"
 
-class CompletionSignal {
+// NOLINTBEGIN(readability-make-member-function-const)
+
+class CompletionSignal final {
 public:
     CompletionSignal() {
         fd.reset(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
@@ -29,5 +31,7 @@ public:
 private:
     UniqueFd fd;
 };
+
+// NOLINTEND(readability-make-member-function-const)
 
 #endif // PROXY_OVER_SSH_COMPLETIONSIGNAL_H

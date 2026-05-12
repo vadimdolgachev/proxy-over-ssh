@@ -4,33 +4,32 @@
 #include <chrono>
 
 #include "Timer.h"
-#include "Constants.h"
-#include "Logger.h"
 
-class IdleTimer {
+// NOLINTBEGIN(readability-make-member-function-const)
+
+class IdleTimer final {
 public:
-    IdleTimer() = default;
-
-    void arm() {
-        timer.armSec(Constants::IDLE_TIMEOUT_SEC);
+    explicit IdleTimer(const std::chrono::seconds timeout_) :
+        timeout(timeout_) {
     }
 
-    void drain() {
+    void arm() noexcept {
+        timer.arm(timeout);
+    }
+
+    void drain() noexcept {
         timer.drain();
     }
 
-    bool checkIdleTimeout() {
-        drain();
-        log_v("Closing connection due to idle timeout\n");
-        return true;
-    }
-
-    int getFd() const {
+    [[nodiscard]] int getFd() const noexcept {
         return timer.getFd();
     }
 
 private:
+    const std::chrono::seconds timeout;
     Timer timer;
 };
+
+// NOLINTBEGIN(readability-make-member-function-const)
 
 #endif // PROXY_OVER_SSH_IDLETIMER_H

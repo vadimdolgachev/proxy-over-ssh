@@ -1,14 +1,16 @@
 #ifndef TIMER_H
 #define TIMER_H
 
+#include <cerrno>
 #include <chrono>
 #include <system_error>
-#include <cerrno>
 
 #include <sys/timerfd.h>
 
-#include "FdUtils.h"
 #include "Constants.h"
+#include "FdUtils.h"
+
+// NOLINTBEGIN(readability-make-member-function-const)
 
 class Timer final {
 public:
@@ -19,18 +21,18 @@ public:
         }
     }
 
-    void arm(const std::chrono::nanoseconds delay) const {
+    void arm(const std::chrono::nanoseconds delay) noexcept {
         itimerspec spec{};
         spec.it_value.tv_sec = static_cast<time_t>(delay.count() / Constants::NANOSECONDS_PER_SECOND);
         spec.it_value.tv_nsec = static_cast<long>(delay.count() % Constants::NANOSECONDS_PER_SECOND);
         timerfd_settime(fd.get(), 0, &spec, nullptr);
     }
 
-    void armSec(const int secs) const {
+    void armSec(const int secs) noexcept {
         arm(std::chrono::seconds(secs));
     }
 
-    void drain() const {
+    void drain() noexcept {
         uint64_t val;
         [[maybe_unused]] const ssize_t r = read(fd.get(), &val, sizeof(val));
     }
@@ -42,5 +44,7 @@ public:
 private:
     UniqueFd fd;
 };
+
+// NOLINTEND(readability-make-member-function-const)
 
 #endif // TIMER_H

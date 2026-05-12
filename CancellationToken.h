@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
 
 #include "CompletionSignal.h"
 
@@ -35,6 +36,8 @@ private:
 
     friend class CancellationTokenSource;
 };
+
+using CancellationTokenOpt = std::optional<CancellationToken>;
 
 class CancellationTokenSource final {
 public:
