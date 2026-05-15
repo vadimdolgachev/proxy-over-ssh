@@ -3,11 +3,11 @@
 
 namespace Constants {
     constexpr size_t EPOLL_BATCH_SIZE = 16;
-    constexpr size_t EPOLL_TIMEOUT_MS = 1'000;
+    constexpr size_t EPOLL_TIMEOUT_MS = 5'000;
 
     constexpr size_t BUFFER_SIZE = 8192;
 
-    constexpr int IDLE_TIMEOUT_SEC = 30;
+    constexpr int IDLE_TIMEOUT_SEC = 300;
 
     constexpr long long NANOSECONDS_PER_SECOND = 1'000'000'000LL;
 

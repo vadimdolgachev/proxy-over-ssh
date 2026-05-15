@@ -14,7 +14,7 @@
 struct AcceptedSocket;
 
 struct ListenSocketAwaiter final : SchedulerAware<EpollScheduler> {
-    ListenSocketAwaiter(int fd_, CancellationToken ct_);
+    ListenSocketAwaiter(int fd_, CancellationToken cancellationToken_);
 
     [[nodiscard]] bool await_ready() const noexcept;
 
@@ -24,7 +24,7 @@ struct ListenSocketAwaiter final : SchedulerAware<EpollScheduler> {
 
 private:
     int fd;
-    CancellationToken ct;
+    CancellationToken cancellationToken;
     std::coroutine_handle<> handle;
 };
 
@@ -32,7 +32,9 @@ class Socket;
 using SocketPtr = std::shared_ptr<Socket>;
 
 struct ReadSocketAwaiter final : SchedulerAware<EpollScheduler> {
-    ReadSocketAwaiter(SocketPtr socket_, std::span<unsigned char> buffer_, CancellationTokenOpt ct_);
+    ReadSocketAwaiter(SocketPtr socket_,
+                      std::span<unsigned char> buffer_,
+                      CancellationTokenOpt cancellationToken_);
 
     [[nodiscard]] bool await_ready() const noexcept;
 
@@ -45,12 +47,14 @@ private:
     std::span<unsigned char> buffer;
     mutable int peekErrno = 0;
     mutable bool peekEof = false;
-    CancellationTokenOpt ct;
+    CancellationTokenOpt cancellationToken;
     std::coroutine_handle<> handle;
 };
 
 struct WriteSocketAwaiter final : SchedulerAware<EpollScheduler> {
-    WriteSocketAwaiter(SocketPtr socket_, std::span<unsigned char> buffer_, CancellationTokenOpt ct_);
+    WriteSocketAwaiter(SocketPtr socket_,
+                       std::span<unsigned char> buffer_,
+                       CancellationTokenOpt cancellationToken_);
 
     [[nodiscard]] bool await_ready() const noexcept;
 
@@ -64,12 +68,14 @@ private:
     mutable int pollErrno = 0;
     mutable bool pollError = false;
     mutable short pollRevents = 0;
-    CancellationTokenOpt ct;
+    CancellationTokenOpt cancellationToken;
     std::coroutine_handle<> handle;
 };
 
 struct ConnectSocketAwaiter final : SchedulerAware<EpollScheduler> {
-    ConnectSocketAwaiter(SocketPtr socket_, Endpoint endpoint_, CancellationTokenOpt ct_);
+    ConnectSocketAwaiter(SocketPtr socket_,
+                         Endpoint endpoint_,
+                         CancellationTokenOpt cancellationToken_);
 
     [[nodiscard]] bool await_ready() const noexcept;
 
@@ -82,7 +88,7 @@ private:
     Endpoint endpoint;
     mutable int connectErrno = 0;
     mutable bool connectPending = false;
-    CancellationTokenOpt ct;
+    CancellationTokenOpt cancellationToken;
     std::coroutine_handle<> handle;
 };
 

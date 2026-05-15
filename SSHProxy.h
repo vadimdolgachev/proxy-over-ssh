@@ -27,6 +27,11 @@ struct ProxyConfig final {
     std::uint16_t listenPort;
 };
 
+struct ProxyStats final {
+    std::atomic_uint64_t activeConnections = 0;
+    std::atomic_uint64_t totalConnections = 0;
+};
+
 using StartCallback = std::function<void()>;
 using FinishCallback = std::function<void()>;
 using ErrorCallback = std::function<void(int)>;
@@ -51,6 +56,9 @@ private:
     std::optional<ProxyConfig> config;
     std::optional<std::jthread> mainThread;
     CancellationTokenSource &cts;
+    std::shared_ptr<ProxyStats> proxyStats = std::make_shared<ProxyStats>();
+    std::atomic_bool isStopRequested = true;
+    std::unique_ptr<std::jthread> proxyStatsThread;
 };
 
 #endif // PROXY_OVER_SSH_SSHEPROXY_H

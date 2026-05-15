@@ -24,7 +24,6 @@ void EpollScheduler::ThreadPool::worker(const std::stop_token &st) {
             h = queue.back();
             queue.pop_back();
         }
-        const auto address = h.address();
         if (!h.done()) {
             h.resume();
         }
@@ -68,34 +67,33 @@ EpollScheduler::EpollScheduler(const CancellationTokenSource &cts_) :
     pendingResumes.reserve(16);
 }
 
-void EpollScheduler::add(const uint32_t events, const int fd, const std::coroutine_handle<> coro) {
+void EpollScheduler::add(const uint32_t events, int fd, std::coroutine_handle<> coro) {
     std::lock_guard lock(schedulerMutex);
 
-    auto &[coros, registeredEvents] = fdStates[fd];
-    coros.push_back({events, coro});
+    auto it = fdStates.find(fd);
+    const bool exists = it != fdStates.end();
 
-    const uint32_t desired = registeredEvents | events;
-    if (desired == registeredEvents) {
-        return;
+    if (!exists) {
+        it = fdStates.emplace(fd, FdState{}).first;
     }
+    it->second.coros.push_back({events, coro});
 
-    const int op = registeredEvents == 0 ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
+    const int op = exists ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+
     epoll_event ev{};
-    ev.events = desired;
+    ev.events = exists ? calculateRemainingEvents(it->second) : events;
     ev.data.fd = fd;
 
     if (epoll_ctl(epollFd.get(), op, fd, &ev) < 0) {
-        const int err = errno;
-        coros.pop_back();
-        if (coros.empty()) {
-            fdStates.erase(fd);
+        it->second.coros.pop_back();
+        if (it->second.coros.empty()) {
+            fdStates.erase(it);
         }
-        throw std::system_error(err, std::system_category(), "Epoll add failed");
+        throw std::system_error(errno, std::system_category(), "Epoll add/mod failed");
     }
-    registeredEvents = desired;
+
     wakeupSignal.signal();
 }
-
 void EpollScheduler::remove(const int fd, const std::coroutine_handle<> coro) {
     std::lock_guard lock(schedulerMutex);
 
@@ -104,10 +102,13 @@ void EpollScheduler::remove(const int fd, const std::coroutine_handle<> coro) {
         return;
     }
 
-    auto &coros = it->second.coros;
-    const auto coroIt = std::ranges::find_if(coros, [&](const CoroEntry &e) { return e.h == coro; });
-    if (coroIt != coros.end()) {
-        coros.erase(coroIt);
+    const auto coroIt =
+        std::ranges::find_if(it->second.coros,
+            [&](const auto &ce) {
+                return ce.handle == coro;
+            });
+    if (coroIt != it->second.coros.end()) {
+        it->second.coros.erase(coroIt);
         updateEpollRegistration(it);
     }
 }
@@ -146,7 +147,7 @@ void EpollScheduler::run() {
                     auto &coros = fdIt->second.coros;
                     std::erase_if(coros, [&](const CoroEntry &e) {
                         if (e.events & occurredEvents) {
-                            pendingResumes.push_back(e.h);
+                            pendingResumes.push_back(e.handle);
                             return true;
                         }
                         return false;
@@ -176,26 +177,25 @@ const CancellationTokenSource &EpollScheduler::getCancellationTokenSource() cons
 
 uint32_t EpollScheduler::calculateRemainingEvents(const FdState &state) {
     uint32_t remaining = 0;
-    for (const auto &coro: state.coros) {
-        remaining |= coro.events;
+    for (const auto &[events, h]: state.coros) {
+        remaining |= events;
     }
     return remaining;
 }
 
 void EpollScheduler::updateEpollRegistration(const FdStates::iterator it) {
     const int fd = it->first;
-    auto &state = it->second;
+    const auto &state = it->second;
 
     const uint32_t remaining = calculateRemainingEvents(state);
 
     if (state.coros.empty()) {
         epoll_ctl(epollFd.get(), EPOLL_CTL_DEL, fd, nullptr);
         fdStates.erase(it);
-    } else if (remaining != state.registeredEvents) {
+    } else {
         epoll_event ev{};
         ev.events = remaining;
         ev.data.fd = fd;
         epoll_ctl(epollFd.get(), EPOLL_CTL_MOD, fd, &ev);
-        state.registeredEvents = remaining;
     }
 }

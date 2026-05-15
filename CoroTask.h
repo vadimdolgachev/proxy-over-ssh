@@ -28,7 +28,7 @@ class Socket;
 class EpollScheduler final {
     struct CoroEntry final {
         uint32_t events{};
-        std::coroutine_handle<> h;
+        std::coroutine_handle<> handle;
     };
 
     class ThreadPool final {
@@ -74,7 +74,6 @@ public:
 private:
     struct FdState {
         std::vector<CoroEntry> coros;
-        uint32_t registeredEvents = 0;
     };
 
     using FdStates = std::unordered_map<int, FdState>;
@@ -262,7 +261,7 @@ struct CoroTaskAwaiterVoid final : CoroTaskAwaiterBase<Promise> {
     }
 };
 
-template<typename T>
+template<typename T = void>
 class CoroTask final {
 public:
     template<typename promise_type>

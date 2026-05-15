@@ -72,13 +72,14 @@ add_executable(proxy_over_ssh main.cpp
         SshSessionHandler.cpp
         CancellationToken.cpp
         CancellationToken.h
+        CoroTask.cpp
 )
 target_link_libraries(proxy_over_ssh PRIVATE
         OpenSSL::Crypto
         OpenSSL::SSL
         libssh2
 )
-target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion -Wsign-conversion -Wnull-dereference -Wno-unused-variable -Wno-unused-parameter -Wno-unused-private-field -Werror=uninitialized -fno-omit-frame-pointer)
+target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion -Wsign-conversion -Wnull-dereference -Wno-unused-variable -Wno-unused-parameter -Wno-unused-private-field -Werror=uninitialized -Wno-unused-function -fno-omit-frame-pointer)
 
 if (CMAKE_BUILD_TYPE STREQUAL "DebugAddrSan")
     target_link_options(proxy_over_ssh PRIVATE -g -Og -fsanitize=address)

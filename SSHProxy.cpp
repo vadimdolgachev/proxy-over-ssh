@@ -64,7 +64,7 @@ namespace {
         return a + b;
     }
 
-    CoroTask<void> readUntil(const std::shared_ptr<ClientContextCoro> clientCtx, const size_t totalSize) {
+    [[nodiscard]] CoroTask<> readUntil(const std::shared_ptr<ClientContextCoro> clientCtx, const size_t totalSize) {
         if (clientCtx->buffer.size() < totalSize) {
             throw std::runtime_error("Buffer too small for requested read size");
         }
@@ -102,7 +102,7 @@ struct Socks5Negotiation final {
     std::span<const uint8_t> nmethodsData;
 
 
-    static CoroTask<Socks5Negotiation> parse(const std::shared_ptr<ClientContextCoro> clientCtx) {
+    [[nodiscard]] static CoroTask<Socks5Negotiation> parse(const std::shared_ptr<ClientContextCoro> clientCtx) {
         Socks5Negotiation result;
 
         constexpr size_t kHeaderSize = 2;
@@ -132,7 +132,7 @@ struct Socks5Negotiation final {
     }
 };
 
-CoroTask<void> handleSocks5Handshake(const std::shared_ptr<ClientContextCoro> clientCtx) {
+[[nodiscard]] CoroTask<> handleSocks5Handshake(const std::shared_ptr<ClientContextCoro> clientCtx) {
     const auto negotiation = co_await Socks5Negotiation::parse(clientCtx);
 
     const bool hasNoAuth = std::ranges::find_if(negotiation.nmethodsData, [](const auto c) {
@@ -154,7 +154,7 @@ CoroTask<void> handleSocks5Handshake(const std::shared_ptr<ClientContextCoro> cl
     }
 }
 
-static CoroTask<void> writeAll(const SocketPtr &socket, std::span<const uint8_t> data) {
+[[nodiscard]] static CoroTask<> writeAll(const SocketPtr &socket, std::span<const uint8_t> data) {
     size_t offset = 0;
     while (offset < data.size()) {
         const size_t written =
@@ -182,7 +182,7 @@ struct Socks5Request final {
     uint8_t atyp;
     Endpoint targetEndpoint;
 
-    static CoroTask<Socks5Request> readRequest(const std::shared_ptr<ClientContextCoro> clientCtx) {
+    [[nodiscard]] static CoroTask<Socks5Request> readRequest(const std::shared_ptr<ClientContextCoro> clientCtx) {
         auto readBytes = [&clientCtx](auto &buffer, size_t &offset, const size_t n) -> CoroTask<void> {
             buffer.resize(offset + n);
             while (offset < buffer.size()) {
@@ -355,12 +355,12 @@ struct Socks5Response final {
     }
 };
 
-CoroTask<void> handleSocks5Request(const std::shared_ptr<ClientContextCoro> clientCtx) {
+[[nodiscard]] static CoroTask<> handleSocks5Request(const std::shared_ptr<ClientContextCoro> clientCtx) {
     const auto req = co_await Socks5Request::readRequest(clientCtx);
     clientCtx->targetEndpoint = req.targetEndpoint;
 }
 
-static CoroTask<void> sendSocks5Success(const std::shared_ptr<ClientContextCoro> clientCtx) {
+[[nodiscard]] static CoroTask<> sendSocks5Success(const std::shared_ptr<ClientContextCoro> clientCtx) {
     Socks5Response::ipv4Any(clientCtx->targetEndpoint.port()).serializeTo(clientCtx->buffer);
     co_await writeAll(clientCtx->socket, {clientCtx->buffer.data(), clientCtx->buffer.size()});
 }
@@ -380,27 +380,42 @@ static void sendSocks5FailureSync(const std::shared_ptr<ClientContextCoro> &clie
     }
 }
 
-struct ForwardCoordinator final {
+struct DataForwardContext final {
     std::atomic<bool> clientReadDone = false;
     std::atomic<bool> backendReadDone = false;
     std::atomic<bool> closed = false;
     std::shared_ptr<ClientContextCoro> client;
     BackendSocketPtr backend;
-    CompletionSignal completionSignal;
-    IdleTimer idleTimer;
+    std::shared_ptr<CompletionSignal> completionSignal = std::make_shared<CompletionSignal>();
+    IdleTimer idleTimer{std::chrono::seconds(Constants::IDLE_TIMEOUT_SEC)};
     EpollScheduler *scheduler = nullptr;
+    std::optional<CancellationTokenSource> cts;
+    std::shared_ptr<ProxyStats> proxyStats;
 
-    ForwardCoordinator(std::shared_ptr<ClientContextCoro> client_, BackendSocketPtr backend_) :
+    DataForwardContext(std::shared_ptr<ClientContextCoro> client_,
+                       BackendSocketPtr backend_,
+                       std::shared_ptr<ProxyStats> proxyStats_) :
         client(std::move(client_)),
-        backend(std::move(backend_)) {
+        backend(std::move(backend_)),
+        proxyStats(std::move(proxyStats_)) {
         idleTimer.arm();
+        log_v("DataForwardContext: {}\n", proxyStats->activeConnections.fetch_add(1));
+    }
+
+    DataForwardContext(const DataForwardContext &) = delete;
+    DataForwardContext &operator=(const DataForwardContext &) = delete;
+
+    ~DataForwardContext() {
+        log_v("~DataForwardContext: {}\n", proxyStats->activeConnections.fetch_sub(1));
     }
 
     void onDirectionDone(const bool isClientDirection) {
         auto &self = isClientDirection ? clientReadDone : backendReadDone;
-        self.store(true, std::memory_order_release);
-        closeAll();
-        completionSignal.signal();
+        self.store(true);
+        cts->requestStop();
+        if (clientReadDone && backendReadDone) {
+            completionSignal->signal();
+        }
     }
 
     void closeAll() {
@@ -424,17 +439,10 @@ struct ForwardCoordinator final {
             client->socket->close();
         }
     }
-
-    bool checkIdleTimeout() {
-        idleTimer.drain();
-        log_v("Closing connection due to idle timeout\n");
-        closeAll();
-        return true;
-    }
 };
 
 template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typename DestIsEofFunc>
-static CoroTask<void> forwardDirection(const std::shared_ptr<ForwardCoordinator> state,
+[[nodiscard]] static CoroTask<> forwardDirection(const std::shared_ptr<DataForwardContext> state,
                                        ReadFunc read,
                                        WriteFunc write,
                                        SourceIsEofFunc sourceIsEof,
@@ -482,26 +490,44 @@ static CoroTask<void> forwardDirection(const std::shared_ptr<ForwardCoordinator>
     state->onDirectionDone(isClientDirection);
 }
 
-static CoroTask<void> forwardClientToBackend(const std::shared_ptr<ForwardCoordinator> state) {
+[[nodiscard]] static CoroTask<> forwardClientToBackend(const std::shared_ptr<DataForwardContext> state) {
     co_await forwardDirection(
             state,
             [state](const std::span<uint8_t> buf) -> CoroTask<size_t> {
-                co_return co_await state->client->socket->read(buf, co_await GetCancellationToken());
+                co_return co_await state->client->socket->read(buf, state->cts->getToken());
             },
-            [state](const std::span<const uint8_t> buf) -> CoroTask<size_t> { return state->backend->writeAsync(buf); },
-            [state]() -> bool { return state->client->socket->isEof(); },
-            [state]() -> bool { return state->backend->isEof(); }, state->clientReadDone, state->backendReadDone, true);
+            [state](const std::span<const uint8_t> buf) -> CoroTask<size_t> {
+                co_return co_await state->backend->writeAsync(buf, state->cts->getToken());
+            },
+            [state]() -> bool {
+                return state->client->socket->isEof();
+            },
+            [state]() -> bool {
+                return state->backend->isEof();
+            },
+            state->clientReadDone,
+            state->backendReadDone,
+            true);
 }
 
-static CoroTask<void> forwardBackendToClient(const std::shared_ptr<ForwardCoordinator> state) {
+[[nodiscard]] static CoroTask<> forwardBackendToClient(const std::shared_ptr<DataForwardContext> state) {
     co_await forwardDirection(
-            state, [state](const std::span<uint8_t> buf) -> CoroTask<size_t> { return state->backend->readAsync(buf); },
+            state,
+            [state] (const std::span<uint8_t> buf) mutable -> CoroTask<size_t> {
+                co_return co_await state->backend->readAsync(buf, state->cts->getToken());
+            },
             [state](const std::span<const uint8_t> buf) -> CoroTask<size_t> {
                 co_await writeAll(state->client->socket, buf);
                 co_return buf.size();
             },
-            [state]() -> bool { return state->backend->isEof(); },
-            [state]() -> bool { return state->client->socket->isEof(); }, state->backendReadDone, state->clientReadDone,
+            [state]() -> bool {
+                return state->backend->isEof();
+            },
+            [state]() -> bool {
+                return state->client->socket->isEof();
+            },
+            state->backendReadDone,
+            state->clientReadDone,
             false);
 }
 
@@ -542,15 +568,18 @@ struct MultiFdAwaiter final : SchedulerAware<EpollScheduler> {
 
 private:
     std::vector<FdInfo> fds;
-    std::coroutine_handle<> handle = {};
+    std::coroutine_handle<> handle;
 };
 
-static CoroTask<void> forwardData(const std::shared_ptr<ClientContextCoro> clientCtx,
-                                  const BackendSocketPtr backendSocket) {
-    const auto state = std::make_shared<ForwardCoordinator>(clientCtx, backendSocket);
+[[nodiscard]] static CoroTask<> forwardData(const std::shared_ptr<ClientContextCoro> clientCtx,
+                                            const BackendSocketPtr backendSocket,
+                                            CancellationTokenSource cts,
+                                            const std::shared_ptr<ProxyStats> &proxyStats) {
+    const auto state = std::make_shared<DataForwardContext>(clientCtx, backendSocket, proxyStats);
 
     auto *scheduler = co_await GetScheduler{};
     state->scheduler = scheduler;
+    state->cts = cts;
 
     auto clientToBackend = forwardClientToBackend(state);
     auto backendToClient = forwardBackendToClient(state);
@@ -558,35 +587,43 @@ static CoroTask<void> forwardData(const std::shared_ptr<ClientContextCoro> clien
     clientToBackend.detach(*scheduler);
     backendToClient.detach(*scheduler);
 
-    while (!(state->clientReadDone.load(std::memory_order_relaxed) &&
-             state->backendReadDone.load(std::memory_order_relaxed))) {
+    while (!(state->clientReadDone.load() && state->backendReadDone.load())) {
         const auto readyFds = co_await MultiFdAwaiter{
             {
-                {state->completionSignal.getFd(), EPOLLIN},
+                {state->completionSignal->getFd(), EPOLLIN},
                 {state->idleTimer.getFd(), EPOLLIN}
             }
         };
 
         for (const int fd: readyFds) {
-            if (fd == state->completionSignal.getFd()) {
-                state->completionSignal.drain();
-            } else if (fd == state->idleTimer.getFd() && state->checkIdleTimeout()) {
+            if (fd == state->completionSignal->getFd()) {
+                state->completionSignal->drain();
+                state->closeAll();
+                break;
+            }
+            if (fd == state->idleTimer.getFd()) {
+                state->idleTimer.drain();
+                state->cts->requestStop();
+                state->closeAll();
                 break;
             }
         }
     }
 }
 
-static CoroTask<void> handleClient(const BackendFactory backendFactory,
-                                   Endpoint endpoint,
-                                   SocketPtr socket) {
+[[nodiscard]] static CoroTask<> handleClient(const BackendFactory backendFactory,
+                                             Endpoint endpoint,
+                                             SocketPtr socket,
+                                             const std::shared_ptr<ProxyStats> &proxyStats) {
     const auto client = std::make_shared<ClientContextCoro>(endpoint, socket);
     try {
         co_await handleSocks5Handshake(client);
         co_await handleSocks5Request(client);
 
         const auto backendSocket = backendFactory(client->targetEndpoint);
-        if (const auto connectResult = co_await backendSocket->connectAsync(client->targetEndpoint);
+        CancellationTokenSource cts;
+
+        if (const auto connectResult = co_await backendSocket->connectAsync(client->targetEndpoint, cts.getToken());
             connectResult != ResultCode::Ok) {
             sendSocks5FailureSync(client);
             client->closeSocket();
@@ -594,7 +631,7 @@ static CoroTask<void> handleClient(const BackendFactory backendFactory,
         }
 
         co_await sendSocks5Success(client);
-        co_await forwardData(client, backendSocket);
+        co_await forwardData(client, backendSocket, std::move(cts), proxyStats);
     } catch (const std::exception &) {
         sendSocks5FailureSync(client);
     } catch (...) {
@@ -603,7 +640,9 @@ static CoroTask<void> handleClient(const BackendFactory backendFactory,
     client->closeSocket();
 }
 
-CoroTask<void> startServer(const ProxyConfig config) {
+[[nodiscard]] CoroTask<> startServer(const ProxyConfig config,
+                                     const std::shared_ptr<ProxyStats> proxyStats,
+                                     std::atomic_bool &isStopRequested) {
     Socket serverSocket;
     serverSocket.setReuseAddr(true);
     log_d("Listening port: {}\n", config.listenPort);
@@ -618,9 +657,10 @@ CoroTask<void> startServer(const ProxyConfig config) {
         try {
             auto [socket, endpoint] = co_await serverSocket.listen(scheduler->getCancellationTokenSource().getToken());
             log_d("Server: new connection port: {}\n", endpoint.port());
-            auto handler = handleClient(config.backendFactory, endpoint, socket);
+            auto handler = handleClient(config.backendFactory, endpoint, socket, proxyStats);
             handler.detach(*scheduler);
-        } catch (const SocketCancelException &) {
+        } catch (const CancellationTokenException &) {
+            isStopRequested.store(true);
             log_d("Server task finished\n");
             break;
         } catch (const std::exception &) {
@@ -647,12 +687,14 @@ void SSHProxy::start(const ProxyConfig &proxyConfig,
         throw std::runtime_error("Already started");
     }
     this->config = proxyConfig;
+    isStopRequested = false;
     mainThread = std::jthread([this, startCb, stopCb] { mainLoop(startCb, stopCb); });
 }
 
 void SSHProxy::requestStop() noexcept {
     log_d("SSHProxy::requestStop\n");
     cts.requestStop();
+    isStopRequested = true;
 }
 
 void SSHProxy::waitForFinish() {
@@ -663,8 +705,16 @@ void SSHProxy::waitForFinish() {
 
 void SSHProxy::mainLoop(const std::optional<StartCallback> &startCb, const std::optional<FinishCallback> &stopCb) {
     try {
+
+        proxyStatsThread = std::make_unique<std::jthread>([stats = proxyStats,
+                                                             &isStopped = isStopRequested] {
+            while (!isStopped) {
+                log_d("Active connections: {}\n", stats->activeConnections.load());
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        });
         EpollScheduler sched(cts);
-        auto task = startServer(config.value());
+        auto task = startServer(config.value(), proxyStats, isStopRequested);
         task.start(sched);
         log_d("SOCKS5 proxy started on port: {}\n", config.value().listenPort);
         log_d("Proxy started. Press Ctrl+C to stop...\n");

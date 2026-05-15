@@ -449,7 +449,6 @@ void SshSocketAwaiterBase::onResume() {
     if (cancellationToken && handle) {
         this->getScheduler()->remove(cancellationToken->getFd(), handle);
     }
-    this->getScheduler()->remove(socket->fd(), handle);
     if (cancellationToken && cancellationToken->isStopped()) {
         cancellationToken->drain();
         throw CancellationTokenException();
