@@ -44,11 +44,11 @@ public:
 
     ~SshSocket() override;
 
-    [[nodiscard]] CoroTask<ResultCode> connectAsync(const Endpoint &targetEndpoint_, std::shared_ptr<CompletionSignal> cs) override;
+    [[nodiscard]] CoroTask<ResultCode> connectAsync(const Endpoint &targetEndpoint_, CancellationTokenOpt ct) override;
 
-    [[nodiscard]] CoroTask<size_t> readAsync(std::span<uint8_t> buffer, std::shared_ptr<CompletionSignal> cs) override;
+    [[nodiscard]] CoroTask<size_t> readAsync(std::span<uint8_t> buffer, CancellationTokenOpt ct) override;
 
-    [[nodiscard]] CoroTask<size_t> writeAsync(std::span<const uint8_t> data, std::shared_ptr<CompletionSignal> cs) override;
+    [[nodiscard]] CoroTask<size_t> writeAsync(std::span<const uint8_t> data, CancellationTokenOpt ct) override;
 
     [[nodiscard]] int fd() const noexcept override;
 
@@ -96,8 +96,8 @@ private:
 
 struct SshSocketAwaiterBase : SchedulerAware<EpollScheduler> {
 protected:
-    SshSocketAwaiterBase(std::shared_ptr<SshSocket> socket,
-                         const std::shared_ptr<CompletionSignal> &cs_);
+    SshSocketAwaiterBase(std::shared_ptr<SshSocket> socket_,
+                         const CancellationTokenOpt &cancellationToken_);
 
     [[nodiscard]] uint32_t computePollEvents(uint32_t defaultEvents) const;
 
@@ -105,15 +105,15 @@ protected:
 
     void onResume();
 
-    std::shared_ptr<SshSocket> sshSocket;
-    std::shared_ptr<CompletionSignal> cs;
+    std::shared_ptr<SshSocket> socket;
+    const CancellationTokenOpt &cancellationToken;
     std::coroutine_handle<> handle;
 };
 
 struct SshConnectAwaiter final : SshSocketAwaiterBase {
-    SshConnectAwaiter(std::shared_ptr<SshSocket> socket,
+    SshConnectAwaiter(std::shared_ptr<SshSocket> socket_,
                       Endpoint targetEndpoint_,
-                      const std::shared_ptr<CompletionSignal> &cs_);
+                      const CancellationTokenOpt &cancellationToken_);
 
     [[nodiscard]] bool await_ready() const noexcept;
 
@@ -127,14 +127,14 @@ private:
 };
 
 struct SshFdWaitAwaiter final : SshSocketAwaiterBase {
-    SshFdWaitAwaiter(std::shared_ptr<SshSocket> socket,
-                     const std::shared_ptr<CompletionSignal> &cs_);
+    SshFdWaitAwaiter(std::shared_ptr<SshSocket> socket_,
+                     const CancellationTokenOpt &cancellationToken_);
 
     [[nodiscard]] bool await_ready() const noexcept;
 
     void await_suspend(std::coroutine_handle<> h);
 
-    void await_resume() noexcept;
+    void await_resume();
 };
 
 using SshSocketPtr = std::shared_ptr<SshSocket>;

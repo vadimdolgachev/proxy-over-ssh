@@ -275,7 +275,7 @@ ResultCode SshSocket::createChannel() {
     return result;
 }
 
-CoroTask<ResultCode> SshSocket::connectAsync(const Endpoint &targetEndpoint_, std::shared_ptr<CompletionSignal> cs) {
+CoroTask<ResultCode> SshSocket::connectAsync(const Endpoint &targetEndpoint_, CancellationTokenOpt ct) {
     targetEndpoint = targetEndpoint_;
 
     while (true) {
@@ -286,11 +286,14 @@ CoroTask<ResultCode> SshSocket::connectAsync(const Endpoint &targetEndpoint_, st
         if (rc != ResultCode::ErrAgain) {
             co_return rc;
         }
-        co_await SshConnectAwaiter{shared_from_this(), targetEndpoint, cs};
+        co_await SshConnectAwaiter{shared_from_this(), targetEndpoint, ct};
+        if (ct && ct->isStopped()) {
+            throw std::logic_error("SshSocket::connectAsync");
+        }
     }
 }
 
-CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer, const std::shared_ptr<CompletionSignal> cs) {
+CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer, CancellationTokenOpt ct) {
     while (true) {
         if (libSsh2Channel == nullptr) {
             co_return 0;
@@ -318,7 +321,7 @@ CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer, const std::shar
         }
 
         if (n == LIBSSH2_ERROR_EAGAIN) {
-            co_await SshFdWaitAwaiter{shared_from_this(), cs};
+            co_await SshFdWaitAwaiter{shared_from_this(), ct};
             continue;
         }
 
@@ -331,7 +334,7 @@ CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer, const std::shar
     }
 }
 
-CoroTask<size_t> SshSocket::writeAsync(const std::span<const uint8_t> data, std::shared_ptr<CompletionSignal> cs) {
+CoroTask<size_t> SshSocket::writeAsync(const std::span<const uint8_t> data, CancellationTokenOpt ct) {
     while (true) {
         if (libSsh2Channel == nullptr) {
             co_return 0;
@@ -354,16 +357,13 @@ CoroTask<size_t> SshSocket::writeAsync(const std::span<const uint8_t> data, std:
             co_return static_cast<size_t>(n);
         }
 
-        if (n == LIBSSH2_ERROR_EAGAIN) {
-            if (eof) {
-                co_return 0;
-            }
-            co_await SshFdWaitAwaiter{shared_from_this(), cs};
-            continue;
+        if (eof || n == 0 || n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
+            co_return 0;
         }
 
-        if (n == LIBSSH2_ERROR_CHANNEL_CLOSED) {
-            co_return 0;
+        if (n == LIBSSH2_ERROR_EAGAIN) {
+            co_await SshFdWaitAwaiter{shared_from_this(), ct};
+            continue;
         }
 
         if (n < 0) {
@@ -423,14 +423,14 @@ void SshSocket::close() noexcept {
     pendingDirections = 0;
 }
 
-SshSocketAwaiterBase::SshSocketAwaiterBase(std::shared_ptr<SshSocket> socket,
-                                           const std::shared_ptr<CompletionSignal> &cs_) :
-    sshSocket(std::move(socket)),
-    cs(cs_) {
+SshSocketAwaiterBase::SshSocketAwaiterBase(std::shared_ptr<SshSocket> socket_,
+                                           const CancellationTokenOpt &cancellationToken_) :
+    socket(std::move(socket_)),
+    cancellationToken(cancellationToken_) {
 }
 
 uint32_t SshSocketAwaiterBase::computePollEvents(const uint32_t defaultEvents) const {
-    const int directions = sshSocket->getBlockDirections();
+    const int directions = socket->getBlockDirections();
     return SshSocket::computePollEvents(directions, defaultEvents);
 }
 
@@ -439,35 +439,40 @@ void SshSocketAwaiterBase::onSuspend(const std::coroutine_handle<> h, const uint
     handle = h;
     uint32_t events = computePollEvents(defaultEvents);
     events |= EpollScheduler::PollErr | EpollScheduler::PollHUp;
-    if (cs) {
-        this->getScheduler()->add(EpollScheduler::PollIn, cs->getFd(), h);
+    this->getScheduler()->add(events, socket->fd(), h);
+    if (cancellationToken) {
+        this->getScheduler()->add(EpollScheduler::PollIn, cancellationToken->getFd(), h);
     }
-    this->getScheduler()->add(events, sshSocket->fd(), h);
 }
 
 void SshSocketAwaiterBase::onResume() {
-    if (cs && handle) {
-        this->getScheduler()->remove(cs->getFd(), handle);
+    if (cancellationToken && handle) {
+        this->getScheduler()->remove(cancellationToken->getFd(), handle);
+    }
+    this->getScheduler()->remove(socket->fd(), handle);
+    if (cancellationToken && cancellationToken->isStopped()) {
+        cancellationToken->drain();
+        throw CancellationTokenException();
     }
 }
 
-SshConnectAwaiter::SshConnectAwaiter(std::shared_ptr<SshSocket> socket,
+SshConnectAwaiter::SshConnectAwaiter(std::shared_ptr<SshSocket> socket_,
                                      Endpoint targetEndpoint_,
-                                     const std::shared_ptr<CompletionSignal> &cs_) :
-    SshSocketAwaiterBase(std::move(socket), cs_),
+                                     const CancellationTokenOpt &cancellationToken_) :
+    SshSocketAwaiterBase(std::move(socket_), cancellationToken_),
     targetEndpoint(std::move(targetEndpoint_)) {
 }
 
 bool SshConnectAwaiter::await_ready() const noexcept {
-    if (sshSocket->connectionState == SshSocket::State::CHANNEL_CREATED) {
+    if (socket->connectionState == SshSocket::State::CHANNEL_CREATED) {
         return true;
     }
 
-    if (sshSocket->pendingDirections != 0) {
+    if (socket->pendingDirections != 0) {
         return false;
     }
 
-    const auto rc = sshSocket->tryConnectNonBlocking();
+    const auto rc = socket->tryConnectNonBlocking();
     if (rc == ResultCode::ErrAgain) {
         return false;
     }
@@ -490,12 +495,15 @@ void SshConnectAwaiter::await_resume() {
     }
 }
 
-SshFdWaitAwaiter::SshFdWaitAwaiter(std::shared_ptr<SshSocket> socket,
-                                   const std::shared_ptr<CompletionSignal> &cs_) :
-    SshSocketAwaiterBase(std::move(socket), cs_) {
+SshFdWaitAwaiter::SshFdWaitAwaiter(std::shared_ptr<SshSocket> socket_,
+                                   const CancellationTokenOpt &cancellationToken_) :
+    SshSocketAwaiterBase(std::move(socket_), cancellationToken_) {
 }
 
 bool SshFdWaitAwaiter::await_ready() const noexcept {
+    if (cancellationToken && cancellationToken->isStopped()) {
+        return true;
+    }
     return false;
 }
 
@@ -503,6 +511,6 @@ void SshFdWaitAwaiter::await_suspend(const std::coroutine_handle<> h) {
     onSuspend(h, EpollScheduler::PollIn);
 }
 
-void SshFdWaitAwaiter::await_resume() noexcept {
+void SshFdWaitAwaiter::await_resume() {
     onResume();
 }
