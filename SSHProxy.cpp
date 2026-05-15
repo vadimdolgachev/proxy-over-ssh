@@ -28,35 +28,35 @@
 #include "Socket.h"
 #include "Types.h"
 
-struct ClientContextCoro final {
-    ClientContextCoro(Endpoint endpoint_, SocketPtr socket_) :
-        endpoint(std::move(endpoint_)),
-        socket(std::move(socket_)) {
-    }
-
-    ClientContextCoro(const ClientContextCoro &) = delete;
-
-    ClientContextCoro &operator=(const ClientContextCoro &) = delete;
-
-    ClientContextCoro(ClientContextCoro &&) = default;
-
-    ClientContextCoro &operator=(ClientContextCoro &&) = default;
-
-    ~ClientContextCoro() = default;
-
-    void closeSocket() noexcept {
-        if (socket != nullptr) {
-            socket->close();
-        }
-    }
-
-    Endpoint endpoint;
-    Endpoint targetEndpoint;
-    SocketPtr socket;
-    std::vector<uint8_t> buffer;
-};
-
 namespace {
+    struct ClientContextCoro final {
+        ClientContextCoro(Endpoint endpoint_, SocketPtr socket_) :
+            endpoint(std::move(endpoint_)),
+            socket(std::move(socket_)) {
+        }
+
+        ClientContextCoro(const ClientContextCoro &) = delete;
+
+        ClientContextCoro &operator=(const ClientContextCoro &) = delete;
+
+        ClientContextCoro(ClientContextCoro &&) = default;
+
+        ClientContextCoro &operator=(ClientContextCoro &&) = default;
+
+        ~ClientContextCoro() = default;
+
+        void closeSocket() noexcept {
+            if (socket != nullptr) {
+                socket->close();
+            }
+        }
+
+        Endpoint endpoint;
+        Endpoint targetEndpoint;
+        SocketPtr socket;
+        std::vector<uint8_t> buffer;
+    };
+
     constexpr size_t safeAdd(const size_t a, const size_t b) {
         if (a > std::numeric_limits<size_t>::max() - b) {
             throw std::runtime_error("Integer overflow in size calculation");
@@ -85,8 +85,46 @@ namespace {
             totalRead = safeAdd(totalRead, read);
         }
     }
-} // namespace
 
+    struct MultiFdAwaiter final : SchedulerAware<EpollScheduler> {
+        struct FdInfo final {
+            int fd;
+            uint32_t events;
+        };
+
+        explicit MultiFdAwaiter(std::vector<FdInfo> fds_) :
+            fds(std::move(fds_)) {
+        }
+
+        [[nodiscard]] bool await_ready() const noexcept {
+            return false;
+        }
+
+        void await_suspend(const std::coroutine_handle<> h) {
+            handle = h;
+            for (const auto &[fd, events]: fds) {
+                this->getScheduler()->add(events, fd, h);
+            }
+        }
+
+        std::vector<int> await_resume() {
+            for (const auto &[fd, _]: fds) {
+                this->getScheduler()->remove(fd, handle);
+            }
+            std::vector<int> ready;
+            for (const auto &[fd, _]: fds) {
+                pollfd pollFD{fd, POLLIN, 0};
+                if (poll(&pollFD, 1, 0) == 1 && pollFD.revents & POLLIN) {
+                    ready.push_back(fd);
+                }
+            }
+            return ready;
+        }
+
+    private:
+        std::vector<FdInfo> fds;
+        std::coroutine_handle<> handle;
+    };
 
 // SOCKS5 negotiation header (RFC 1928)
 //+----+----------+----------+
@@ -136,15 +174,18 @@ struct Socks5Negotiation final {
     const auto negotiation = co_await Socks5Negotiation::parse(clientCtx);
 
     const bool hasNoAuth = std::ranges::find_if(negotiation.nmethodsData, [](const auto c) {
-        return c == Socks5::Auth::NoAuth;
-    }) != negotiation.nmethodsData.end();
+                               return c == Socks5::Auth::NoAuth;
+                           }) != negotiation.nmethodsData.end();
 
     const uint8_t selectedMethod = hasNoAuth ? Socks5::Auth::NoAuth : 0xFF;
 
     clientCtx->buffer.resize(2);
     clientCtx->buffer[0] = Socks5::Version;
     clientCtx->buffer[1] = selectedMethod;
-    const size_t length = co_await clientCtx->socket->write({clientCtx->buffer.data(), clientCtx->buffer.size()}, co_await GetCancellationToken());
+    const size_t length = co_await clientCtx->socket->write(
+        {clientCtx->buffer.data(),
+            clientCtx->buffer.size()},
+            co_await GetCancellationToken());
     if (length != clientCtx->buffer.size()) {
         throw std::runtime_error("Failed to write to client");
     }
@@ -154,7 +195,7 @@ struct Socks5Negotiation final {
     }
 }
 
-[[nodiscard]] static CoroTask<> writeAll(const SocketPtr &socket, std::span<const uint8_t> data) {
+[[nodiscard]] CoroTask<> writeAll(const SocketPtr &socket, std::span<const uint8_t> data) {
     size_t offset = 0;
     while (offset < data.size()) {
         const size_t written =
@@ -275,7 +316,7 @@ struct Socks5Response final {
 
     Socks5Response() = default;
 
-    static Socks5Response ipv4(uint32_t addr, uint16_t port) {
+    static Socks5Response ipv4(const uint32_t addr, const uint16_t port) {
         Socks5Response resp;
         resp.atyp = Socks5::Atyp::IpV4;
         resp.bndAddr.resize(4);
@@ -287,42 +328,8 @@ struct Socks5Response final {
         return resp;
     }
 
-    static Socks5Response ipv6(const uint8_t addr[16], uint16_t port) {
-        Socks5Response resp;
-        resp.atyp = Socks5::Atyp::IpV6;
-        resp.bndAddr.assign(addr, addr + 16);
-        resp.bndPort = port;
-        return resp;
-    }
-
-    static Socks5Response domain(const std::string &domain, uint16_t port) {
-        Socks5Response resp;
-        resp.atyp = Socks5::Atyp::Domain;
-        resp.bndAddr.resize(1 + domain.size());
-        resp.bndAddr[0] = static_cast<uint8_t>(domain.size());
-        std::memcpy(resp.bndAddr.data() + 1, domain.data(), domain.size());
-        resp.bndPort = port;
-        return resp;
-    }
-
     static Socks5Response ipv4Any(const uint16_t port) {
         return ipv4(0, port);
-    }
-
-    static Socks5Response fromHost(const std::string &host, uint16_t port) {
-        sockaddr_in6 sa6{};
-        sockaddr_in sa{};
-
-        if (inet_pton(AF_INET6, host.c_str(), &sa6.sin6_addr) == 1) {
-            uint8_t addr[16];
-            std::memcpy(addr, &sa6.sin6_addr, 16);
-            return ipv6(addr, port);
-        }
-        if (inet_pton(AF_INET, host.c_str(), &sa.sin_addr) == 1) {
-            const uint32_t addr = ntohl(sa.sin_addr.s_addr);
-            return ipv4(addr, port);
-        }
-        return domain(host, port);
     }
 
     [[nodiscard]] size_t size() const {
@@ -343,29 +350,23 @@ struct Socks5Response final {
         buffer[portOffset + 1] = static_cast<uint8_t>(bndPort & 0xFF);
     }
 
-    [[nodiscard]] std::vector<uint8_t> serialize() const {
-        std::vector<uint8_t> result(size());
-        serialize(result);
-        return result;
-    }
-
     void serializeTo(std::vector<uint8_t> &buffer) const {
         buffer.resize(size());
         serialize(buffer);
     }
 };
 
-[[nodiscard]] static CoroTask<> handleSocks5Request(const std::shared_ptr<ClientContextCoro> clientCtx) {
+[[nodiscard]] CoroTask<> handleSocks5Request(const std::shared_ptr<ClientContextCoro> clientCtx) {
     const auto req = co_await Socks5Request::readRequest(clientCtx);
     clientCtx->targetEndpoint = req.targetEndpoint;
 }
 
-[[nodiscard]] static CoroTask<> sendSocks5Success(const std::shared_ptr<ClientContextCoro> clientCtx) {
+[[nodiscard]] CoroTask<> sendSocks5Success(const std::shared_ptr<ClientContextCoro> clientCtx) {
     Socks5Response::ipv4Any(clientCtx->targetEndpoint.port()).serializeTo(clientCtx->buffer);
     co_await writeAll(clientCtx->socket, {clientCtx->buffer.data(), clientCtx->buffer.size()});
 }
 
-static void sendSocks5FailureSync(const std::shared_ptr<ClientContextCoro> &clientCtx) {
+void sendSocks5FailureSync(const std::shared_ptr<ClientContextCoro> &clientCtx) {
     Socks5Response response;
     response.rep = Socks5::Rep::GeneralFailure;
     response.atyp = Socks5::Atyp::IpV4;
@@ -442,14 +443,14 @@ struct DataForwardContext final {
 };
 
 template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typename DestIsEofFunc>
-[[nodiscard]] static CoroTask<> forwardDirection(const std::shared_ptr<DataForwardContext> state,
-                                       ReadFunc read,
-                                       WriteFunc write,
-                                       SourceIsEofFunc sourceIsEof,
-                                       DestIsEofFunc destIsEof,
-                                       std::atomic<bool> &sourceDoneFlag,
-                                       std::atomic<bool> &destDoneFlag,
-                                       const bool isClientDirection) {
+[[nodiscard]] CoroTask<> forwardDirection(const std::shared_ptr<DataForwardContext> state,
+                                          ReadFunc read,
+                                          WriteFunc write,
+                                          SourceIsEofFunc sourceIsEof,
+                                          DestIsEofFunc destIsEof,
+                                          std::atomic<bool> &sourceDoneFlag,
+                                          std::atomic<bool> &destDoneFlag,
+                                          const bool isClientDirection) {
     constexpr size_t kBufferSize = Constants::BUFFER_SIZE;
     Buffer buffer(kBufferSize);
 
@@ -482,6 +483,8 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
                 state->idleTimer.arm();
             }
         }
+    } catch (const CancellationTokenException &e) {
+        log_d("{}->{} data forwarding canceled\n", isClientDirection ? "C" : "B", isClientDirection ? "B" : "C");
     } catch (const std::exception &e) {
         log_e("{}->{} exception: {}\n", isClientDirection ? "C" : "B", isClientDirection ? "B" : "C", e.what());
     } catch (...) {
@@ -490,7 +493,7 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
     state->onDirectionDone(isClientDirection);
 }
 
-[[nodiscard]] static CoroTask<> forwardClientToBackend(const std::shared_ptr<DataForwardContext> state) {
+[[nodiscard]] CoroTask<> forwardClientToBackend(const std::shared_ptr<DataForwardContext> state) {
     co_await forwardDirection(
             state,
             [state](const std::span<uint8_t> buf) -> CoroTask<size_t> {
@@ -510,7 +513,7 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
             true);
 }
 
-[[nodiscard]] static CoroTask<> forwardBackendToClient(const std::shared_ptr<DataForwardContext> state) {
+[[nodiscard]] CoroTask<> forwardBackendToClient(const std::shared_ptr<DataForwardContext> state) {
     co_await forwardDirection(
             state,
             [state] (const std::span<uint8_t> buf) mutable -> CoroTask<size_t> {
@@ -531,50 +534,10 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
             false);
 }
 
-struct MultiFdAwaiter final : SchedulerAware<EpollScheduler> {
-    struct FdInfo final {
-        int fd;
-        uint32_t events;
-    };
-
-    explicit MultiFdAwaiter(std::vector<FdInfo> fds_) :
-        fds(std::move(fds_)) {
-    }
-
-    [[nodiscard]] bool await_ready() const noexcept {
-        return false;
-    }
-
-    void await_suspend(const std::coroutine_handle<> h) {
-        handle = h;
-        for (const auto &[fd, events]: fds) {
-            this->getScheduler()->add(events, fd, h);
-        }
-    }
-
-    std::vector<int> await_resume() {
-        for (const auto &[fd, _]: fds) {
-            this->getScheduler()->remove(fd, handle);
-        }
-        std::vector<int> ready;
-        for (const auto &[fd, _]: fds) {
-            pollfd pollFD{fd, POLLIN, 0};
-            if (poll(&pollFD, 1, 0) == 1 && pollFD.revents & POLLIN) {
-                ready.push_back(fd);
-            }
-        }
-        return ready;
-    }
-
-private:
-    std::vector<FdInfo> fds;
-    std::coroutine_handle<> handle;
-};
-
-[[nodiscard]] static CoroTask<> forwardData(const std::shared_ptr<ClientContextCoro> clientCtx,
-                                            const BackendSocketPtr backendSocket,
-                                            CancellationTokenSource cts,
-                                            const std::shared_ptr<ProxyStats> &proxyStats) {
+[[nodiscard]] CoroTask<> forwardData(const std::shared_ptr<ClientContextCoro> clientCtx,
+                                     const BackendSocketPtr backendSocket,
+                                     CancellationTokenSource cts,
+                                     const std::shared_ptr<ProxyStats> &proxyStats) {
     const auto state = std::make_shared<DataForwardContext>(clientCtx, backendSocket, proxyStats);
 
     auto *scheduler = co_await GetScheduler{};
@@ -611,10 +574,10 @@ private:
     }
 }
 
-[[nodiscard]] static CoroTask<> handleClient(const BackendFactory backendFactory,
-                                             Endpoint endpoint,
-                                             SocketPtr socket,
-                                             const std::shared_ptr<ProxyStats> &proxyStats) {
+[[nodiscard]] CoroTask<> handleClient(const BackendFactory backendFactory,
+                                      Endpoint endpoint,
+                                      SocketPtr socket,
+                                      const std::shared_ptr<ProxyStats> &proxyStats) {
     const auto client = std::make_shared<ClientContextCoro>(endpoint, socket);
     try {
         co_await handleSocks5Handshake(client);
@@ -668,6 +631,8 @@ private:
         }
     }
 }
+
+} // namespace
 
 SSHProxy::SSHProxy(CancellationTokenSource &cts_) :
     cts(cts_) {
