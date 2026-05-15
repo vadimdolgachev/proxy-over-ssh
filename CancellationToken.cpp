@@ -4,8 +4,10 @@
 
 #include "CancellationToken.h"
 
+#include "Logger.h"
+
 bool CancellationToken::isStopped() const noexcept {
-    return state->stopped.load(std::memory_order_relaxed);
+    return state->stopped.load();
 }
 
 int CancellationToken::getFd() const noexcept {
@@ -29,6 +31,10 @@ CancellationToken CancellationTokenSource::getToken() const noexcept {
 }
 
 void CancellationTokenSource::requestStop() noexcept {
-    state->stopped.store(true, std::memory_order_relaxed);
-    state->signal.signal();
+    if (!state->stopped.exchange(true)) {
+        state->signal.signal();
+    }
+}
+bool CancellationTokenSource::isStopped() const noexcept {
+    return state->stopped.load();
 }

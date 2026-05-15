@@ -39,6 +39,8 @@ private:
 
 using CancellationTokenOpt = std::optional<CancellationToken>;
 
+class CancellationTokenException final : public std::exception {};
+
 class CancellationTokenSource final {
 public:
     CancellationTokenSource();
@@ -46,6 +48,8 @@ public:
     [[nodiscard]] CancellationToken getToken() const noexcept;
 
     void requestStop() noexcept;
+
+    [[nodiscard]] bool isStopped() const noexcept;
 
 private:
     std::shared_ptr<CancellationToken::State> state;

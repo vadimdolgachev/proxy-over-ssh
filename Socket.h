@@ -11,8 +11,6 @@
 #include <memory>
 #include <span>
 
-class SocketCancelException final : public std::exception {};
-
 struct AcceptedSocket;
 
 struct ListenSocketAwaiter final : SchedulerAware<EpollScheduler> {
@@ -48,6 +46,7 @@ private:
     mutable int peekErrno = 0;
     mutable bool peekEof = false;
     CancellationTokenOpt ct;
+    std::coroutine_handle<> handle;
 };
 
 struct WriteSocketAwaiter final : SchedulerAware<EpollScheduler> {
