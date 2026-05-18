@@ -431,23 +431,27 @@ uint32_t SshSocketAwaiterBase::computePollEvents(const uint32_t defaultEvents) c
 }
 
 void SshSocketAwaiterBase::onSuspend(const std::coroutine_handle<> h, const uint32_t defaultEvents) {
-    assert(this->getScheduler() != nullptr);
+    assert(getScheduler() != nullptr);
     handle = h;
     uint32_t events = computePollEvents(defaultEvents);
     events |= EpollScheduler::PollErr | EpollScheduler::PollHUp;
-    this->getScheduler()->add(events, socket->fd(), h);
+    getScheduler()->add(events, socket->fd(), h);
     if (cancellationToken) {
-        this->getScheduler()->add(EpollScheduler::PollIn, cancellationToken->getFd(), h);
+        getScheduler()->add(EpollScheduler::PollIn, cancellationToken->getFd(), h);
+        if (cancellationToken->isStopped()) {
+            getScheduler()->forceRemoveFd(socket->fd());
+            throw CancellationTokenException();
+        }
     }
 }
 
 void SshSocketAwaiterBase::onResume() {
     if (cancellationToken && handle) {
-        this->getScheduler()->remove(cancellationToken->getFd(), handle);
+        getScheduler()->remove(cancellationToken->getFd(), handle);
     }
     if (cancellationToken && cancellationToken->isStopped()) {
         cancellationToken->drain();
-        this->getScheduler()->remove(socket->fd(), handle);
+        getScheduler()->forceRemoveFd(socket->fd());
         throw CancellationTokenException();
     }
 }

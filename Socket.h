@@ -36,11 +36,11 @@ struct ReadSocketAwaiter final : SchedulerAware<EpollScheduler> {
                       std::span<unsigned char> buffer_,
                       CancellationTokenOpt cancellationToken_);
 
-    [[nodiscard]] bool await_ready() const noexcept;
+    bool await_ready() const noexcept;
 
     void await_suspend(std::coroutine_handle<> h);
 
-    [[nodiscard]] size_t await_resume();
+    size_t await_resume();
 
 private:
     SocketPtr socket;
@@ -56,11 +56,11 @@ struct WriteSocketAwaiter final : SchedulerAware<EpollScheduler> {
                        std::span<unsigned char> buffer_,
                        CancellationTokenOpt cancellationToken_);
 
-    [[nodiscard]] bool await_ready() const noexcept;
+    bool await_ready() const noexcept;
 
     void await_suspend(std::coroutine_handle<> h);
 
-    [[nodiscard]] size_t await_resume();
+    size_t await_resume();
 
 private:
     SocketPtr socket;
@@ -77,7 +77,7 @@ struct ConnectSocketAwaiter final : SchedulerAware<EpollScheduler> {
                          Endpoint endpoint_,
                          CancellationTokenOpt cancellationToken_);
 
-    [[nodiscard]] bool await_ready() const noexcept;
+    bool await_ready() const noexcept;
 
     void await_suspend(std::coroutine_handle<> h);
 
