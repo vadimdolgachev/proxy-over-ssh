@@ -17,6 +17,7 @@ CPMAddPackage(
 
 set(OPENSSL_ROOT_DIR ${openssl-cmake_BINARY_DIR})
 set(OPENSSL_INCLUDE_DIR ${openssl-cmake_BINARY_DIR}/include)
+
 if (ANDROID)
     set(OPENSSL_SSL_LIBRARY ${openssl-cmake_BINARY_DIR}/ssl/libssl_1_1.a)
     set(OPENSSL_CRYPTO_LIBRARY ${openssl-cmake_BINARY_DIR}/crypto/libcrypto_1_1.a)
@@ -81,15 +82,18 @@ target_link_libraries(proxy_over_ssh PRIVATE
 )
 target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion -Wsign-conversion -Wnull-dereference -Wno-unused-variable -Wno-unused-parameter -Wno-unused-private-field -Werror=uninitialized -Wno-unused-function -fno-omit-frame-pointer)
 
-if (CMAKE_BUILD_TYPE STREQUAL "DebugAddrSan")
-    target_link_options(proxy_over_ssh PRIVATE -g -Og -fsanitize=address)
-    target_compile_options(proxy_over_ssh PRIVATE -fsanitize=address)
-elseif (CMAKE_BUILD_TYPE STREQUAL "DebugThrSan")
-    # Reduce ASLR Entropy:
-    # sudo sysctl vm.mmap_rnd_bits=30
-    target_compile_options(proxy_over_ssh PRIVATE -g -Og -fsanitize=thread)
-    target_link_options(proxy_over_ssh PRIVATE -fsanitize=thread)
-endif ()
+#sudo sysctl vm.mmap_rnd_bits=30
+
+target_compile_options(proxy_over_ssh PRIVATE
+        $<$<STREQUAL:${SANITIZER},address>:-fsanitize=address>
+        $<$<STREQUAL:${SANITIZER},thread>:-fsanitize=thread>
+        $<$<OR:$<STREQUAL:${SANITIZER},address>,$<STREQUAL:${SANITIZER},thread>>:-O1>
+)
+
+target_link_options(proxy_over_ssh PRIVATE
+        $<$<STREQUAL:${SANITIZER},address>:-fsanitize=address>
+        $<$<STREQUAL:${SANITIZER},thread>:-fsanitize=thread>
+)
 
 if (ANDROID)
     message("ANDROID_ABI=${ANDROID_ABI}")
