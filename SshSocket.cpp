@@ -366,16 +366,12 @@ CoroTask<size_t> SshSocket::writeAsync(const std::span<const uint8_t> data, Canc
             continue;
         }
 
-        if (n < 0) {
-            int sockErr = 0;
-            socklen_t sockErrLen = sizeof(sockErr);
-            getsockopt(fd(), SOL_SOCKET, SO_ERROR, &sockErr, &sockErrLen);
-            throw std::runtime_error("SSH channel write error: " + std::to_string(n)
-                                     + ", socket: " + std::to_string(sockErr)
-                                     + " (" + std::strerror(sockErr) + ")");
-        }
-
-        co_return 0;
+        int sockErr = 0;
+        socklen_t sockErrLen = sizeof(sockErr);
+        getsockopt(fd(), SOL_SOCKET, SO_ERROR, &sockErr, &sockErrLen);
+        throw std::runtime_error("SSH channel write error: " + std::to_string(n)
+                                 + ", socket: " + std::to_string(sockErr)
+                                 + " (" + std::strerror(sockErr) + ")");
     }
 }
 
@@ -451,6 +447,7 @@ void SshSocketAwaiterBase::onResume() {
     }
     if (cancellationToken && cancellationToken->isStopped()) {
         cancellationToken->drain();
+        this->getScheduler()->remove(socket->fd(), handle);
         throw CancellationTokenException();
     }
 }

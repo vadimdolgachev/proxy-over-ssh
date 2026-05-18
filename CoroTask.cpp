@@ -67,7 +67,7 @@ EpollScheduler::EpollScheduler(const CancellationTokenSource &cts_) :
     pendingResumes.reserve(16);
 }
 
-void EpollScheduler::add(const uint32_t events, int fd, std::coroutine_handle<> coro) {
+void EpollScheduler::add(const uint32_t events, int fd, const std::coroutine_handle<> coro) {
     std::lock_guard lock(schedulerMutex);
 
     auto it = fdStates.find(fd);
@@ -94,6 +94,7 @@ void EpollScheduler::add(const uint32_t events, int fd, std::coroutine_handle<> 
 
     wakeupSignal.signal();
 }
+
 void EpollScheduler::remove(const int fd, const std::coroutine_handle<> coro) {
     std::lock_guard lock(schedulerMutex);
 

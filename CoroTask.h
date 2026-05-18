@@ -20,10 +20,8 @@
 #include "CancellationToken.h"
 #include "CompletionSignal.h"
 #include "FdUtils.h"
+#include "Logger.h"
 #include "Timer.h"
-
-class Endpoint;
-class Socket;
 
 class EpollScheduler final {
     struct CoroEntry final {
@@ -112,8 +110,9 @@ private:
 };
 
 struct TimerAwaiter final : SchedulerAware<EpollScheduler> {
-    explicit TimerAwaiter(const std::chrono::nanoseconds delay_) :
-        delay(delay_) {
+    explicit TimerAwaiter(const std::chrono::nanoseconds delay_, CancellationTokenOpt ct) :
+        delay(delay_),
+        cancellationToken(std::move(ct)) {
     }
 
     [[nodiscard]] bool await_ready() const noexcept {
@@ -121,43 +120,49 @@ struct TimerAwaiter final : SchedulerAware<EpollScheduler> {
     }
 
     void await_suspend(const std::coroutine_handle<> h) {
-        coroHandle = h;
+        handle = h;
+        if (cancellationToken) {
+            this->getScheduler()->add(EpollScheduler::PollIn, cancellationToken.value().getFd(), h);
+        }
         timer.arm(delay);
         this->getScheduler()->add(EpollScheduler::PollIn, timer.getFd(), h);
     }
 
-    void await_resume() noexcept {
+    void await_resume() {
+        if (cancellationToken) {
+            if (handle) {
+                this->getScheduler()->remove(cancellationToken.value().getFd(), handle);
+            }
+            if (cancellationToken.value().isStopped()) {
+                cancellationToken->drain();
+                throw CancellationTokenException{};
+            }
+        }
         timer.drain();
-        this->getScheduler()->remove(timer.getFd(), coroHandle);
+        this->getScheduler()->remove(timer.getFd(), handle);
     }
 
 private:
     std::chrono::nanoseconds delay;
     Timer timer;
-    std::coroutine_handle<> coroHandle;
+    CancellationTokenOpt cancellationToken;
+    std::coroutine_handle<> handle;
 };
 
 template<typename Base>
 struct PromiseBase : SchedulerAware<EpollScheduler> {
     std::suspend_always initial_suspend() {
-        return {};
+        return{};
     }
 
-    auto final_suspend() noexcept {
-        struct Awaiter final {
-            bool await_ready() noexcept {
-                return false;
-            }
-
+    auto final_suspend() const noexcept {
+        struct Awaiter final : std::suspend_always {
             void await_suspend(std::coroutine_handle<Base> h) noexcept {
                 if (auto cont = std::exchange(h.promise().continuation, nullptr)) {
                     cont.resume();
                 } else if (h.promise().detached) {
                     h.destroy();
                 }
-            }
-
-            void await_resume() noexcept {
             }
         };
         return Awaiter{};
@@ -176,10 +181,9 @@ struct PromiseBase : SchedulerAware<EpollScheduler> {
     }
 
     std::exception_ptr exception;
-    std::coroutine_handle<> continuation = nullptr;
+    std::coroutine_handle<> continuation;
     bool detached = false;
 };
-
 
 template<typename Base>
 struct PromiseVoid : PromiseBase<Base> {
@@ -223,44 +227,6 @@ struct GetCancellationToken : SchedulerAware<EpollScheduler> {
     }
 };
 
-template<typename Promise>
-struct CoroTaskAwaiterBase {
-    bool await_ready() noexcept {
-        return handle == nullptr || handle.done();
-    }
-
-    void await_suspend(const std::coroutine_handle<> parent) noexcept {
-        handle.promise().continuation = parent;
-        handle.resume();
-    }
-
-    std::coroutine_handle<Promise> handle;
-};
-
-template<typename Promise, typename Resume>
-struct CoroTaskAwaiter final : CoroTaskAwaiterBase<Promise> {
-    using CoroTaskAwaiterBase<Promise>::handle;
-
-    Resume await_resume() {
-        auto &promise = handle.promise();
-        if (promise.exception) {
-            std::rethrow_exception(promise.exception);
-        }
-        return std::move(*promise.value);
-    }
-};
-
-template<typename Promise>
-struct CoroTaskAwaiterVoid final : CoroTaskAwaiterBase<Promise> {
-    using CoroTaskAwaiterBase<Promise>::handle;
-
-    void await_resume() {
-        if (handle.promise().exception) {
-            std::rethrow_exception(handle.promise().exception);
-        }
-    }
-};
-
 template<typename T = void>
 class CoroTask final {
 public:
@@ -273,8 +239,28 @@ public:
         }
     };
 
-    using Awaiter =
-            std::conditional_t<std::is_void_v<T>, CoroTaskAwaiterVoid<promise_type>, CoroTaskAwaiter<promise_type, T>>;
+    struct CoroTaskAwaiter final {
+        auto await_resume() {
+            auto &promise = handle.promise();
+            if (promise.exception) {
+                std::rethrow_exception(promise.exception);
+            }
+            if constexpr (!std::is_void_v<T>) {
+                return std::move(*promise.value);
+            }
+        }
+
+        bool await_ready() noexcept {
+            return handle == nullptr || handle.done();
+        }
+
+        void await_suspend(const std::coroutine_handle<> parent) {
+            handle.promise().continuation = parent;
+            handle.resume();
+        }
+
+        std::coroutine_handle<promise_type> handle;
+    };
 
     explicit CoroTask(const std::coroutine_handle<promise_type> h) :
         handle(h) {
@@ -295,11 +281,7 @@ public:
     }
 
     void start(EpollScheduler &scheduler) {
-        if (handle == nullptr || handle.done()) {
-            return;
-        }
-        handle.promise().setScheduler(&scheduler);
-        handle.resume();
+        startCoro(scheduler);
         if (handle.done()) {
             if (const auto exception = std::move(handle.promise().exception)) {
                 std::rethrow_exception(exception);
@@ -307,18 +289,14 @@ public:
         }
     }
 
-    void detach(EpollScheduler &scheduler) {
-        if (handle == nullptr || handle.done()) {
-            return;
-        }
-        handle.promise().setScheduler(&scheduler);
+    void startDetached(EpollScheduler &scheduler) {
         handle.promise().detached = true;
         detached = true;
-        handle.resume();
+        startCoro(scheduler);
     }
 
     auto operator co_await() const noexcept {
-        return Awaiter{handle};
+        return CoroTaskAwaiter{handle};
     }
 
     void setScheduler(EpollScheduler *s) noexcept {
@@ -326,6 +304,14 @@ public:
     }
 
 private:
+    void startCoro(EpollScheduler &scheduler) {
+        if (handle == nullptr || handle.done()) {
+            return;
+        }
+        handle.promise().setScheduler(&scheduler);
+        handle.resume();
+    }
+
     std::coroutine_handle<promise_type> handle;
     bool detached = false;
 };

@@ -15,6 +15,8 @@ namespace Constants {
     constexpr int SSH_KEEPALIVE_INTERVAL_SEC = 30;
 
     constexpr size_t THREAD_POOL_SIZE = 4;
+
+    constexpr auto PRINT_STATS_INTERVAL = std::chrono::seconds(1);
 } // namespace Constants
 
 #endif // PROXY_OVER_SSH_CONSTANTS_H
