@@ -30,6 +30,8 @@ struct ProxyConfig final {
 struct ProxyStats final {
     std::atomic_uint64_t activeConnections = 0;
     std::atomic_uint64_t totalConnections = 0;
+    std::atomic_uint64_t totalInBytes = 0;
+    std::atomic_uint64_t totalOutBytes = 0;
 };
 
 using StartCallback = std::function<void()>;

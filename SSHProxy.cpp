@@ -466,28 +466,33 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
                 break;
             }
 
-            const size_t n = co_await read(buffer.span());
-            if (n == 0) {
+            const size_t readBytes = co_await read(buffer.span());
+            if (readBytes == 0) {
                 break;
             }
 
             state->idleTimer.arm();
 
-            size_t written = 0;
-            while (written < n) {
+            size_t writtenBytes = 0;
+            while (writtenBytes < readBytes) {
                 if (destDoneFlag.load() || destIsEof()) {
                     break;
                 }
-                const size_t chunk = co_await write(buffer.subspan(written, n - written));
+                const size_t chunk = co_await write(buffer.subspan(writtenBytes, readBytes - writtenBytes));
                 if (chunk == 0) {
                     break;
                 }
-                written += chunk;
+                writtenBytes += chunk;
                 state->idleTimer.arm();
+            }
+            if (isClientDirection) {
+                state->proxyStats->totalOutBytes.fetch_add(writtenBytes, std::memory_order_relaxed);
+            } else {
+                state->proxyStats->totalInBytes.fetch_add(readBytes, std::memory_order_relaxed);
             }
         }
     } catch (const CancellationTokenException &e) {
-        log_d("{}->{} data forwarding canceled\n", isClientDirection ? "C" : "B", isClientDirection ? "B" : "C");
+        // log_d("{}->{} data forwarding canceled\n", isClientDirection ? "C" : "B", isClientDirection ? "B" : "C");
     } catch (const std::exception &e) {
         log_e("{}->{} exception: {}\n", isClientDirection ? "C" : "B", isClientDirection ? "B" : "C", e.what());
     } catch (...) {
@@ -608,7 +613,11 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
 CoroTask<> printProxyStats(const std::shared_ptr<const ProxyStats> stats,
                            const std::atomic_bool &isStopRequested) {
     while (!isStopRequested) {
-        log_d("AC:{}, TC:{}\n", stats->activeConnections.load(), stats->totalConnections.load());
+        log_d("AC:{}, TC:{}, IN:{:.1f}, OUT:{:.1f}\n",
+            stats->activeConnections.load(std::memory_order_relaxed),
+            stats->totalConnections.load(std::memory_order_relaxed),
+            static_cast<double>(stats->totalInBytes.load(std::memory_order_relaxed)) / 1024. / 1024.,
+            static_cast<double>(stats->totalOutBytes.load(std::memory_order_relaxed)) / 1024. / 1024.);
         try {
             co_await TimerAwaiter{Constants::PRINT_STATS_INTERVAL, co_await GetCancellationToken{}};
         } catch (const CancellationTokenException &) {
