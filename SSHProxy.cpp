@@ -492,7 +492,7 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
             }
         }
     } catch (const CancellationTokenException &e) {
-        // log_d("{}->{} data forwarding canceled\n", isClientDirection ? "C" : "B", isClientDirection ? "B" : "C");
+        log_d("{}->{} data forwarding canceled\n", isClientDirection ? "C" : "B", isClientDirection ? "B" : "C");
     } catch (const std::exception &e) {
         log_e("{}->{} exception: {}\n", isClientDirection ? "C" : "B", isClientDirection ? "B" : "C", e.what());
     } catch (...) {

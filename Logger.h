@@ -43,7 +43,10 @@ void log_e(std::format_string<Args...> fmt, Args &&... args) {
 
 template<typename... Args>
 void log_d(std::format_string<Args...> fmt, Args &&... args) {
-    std::osyncstream(std::cout) << std::format("[{}] {}", threadId(), std::format(fmt, std::forward<Args>(args)...));
+    std::osyncstream(std::cout) << std::format("{} [{}] {}",
+        floor<std::chrono::seconds>(std::chrono::system_clock::now()),
+        threadId(),
+        std::format(fmt, std::forward<Args>(args)...));
 }
 
 template<typename... Args>
@@ -55,7 +58,10 @@ void log_v(std::format_string<Args...> fmt, Args &&... args) {
 
 template<typename... Args>
 void log_e(std::format_string<Args...> fmt, Args &&... args) {
-    std::osyncstream(std::cout) << std::format("[{}] {}", threadId(), std::format(fmt, std::forward<Args>(args)...));
+    std::osyncstream(std::cout) << std::format("{} [{}] {}",
+        floor<std::chrono::seconds>(std::chrono::system_clock::now()),
+        threadId(),
+        std::format(fmt, std::forward<Args>(args)...));
 }
 
 #endif
