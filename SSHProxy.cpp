@@ -394,6 +394,7 @@ struct DataForwardContext final {
     EpollScheduler *scheduler = nullptr;
     std::optional<CancellationTokenSource> cts;
     std::shared_ptr<ProxyStats> proxyStats;
+    std::uint64_t id = 0;
 
     DataForwardContext(std::shared_ptr<ClientContextCoro> client_,
                        BackendSocketPtr backend_,
@@ -403,7 +404,7 @@ struct DataForwardContext final {
         proxyStats(std::move(proxyStats_)) {
         idleTimer.arm();
         proxyStats->totalConnections.fetch_add(1);
-        proxyStats->activeConnections.fetch_add(1);
+        id = proxyStats->activeConnections.fetch_add(1);
     }
 
     DataForwardContext(const DataForwardContext &) = delete;
@@ -416,9 +417,12 @@ struct DataForwardContext final {
     void onDirectionDone(const bool isClientDirection) {
         auto &self = isClientDirection ? clientReadDone : backendReadDone;
         self.store(true);
-        cts->requestStop();
         if (clientReadDone && backendReadDone) {
+            log_d("{}: onDirectionDone completionSignal signal\n", toString());
             completionSignal->signal();
+        } else {
+            log_d("{}: onDirectionDone requestStop\n", toString());
+            cts->requestStop();
         }
     }
 
@@ -442,6 +446,10 @@ struct DataForwardContext final {
         if (client != nullptr) {
             client->closeSocket();
         }
+    }
+
+    [[nodiscard]] std::string toString() const {
+        return std::format("{}:{}", id, client->targetEndpoint.host());
     }
 };
 
@@ -492,9 +500,9 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
             }
         }
     } catch (const CancellationTokenException &e) {
-        log_d("{}->{} data forwarding canceled\n", isClientDirection ? "C" : "B", isClientDirection ? "B" : "C");
+        log_d("{}: {}->{} data forwarding canceled\n", state->toString(), isClientDirection ? "C" : "B", isClientDirection ? "B" : "C");
     } catch (const std::exception &e) {
-        log_e("{}->{} exception: {}\n", isClientDirection ? "C" : "B", isClientDirection ? "B" : "C", e.what());
+        log_e("{}: {}->{} exception: {}\n", state->toString(), isClientDirection ? "C" : "B", isClientDirection ? "B" : "C", e.what());
     } catch (...) {
     }
 
@@ -579,6 +587,7 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
             }
         }
     }
+    log_d("{}: forwardData finished\n", state->toString());
     state->closeAll();
 }
 
