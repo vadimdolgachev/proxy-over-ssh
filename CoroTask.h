@@ -39,13 +39,14 @@ class EpollScheduler final {
         std::condition_variable_any cv;
         std::vector<std::coroutine_handle<>> queue;
         std::vector<std::jthread> workers;
+        bool stopping = false;
 
     public:
         void enqueue(std::coroutine_handle<> h);
 
         void worker(const std::stop_token &st);
 
-        void stopAndWait();
+        void drainAndStop();
 
         ThreadPool(EpollScheduler &scheduler_, size_t numThreads);
     };
@@ -90,6 +91,10 @@ private:
     static uint32_t calculateRemainingEvents(const std::vector<CoroEntry> &coros);
 
     void applyEpollRegistration(int fd, const std::vector<CoroEntry> &coros) const;
+
+    void collectReadyCoroutines(FdStates::iterator fdIt, uint32_t occurredEvents);
+
+    void enqueuePendingResumes();
 
     void shutdown() noexcept;
 

@@ -8,42 +8,48 @@
 void EpollScheduler::ThreadPool::enqueue(const std::coroutine_handle<> h) {
     {
         std::lock_guard lock(queueMutex);
+        if (stopping) {
+            throw std::logic_error("Cannot enqueue coroutine while thread pool is stopping");
+        }
         queue.push_back(h);
     }
     cv.notify_one();
 }
 
 void EpollScheduler::ThreadPool::worker(const std::stop_token &st) {
-    while (!st.stop_requested()) {
+    while (true) {
         std::coroutine_handle<> h;
         {
             std::unique_lock lock(queueMutex);
-            if (!cv.wait(lock, st, [&] { return !queue.empty(); })) {
+            if (!cv.wait(lock, st, [&] { return stopping || !queue.empty(); })) {
+                return;
+            }
+            if (queue.empty()) {
                 return;
             }
             h = queue.back();
             queue.pop_back();
         }
+        const auto address = h.address();
         if (!h.done()) {
             h.resume();
         }
-        scheduler.onResumeFinished(h.address());
+        scheduler.onResumeFinished(address);
     }
 }
 
-void EpollScheduler::ThreadPool::stopAndWait() {
-    for (auto &worker: workers) {
-        worker.request_stop();
+void EpollScheduler::ThreadPool::drainAndStop() {
+    {
+        std::lock_guard lock(queueMutex);
+        stopping = true;
     }
+    cv.notify_all();
     for (auto &worker: workers) {
         if (worker.joinable()) {
             worker.join();
         }
     }
-    {
-        std::lock_guard lock(queueMutex);
-        queue.clear();
-    }
+    assert(queue.empty());
     log_v("ThreadPool: finished\n");
 }
 
@@ -181,52 +187,22 @@ void EpollScheduler::run() {
                         continue;
                     }
 
-                    const auto &coros = fdIt->second.coros;
-                    std::vector<CoroEntry> nextCoros;
-                    std::vector<std::coroutine_handle<>> readyCoros;
-                    nextCoros.reserve(coros.size());
-                    readyCoros.reserve(coros.size());
-
-                    try {
-                        for (const auto &entry: coros) {
-                            if (entry.events & occurredEvents) {
-                                if (const auto [_, inserted] = scheduledCoros.insert(entry.handle.address());
-                                    inserted) {
-                                    readyCoros.push_back(entry.handle);
-                                    continue;
-                                }
-                            }
-                            nextCoros.push_back(entry);
-                        }
-
-                        pendingResumes.reserve(pendingResumes.size() + readyCoros.size());
-                        applyEpollRegistration(eventFd, nextCoros);
-                    } catch (...) {
-                        for (const auto rc: readyCoros) {
-                            scheduledCoros.erase(rc.address());
-                        }
-                        throw;
-                    }
-
-                    pendingResumes.insert(pendingResumes.end(), readyCoros.begin(), readyCoros.end());
-                    if (nextCoros.empty()) {
-                        fdStates.erase(fdIt);
-                    } else {
-                        fdIt->second.coros.swap(nextCoros);
-                    }
+                    collectReadyCoroutines(fdIt, occurredEvents);
                 }
             }
-            if (pendingResumes.empty()) {
-                continue;
-            }
-            std::ranges::sort(pendingResumes);
-            pendingResumes.erase(std::ranges::unique(pendingResumes).begin(), pendingResumes.end());
-
-            for (const auto h: pendingResumes) {
-                threadPool->enqueue(h);
-            }
+            enqueuePendingResumes();
         }
     }
+
+    pendingResumes.clear();
+    {
+        std::lock_guard lock(schedulerMutex);
+        if (const auto cancellationIt = fdStates.find(cancellationToken.getFd());
+            cancellationIt != fdStates.end()) {
+            collectReadyCoroutines(cancellationIt, PollIn);
+        }
+    }
+    enqueuePendingResumes();
 
     shutdown();
 }
@@ -236,7 +212,7 @@ void EpollScheduler::shutdown() noexcept {
         return;
     }
 
-    threadPool->stopAndWait();
+    threadPool->drainAndStop();
 
     {
         std::lock_guard lock(schedulerMutex);
@@ -255,6 +231,53 @@ void EpollScheduler::shutdown() noexcept {
         if (coro != nullptr) {
             coro.destroy();
         }
+    }
+}
+
+void EpollScheduler::collectReadyCoroutines(const FdStates::iterator fdIt, const uint32_t occurredEvents) {
+    const int fd = fdIt->first;
+    const auto &coros = fdIt->second.coros;
+    std::vector<CoroEntry> nextCoros;
+    std::vector<std::coroutine_handle<>> readyCoros;
+    nextCoros.reserve(coros.size());
+    readyCoros.reserve(coros.size());
+
+    try {
+        for (const auto &entry: coros) {
+            if (entry.events & occurredEvents) {
+                if (const auto [_, inserted] = scheduledCoros.insert(entry.handle.address()); inserted) {
+                    readyCoros.push_back(entry.handle);
+                    continue;
+                }
+            }
+            nextCoros.push_back(entry);
+        }
+
+        pendingResumes.reserve(pendingResumes.size() + readyCoros.size());
+        applyEpollRegistration(fd, nextCoros);
+    } catch (...) {
+        for (const auto coro: readyCoros) {
+            scheduledCoros.erase(coro.address());
+        }
+        throw;
+    }
+
+    pendingResumes.insert(pendingResumes.end(), readyCoros.begin(), readyCoros.end());
+    if (nextCoros.empty()) {
+        fdStates.erase(fdIt);
+    } else {
+        fdIt->second.coros.swap(nextCoros);
+    }
+}
+
+void EpollScheduler::enqueuePendingResumes() {
+    if (pendingResumes.empty()) {
+        return;
+    }
+    std::ranges::sort(pendingResumes);
+    pendingResumes.erase(std::ranges::unique(pendingResumes).begin(), pendingResumes.end());
+    for (const auto coro: pendingResumes) {
+        threadPool->enqueue(coro);
     }
 }
 
