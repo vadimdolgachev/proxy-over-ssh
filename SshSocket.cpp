@@ -435,14 +435,14 @@ void SshSocketAwaiterBase::onSuspend(const std::coroutine_handle<> h, const uint
     handle = h;
     uint32_t events = computePollEvents(defaultEvents);
     events |= EpollScheduler::PollErr | EpollScheduler::PollHUp;
-    getScheduler()->add(events, socket->fd(), h);
     if (cancellationToken) {
-        getScheduler()->add(EpollScheduler::PollIn, cancellationToken->getFd(), h);
         if (cancellationToken->isStopped()) {
-            getScheduler()->forceRemoveFd(socket->fd());
+            getScheduler()->remove(socket->fd(), handle);
             throw CancellationTokenException();
         }
+        getScheduler()->add(EpollScheduler::PollIn, cancellationToken->getFd(), h);
     }
+    getScheduler()->add(events, socket->fd(), h);
 }
 
 void SshSocketAwaiterBase::onResume() {
@@ -451,7 +451,7 @@ void SshSocketAwaiterBase::onResume() {
     }
     if (cancellationToken && cancellationToken->isStopped()) {
         cancellationToken->drain();
-        getScheduler()->forceRemoveFd(socket->fd());
+        getScheduler()->remove(socket->fd(), handle);
         throw CancellationTokenException();
     }
 }

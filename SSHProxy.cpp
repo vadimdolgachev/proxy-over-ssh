@@ -197,7 +197,7 @@ struct Socks5Negotiation final {
     }
 }
 
-[[nodiscard]] CoroTask<size_t> writeAll(const SocketPtr &socket, std::span<const uint8_t> data, CancellationTokenOpt ct) {
+[[nodiscard]] CoroTask<size_t> writeAll(SocketPtr socket, std::span<const uint8_t> data, CancellationTokenOpt ct) {
     size_t offset = 0;
     while (offset < data.size()) {
         const size_t written =
@@ -392,16 +392,18 @@ struct DataForwardContext final {
     std::shared_ptr<CompletionSignal> completionSignal = std::make_shared<CompletionSignal>();
     IdleTimer idleTimer{std::chrono::seconds(Constants::IDLE_TIMEOUT_SEC)};
     EpollScheduler *scheduler = nullptr;
-    std::optional<CancellationTokenSource> cts;
     std::shared_ptr<ProxyStats> proxyStats;
+    CancellationTokenSource cts;
     std::uint64_t id = 0;
 
     DataForwardContext(std::shared_ptr<ClientContextCoro> client_,
                        BackendSocketPtr backend_,
-                       std::shared_ptr<ProxyStats> proxyStats_) :
+                       std::shared_ptr<ProxyStats> proxyStats_,
+                       CancellationTokenSource cts_) :
         client(std::move(client_)),
         backend(std::move(backend_)),
-        proxyStats(std::move(proxyStats_)) {
+        proxyStats(std::move(proxyStats_)),
+        cts(std::move(cts_)) {
         idleTimer.arm();
         proxyStats->totalConnections.fetch_add(1);
         id = proxyStats->activeConnections.fetch_add(1);
@@ -418,11 +420,9 @@ struct DataForwardContext final {
         auto &self = isClientDirection ? clientReadDone : backendReadDone;
         self.store(true);
         if (clientReadDone && backendReadDone) {
-            log_d("{}: onDirectionDone completionSignal signal\n", toString());
             completionSignal->signal();
         } else {
-            log_d("{}: onDirectionDone requestStop\n", toString());
-            cts->requestStop();
+            cts.requestStop();
         }
     }
 
@@ -510,13 +510,13 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
 }
 
 [[nodiscard]] CoroTask<> forwardClientToBackend(const std::shared_ptr<DataForwardContext> state) {
-    co_await forwardDirection(
+    return forwardDirection(
             state,
             [state](const std::span<uint8_t> buf) -> CoroTask<size_t> {
-                co_return co_await state->client->socket->read(buf, state->cts->getToken());
+                co_return co_await state->client->socket->read(buf, state->cts.getToken());
             },
             [state](const std::span<const uint8_t> buf) -> CoroTask<size_t> {
-                co_return co_await state->backend->writeAsync(buf, state->cts->getToken());
+                co_return co_await state->backend->writeAsync(buf, state->cts.getToken());
             },
             [state]() -> bool {
                 return state->client->socket->isEof();
@@ -530,13 +530,13 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
 }
 
 [[nodiscard]] CoroTask<> forwardBackendToClient(const std::shared_ptr<DataForwardContext> state) {
-    co_await forwardDirection(
+    return forwardDirection(
             state,
             [state] (const std::span<uint8_t> buf) mutable -> CoroTask<size_t> {
-                co_return co_await state->backend->readAsync(buf, state->cts->getToken());
+                co_return co_await state->backend->readAsync(buf, state->cts.getToken());
             },
             [state](const std::span<const uint8_t> buf) -> CoroTask<size_t> {
-                co_return co_await writeAll(state->client->socket, buf, state->cts->getToken());
+                co_return co_await writeAll(state->client->socket, buf, state->cts.getToken());
             },
             [state]() -> bool {
                 return state->backend->isEof();
@@ -553,17 +553,16 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
                                      const BackendSocketPtr backendSocket,
                                      CancellationTokenSource cts,
                                      const std::shared_ptr<ProxyStats> &proxyStats) {
-    const auto state = std::make_shared<DataForwardContext>(clientCtx, backendSocket, proxyStats);
+    const auto state = std::make_shared<DataForwardContext>(clientCtx, backendSocket, proxyStats, std::move(cts));
 
     auto *scheduler = co_await GetScheduler{};
     state->scheduler = scheduler;
-    state->cts = cts;
 
     auto clientToBackend = forwardClientToBackend(state);
     auto backendToClient = forwardBackendToClient(state);
 
-    clientToBackend.start(*scheduler);
-    backendToClient.start(*scheduler);
+    clientToBackend.startDetached(*scheduler);
+    backendToClient.startDetached(*scheduler);
 
     while (!(state->clientReadDone.load() && state->backendReadDone.load())) {
         const auto readyFds = co_await MultiFdAwaiter{
@@ -580,22 +579,18 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
             }
             if (fd == state->idleTimer.getFd()) {
                 state->idleTimer.drain();
-                if (state->cts) {
-                    state->cts->requestStop();
-                }
+                state->cts.requestStop();
                 break;
             }
         }
     }
-    log_d("{}: forwardData finished\n", state->toString());
+
     state->closeAll();
 }
 
 [[nodiscard]] CoroTask<> handleClient(const BackendFactory backendFactory,
-                                      Endpoint endpoint,
-                                      SocketPtr socket,
+                                      const std::shared_ptr<ClientContextCoro> client,
                                       const std::shared_ptr<ProxyStats> &proxyStats) {
-    const auto client = std::make_shared<ClientContextCoro>(endpoint, socket);
     try {
         co_await handleSocks5Handshake(client);
         co_await handleSocks5Request(client);
@@ -612,8 +607,6 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
 
         co_await sendSocks5Success(client, cts.getToken());
         co_await forwardData(client, backendSocket, std::move(cts), proxyStats);
-    } catch (const std::exception &) {
-        sendSocks5FailureSync(client);
     } catch (...) {
         sendSocks5FailureSync(client);
     }
@@ -654,7 +647,7 @@ CoroTask<> printProxyStats(const std::shared_ptr<const ProxyStats> stats,
         try {
             auto [socket, endpoint] = co_await serverSocket.listen(scheduler->getCancellationTokenSource().getToken());
             log_d("Server: new connection port: {}\n", endpoint.port());
-            auto handler = handleClient(config.backendFactory, endpoint, socket, proxyStats);
+            auto handler = handleClient(config.backendFactory, std::make_shared<ClientContextCoro>(endpoint, socket), proxyStats);
             handler.startDetached(*scheduler);
         } catch (const CancellationTokenException &) {
             isStopRequested.store(true);

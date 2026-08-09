@@ -27,6 +27,7 @@ void EpollScheduler::ThreadPool::worker(const std::stop_token &st) {
         if (!h.done()) {
             h.resume();
         }
+        scheduler.onResumeFinished(h.address());
     }
 }
 
@@ -39,10 +40,15 @@ void EpollScheduler::ThreadPool::stopAndWait() {
             worker.join();
         }
     }
+    {
+        std::lock_guard lock(queueMutex);
+        queue.clear();
+    }
     log_v("ThreadPool: finished\n");
 }
 
-EpollScheduler::ThreadPool::ThreadPool(const size_t numThreads) {
+EpollScheduler::ThreadPool::ThreadPool(EpollScheduler &scheduler_, const size_t numThreads) :
+    scheduler(scheduler_) {
     workers.reserve(numThreads);
     for (size_t i = 0; i < numThreads; ++i) {
         workers.emplace_back([this](const auto &st) { worker(st); });
@@ -63,11 +69,34 @@ EpollScheduler::EpollScheduler(const CancellationTokenSource &cts_) :
         throw std::runtime_error("Failed to register wakeup fd with epoll");
     }
 
-    threadPool = std::make_unique<ThreadPool>(Constants::THREAD_POOL_SIZE);
+    threadPool = std::make_unique<ThreadPool>(*this, Constants::THREAD_POOL_SIZE);
     pendingResumes.reserve(16);
 }
 
+EpollScheduler::~EpollScheduler() {
+    shutdown();
+}
+
+void EpollScheduler::registerDetached(const std::coroutine_handle<> coro) {
+    if (shutdownComplete.load()) {
+        throw std::system_error(errno, std::system_category(), "Scheduler has been shutdown");
+    }
+    std::lock_guard lock(detachedMutex);
+    detachedCoros.push_back(coro);
+}
+
+void EpollScheduler::unregisterDetached(const std::coroutine_handle<> coro) noexcept {
+    std::lock_guard lock(detachedMutex);
+    if (const auto it = std::ranges::find(detachedCoros, coro);
+        it != detachedCoros.end()) {
+        detachedCoros.erase(it);
+    }
+}
+
 void EpollScheduler::add(const uint32_t events, int fd, const std::coroutine_handle<> coro) {
+    if (shutdownComplete.load()) {
+        throw std::system_error(errno, std::system_category(), "Scheduler has been shutdown");
+    }
     std::lock_guard lock(schedulerMutex);
 
     auto it = fdStates.find(fd);
@@ -148,8 +177,11 @@ void EpollScheduler::run() {
                     auto &coros = fdIt->second.coros;
                     std::erase_if(coros, [&](const CoroEntry &e) {
                         if (e.events & occurredEvents) {
-                            pendingResumes.push_back(e.handle);
-                            return true;
+                            if (scheduledCoros.insert(e.handle.address()).second) {
+                                pendingResumes.push_back(e.handle);
+                                return true;
+                            }
+                            return false;
                         }
                         return false;
                     });
@@ -157,19 +189,52 @@ void EpollScheduler::run() {
                     updateEpollRegistration(fdIt);
                 }
             }
-
+            if (pendingResumes.empty()) {
+                continue;
+            }
             std::ranges::sort(pendingResumes);
             pendingResumes.erase(std::ranges::unique(pendingResumes).begin(), pendingResumes.end());
 
             for (const auto h: pendingResumes) {
-                if (!h.done()) {
-                    threadPool->enqueue(h);
-                }
+                threadPool->enqueue(h);
             }
         }
     }
 
+    shutdown();
+}
+
+void EpollScheduler::shutdown() noexcept {
+    if (shutdownComplete.exchange(true)) {
+        return;
+    }
+
     threadPool->stopAndWait();
+
+    {
+        std::lock_guard lock(schedulerMutex);
+        fdStates.clear();
+        pendingResumes.clear();
+        scheduledCoros.clear();
+    }
+
+    std::vector<std::coroutine_handle<>> suspended;
+    {
+        std::lock_guard lock(detachedMutex);
+        suspended = std::move(detachedCoros);
+        detachedCoros.clear();
+    }
+    for (const auto coro: suspended) {
+        if (coro != nullptr) {
+            coro.destroy();
+        }
+    }
+}
+
+void EpollScheduler::onResumeFinished(void *const address) {
+    std::lock_guard lock(schedulerMutex);
+    scheduledCoros.erase(address);
+    wakeupSignal.signal();
 }
 
 const CancellationTokenSource &EpollScheduler::getCancellationTokenSource() const {
@@ -191,12 +256,16 @@ void EpollScheduler::updateEpollRegistration(const FdStates::iterator it) {
     const uint32_t remaining = calculateRemainingEvents(state);
 
     if (state.coros.empty()) {
-        epoll_ctl(epollFd.get(), EPOLL_CTL_DEL, fd, nullptr);
+        if (epoll_ctl(epollFd.get(), EPOLL_CTL_DEL, fd, nullptr) < 0) {
+            throw std::system_error(errno, std::system_category(), "Epoll add/mod failed");
+        }
         fdStates.erase(it);
     } else {
         epoll_event ev{};
         ev.events = remaining;
         ev.data.fd = fd;
-        epoll_ctl(epollFd.get(), EPOLL_CTL_MOD, fd, &ev);
+        if (epoll_ctl(epollFd.get(), EPOLL_CTL_MOD, fd, &ev) < 0) {
+            throw std::system_error(errno, std::system_category(), "Epoll add/mod failed");
+        }
     }
 }

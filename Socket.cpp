@@ -100,6 +100,9 @@ bool ListenSocketAwaiter::await_ready() const noexcept {
 
 void ListenSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
     assert(getScheduler() != nullptr);
+    if (cancellationToken.isStopped()) {
+        return;
+    }
     handle = h;
     getScheduler()->add(EpollScheduler::PollIn, cancellationToken.getFd(), h);
     getScheduler()->add(EpollScheduler::PollIn, fd, h);
@@ -190,11 +193,11 @@ void ReadSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
     handle = h;
     assert(getScheduler() != nullptr);
     if (cancellationToken) {
-        getScheduler()->add(EpollScheduler::PollIn, cancellationToken.value().getFd(), h);
         if (cancellationToken->isStopped()) {
             getScheduler()->forceRemoveFd(socket->fd());
             throw CancellationTokenException{};
         }
+        getScheduler()->add(EpollScheduler::PollIn, cancellationToken.value().getFd(), h);
     }
     getScheduler()->add(EpollScheduler::PollIn, socket->fd(), h);
 }
@@ -273,11 +276,11 @@ void WriteSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
     handle = h;
     assert(getScheduler() != nullptr);
     if (cancellationToken) {
-        getScheduler()->add(EpollScheduler::PollIn, cancellationToken.value().getFd(), h);
         if (cancellationToken->isStopped()) {
             getScheduler()->forceRemoveFd(socket->fd());
             throw CancellationTokenException{};
         }
+        getScheduler()->add(EpollScheduler::PollIn, cancellationToken.value().getFd(), h);
     }
     getScheduler()->add(EpollScheduler::PollOut, socket->fd(), h);
 }
@@ -377,11 +380,11 @@ void ConnectSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
     handle = h;
     assert(getScheduler() != nullptr);
     if (cancellationToken) {
-        getScheduler()->add(EpollScheduler::PollIn, cancellationToken.value().getFd(), h);
         if (cancellationToken->isStopped()) {
             getScheduler()->forceRemoveFd(socket->fd());
             throw CancellationTokenException{};
         }
+        getScheduler()->add(EpollScheduler::PollIn, cancellationToken.value().getFd(), h);
     }
     getScheduler()->add(EpollScheduler::PollOut | EpollScheduler::PollErr, socket->fd(), h);
 }
