@@ -110,7 +110,7 @@ void EpollScheduler::add(const uint32_t events, int fd, const std::coroutine_han
     const int op = exists ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
 
     epoll_event ev{};
-    ev.events = exists ? calculateRemainingEvents(it->second) : events;
+    ev.events = exists ? calculateRemainingEvents(it->second.coros) : events;
     ev.data.fd = fd;
 
     if (epoll_ctl(epollFd.get(), op, fd, &ev) < 0) {
@@ -132,14 +132,21 @@ void EpollScheduler::remove(const int fd, const std::coroutine_handle<> coro) {
         return;
     }
 
-    const auto coroIt =
-        std::ranges::find_if(it->second.coros,
-            [&](const auto &ce) {
-                return ce.handle == coro;
-            });
-    if (coroIt != it->second.coros.end()) {
-        it->second.coros.erase(coroIt);
-        updateEpollRegistration(it);
+    auto nextCoros = it->second.coros;
+    const auto coroIt = std::ranges::find_if(nextCoros,
+        [&](const auto &ce) {
+            return ce.handle == coro;
+        });
+    if (coroIt == nextCoros.end()) {
+        return;
+    }
+
+    nextCoros.erase(coroIt);
+    applyEpollRegistration(fd, nextCoros);
+    if (nextCoros.empty()) {
+        fdStates.erase(it);
+    } else {
+        it->second.coros.swap(nextCoros);
     }
 }
 
@@ -174,19 +181,39 @@ void EpollScheduler::run() {
                         continue;
                     }
 
-                    auto &coros = fdIt->second.coros;
-                    std::erase_if(coros, [&](const CoroEntry &e) {
-                        if (e.events & occurredEvents) {
-                            if (scheduledCoros.insert(e.handle.address()).second) {
-                                pendingResumes.push_back(e.handle);
-                                return true;
-                            }
-                            return false;
-                        }
-                        return false;
-                    });
+                    const auto &coros = fdIt->second.coros;
+                    std::vector<CoroEntry> nextCoros;
+                    std::vector<std::coroutine_handle<>> readyCoros;
+                    nextCoros.reserve(coros.size());
+                    readyCoros.reserve(coros.size());
 
-                    updateEpollRegistration(fdIt);
+                    try {
+                        for (const auto &entry: coros) {
+                            if (entry.events & occurredEvents) {
+                                if (const auto [_, inserted] = scheduledCoros.insert(entry.handle.address());
+                                    inserted) {
+                                    readyCoros.push_back(entry.handle);
+                                    continue;
+                                }
+                            }
+                            nextCoros.push_back(entry);
+                        }
+
+                        pendingResumes.reserve(pendingResumes.size() + readyCoros.size());
+                        applyEpollRegistration(eventFd, nextCoros);
+                    } catch (...) {
+                        for (const auto rc: readyCoros) {
+                            scheduledCoros.erase(rc.address());
+                        }
+                        throw;
+                    }
+
+                    pendingResumes.insert(pendingResumes.end(), readyCoros.begin(), readyCoros.end());
+                    if (nextCoros.empty()) {
+                        fdStates.erase(fdIt);
+                    } else {
+                        fdIt->second.coros.swap(nextCoros);
+                    }
                 }
             }
             if (pendingResumes.empty()) {
@@ -241,31 +268,39 @@ const CancellationTokenSource &EpollScheduler::getCancellationTokenSource() cons
     return cts;
 }
 
-uint32_t EpollScheduler::calculateRemainingEvents(const FdState &state) {
-    uint32_t remaining = 0;
-    for (const auto &[events, h]: state.coros) {
-        remaining |= events;
-    }
-    return remaining;
+uint32_t EpollScheduler::calculateRemainingEvents(const std::vector<CoroEntry> &coros) {
+    return std::ranges::fold_left(coros | std::views::transform(&CoroEntry::events), 0u, std::bit_or());
 }
 
-void EpollScheduler::updateEpollRegistration(const FdStates::iterator it) {
-    const int fd = it->first;
-    const auto &state = it->second;
-
-    const uint32_t remaining = calculateRemainingEvents(state);
-
-    if (state.coros.empty()) {
-        if (epoll_ctl(epollFd.get(), EPOLL_CTL_DEL, fd, nullptr) < 0) {
-            throw std::system_error(errno, std::system_category(), "Epoll add/mod failed");
+void EpollScheduler::applyEpollRegistration(const int fd, const std::vector<CoroEntry> &coros) const {
+    if (coros.empty()) {
+        while (epoll_ctl(epollFd.get(), EPOLL_CTL_DEL, fd, nullptr) < 0) {
+            const int error = errno;
+            if (error == EINTR) {
+                continue;
+            }
+            if (error != ENOENT && error != EBADF) {
+                throw std::system_error(error, std::system_category(), "Epoll del failed");
+            }
+            break;
         }
-        fdStates.erase(it);
-    } else {
-        epoll_event ev{};
-        ev.events = remaining;
-        ev.data.fd = fd;
-        if (epoll_ctl(epollFd.get(), EPOLL_CTL_MOD, fd, &ev) < 0) {
-            throw std::system_error(errno, std::system_category(), "Epoll add/mod failed");
+        return;
+    }
+
+    epoll_event ev{};
+    ev.events = calculateRemainingEvents(coros);
+    ev.data.fd = fd;
+
+    int operation = EPOLL_CTL_MOD;
+    while (epoll_ctl(epollFd.get(), operation, fd, &ev) < 0) {
+        const int error = errno;
+        if (error == EINTR) {
+            continue;
         }
+        if (operation == EPOLL_CTL_MOD && error == ENOENT) {
+            operation = EPOLL_CTL_ADD;
+            continue;
+        }
+        throw std::system_error(error, std::system_category(), "Epoll mod/add failed");
     }
 }

@@ -87,9 +87,9 @@ private:
 
     using FdStates = std::unordered_map<int, FdState>;
 
-    static uint32_t calculateRemainingEvents(const FdState &state);
+    static uint32_t calculateRemainingEvents(const std::vector<CoroEntry> &coros);
 
-    void updateEpollRegistration(FdStates::iterator it);
+    void applyEpollRegistration(int fd, const std::vector<CoroEntry> &coros) const;
 
     void shutdown() noexcept;
 
