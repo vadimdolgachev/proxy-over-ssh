@@ -18,6 +18,10 @@ void CancellationToken::drain() const noexcept {
     state->signal.drain();
 }
 
+CancellationToken CancellationToken::clone() const noexcept {
+    return CancellationToken(state);
+}
+
 CancellationToken::CancellationToken(std::shared_ptr<State> s) :
     state(std::move(s)) {
 }

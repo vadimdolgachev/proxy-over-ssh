@@ -24,6 +24,8 @@ public:
 
     void drain() const noexcept;
 
+    [[nodiscard]] CancellationToken clone() const noexcept;
+
 private:
     struct State final {
         std::atomic_bool stopped{false};

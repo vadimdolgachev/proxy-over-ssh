@@ -15,6 +15,26 @@
 #include "Socket.h"
 #include "Logger.h"
 
+namespace {
+    void registerAwaiter(EpollScheduler &scheduler,
+                         const int socketFd,
+                         const uint32_t socketEvents,
+                         const std::coroutine_handle<> handle,
+                         const std::optional<int> cancellationFd) {
+        if (cancellationFd) {
+            scheduler.add(EpollScheduler::PollIn, *cancellationFd, handle);
+        }
+        try {
+            scheduler.add(socketEvents, socketFd, handle);
+        } catch (...) {
+            if (cancellationFd) {
+                scheduler.rollbackAdd(*cancellationFd, handle);
+            }
+            throw;
+        }
+    }
+}
+
 Socket::Socket() :
     fd_(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)) {
 }
@@ -101,16 +121,20 @@ bool ListenSocketAwaiter::await_ready() const noexcept {
 void ListenSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
     assert(getScheduler() != nullptr);
     if (cancellationToken.isStopped()) {
-        return;
+        throw CancellationTokenException{};
     }
     handle = h;
-    getScheduler()->add(EpollScheduler::PollIn, cancellationToken.getFd(), h);
-    getScheduler()->add(EpollScheduler::PollIn, fd, h);
+    registerAwaiter(*getScheduler(), fd, EpollScheduler::PollIn, h, cancellationToken.getFd());
 }
 
 AcceptedSocket ListenSocketAwaiter::await_resume() {
     if (handle) {
         getScheduler()->remove(cancellationToken.getFd(), handle);
+    }
+    if (cancellationToken.isStopped()) {
+        cancellationToken.drain();
+        getScheduler()->forceRemoveFd(fd);
+        throw CancellationTokenException{};
     }
     sockaddr_storage addr{};
     socklen_t socklen = sizeof(addr);
@@ -197,9 +221,11 @@ void ReadSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
             getScheduler()->forceRemoveFd(socket->fd());
             throw CancellationTokenException{};
         }
-        getScheduler()->add(EpollScheduler::PollIn, cancellationToken.value().getFd(), h);
     }
-    getScheduler()->add(EpollScheduler::PollIn, socket->fd(), h);
+    const std::optional<int> cancellationFd = cancellationToken
+                                                  ? std::optional{cancellationToken->getFd()}
+                                                  : std::nullopt;
+    registerAwaiter(*getScheduler(), socket->fd(), EpollScheduler::PollIn, h, cancellationFd);
 }
 
 size_t ReadSocketAwaiter::await_resume() {
@@ -280,9 +306,11 @@ void WriteSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
             getScheduler()->forceRemoveFd(socket->fd());
             throw CancellationTokenException{};
         }
-        getScheduler()->add(EpollScheduler::PollIn, cancellationToken.value().getFd(), h);
     }
-    getScheduler()->add(EpollScheduler::PollOut, socket->fd(), h);
+    const std::optional<int> cancellationFd = cancellationToken
+                                                  ? std::optional{cancellationToken->getFd()}
+                                                  : std::nullopt;
+    registerAwaiter(*getScheduler(), socket->fd(), EpollScheduler::PollOut, h, cancellationFd);
 }
 
 size_t WriteSocketAwaiter::await_resume() {
@@ -311,22 +339,16 @@ size_t WriteSocketAwaiter::await_resume() {
         }
     }
 
-    size_t totalSent = 0;
-    while (totalSent < buffer.size()) {
-        const ssize_t sent =
-                send(socket->fd(), buffer.data() + totalSent, buffer.size() - totalSent, MSG_NOSIGNAL | MSG_DONTWAIT);
+    while (true) {
+        const ssize_t sent = send(socket->fd(), buffer.data(), buffer.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
         if (sent < 0) {
             if (errno == EINTR) {
                 continue;
             }
             throw std::system_error(errno, std::system_category(), "send failed");
         }
-        if (sent == 0) {
-            break;
-        }
-        totalSent += static_cast<size_t>(sent);
+        return static_cast<size_t>(sent);
     }
-    return totalSent;
 }
 
 ConnectSocketAwaiter::ConnectSocketAwaiter(SocketPtr socket_,
@@ -384,9 +406,15 @@ void ConnectSocketAwaiter::await_suspend(const std::coroutine_handle<> h) {
             getScheduler()->forceRemoveFd(socket->fd());
             throw CancellationTokenException{};
         }
-        getScheduler()->add(EpollScheduler::PollIn, cancellationToken.value().getFd(), h);
     }
-    getScheduler()->add(EpollScheduler::PollOut | EpollScheduler::PollErr, socket->fd(), h);
+    const std::optional<int> cancellationFd = cancellationToken
+                                                  ? std::optional{cancellationToken->getFd()}
+                                                  : std::nullopt;
+    registerAwaiter(*getScheduler(),
+                    socket->fd(),
+                    EpollScheduler::PollOut | EpollScheduler::PollErr,
+                    h,
+                    cancellationFd);
 }
 
 void ConnectSocketAwaiter::await_resume() {

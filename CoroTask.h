@@ -71,6 +71,8 @@ public:
 
     void remove(int fd, std::coroutine_handle<> coro);
 
+    void rollbackAdd(int fd, std::coroutine_handle<> coro) noexcept;
+
     void forceRemoveFd(int fd);
 
     void run();

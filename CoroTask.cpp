@@ -156,6 +156,34 @@ void EpollScheduler::remove(const int fd, const std::coroutine_handle<> coro) {
     }
 }
 
+void EpollScheduler::rollbackAdd(const int fd, const std::coroutine_handle<> coro) noexcept {
+    std::lock_guard lock(schedulerMutex);
+
+    const auto it = fdStates.find(fd);
+    if (it == fdStates.end()) {
+        return;
+    }
+
+    auto &coros = it->second.coros;
+    const auto coroIt = std::ranges::find_if(coros, [&](const auto &entry) {
+        return entry.handle == coro;
+    });
+    if (coroIt == coros.end()) {
+        return;
+    }
+
+    coros.erase(coroIt);
+    try {
+        applyEpollRegistration(fd, coros);
+    } catch (...) {
+        // The in-memory registration is authoritative. A stale kernel event is
+        // ignored and removed by the scheduler when it observes no matching state.
+    }
+    if (coros.empty()) {
+        fdStates.erase(it);
+    }
+}
+
 void EpollScheduler::forceRemoveFd(const int fd) {
     std::lock_guard lock(schedulerMutex);
     fdStates.erase(fd);
