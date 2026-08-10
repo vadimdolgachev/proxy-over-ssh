@@ -128,7 +128,8 @@ fun SettingsScreen(
             }
 
             Text(
-                if (vpnMode) "Route all device traffic through proxy" else "SOCKS5 proxy only (manual configuration)",
+                if (vpnMode) "Route all device traffic through proxy"
+                else "SOCKS5 and HTTP CONNECT (manual configuration)",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 16.dp),
@@ -149,11 +150,11 @@ fun SettingsScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // SOCKS5 Port
+            // Shared proxy port
             OutlinedTextField(
                 value = socksPort,
                 onValueChange = { socksPort = it },
-                label = { Text("SOCKS5 Port") },
+                label = { Text("Proxy Port") },
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp),

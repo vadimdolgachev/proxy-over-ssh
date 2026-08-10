@@ -168,7 +168,7 @@ fun MainScreen(
                     enabled = !isProxyRunning && selectedProfileId != null,
                     modifier = Modifier.weight(1f),
                 ) {
-                    Text(if (vpnMode) "Start VPN" else "Start SOCKS5")
+                    Text(if (vpnMode) "Start VPN" else "Start Proxy")
                 }
                 OutlinedButton(
                     onClick = onStopProxy,

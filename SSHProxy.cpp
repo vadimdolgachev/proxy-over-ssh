@@ -23,12 +23,19 @@
 #include "Constants.h"
 #include "CoroTask.h"
 #include "IdleTimer.h"
+#include "HttpConnect.h"
 #include "Logger.h"
 #include "SSHProxy.h"
 #include "Socket.h"
 #include "Types.h"
 
 namespace {
+    enum class ClientProtocol {
+        Unknown,
+        Socks5,
+        HttpConnect,
+    };
+
     struct ClientContextCoro final {
         ClientContextCoro(Endpoint endpoint_, SocketPtr socket_) :
             endpoint(std::move(endpoint_)),
@@ -57,6 +64,8 @@ namespace {
         Endpoint targetEndpoint;
         SocketPtr socket;
         std::vector<uint8_t> buffer;
+        std::vector<uint8_t> prefetchedClientData;
+        ClientProtocol protocol = ClientProtocol::Unknown;
     };
 
     constexpr size_t safeAdd(const size_t a, const size_t b) {
@@ -66,14 +75,16 @@ namespace {
         return a + b;
     }
 
-    [[nodiscard]] CoroTask<> readUntil(const std::shared_ptr<ClientContextCoro> clientCtx, const size_t totalSize) {
-        if (clientCtx->buffer.size() < totalSize) {
+    [[nodiscard]] CoroTask<> readUntil(const std::shared_ptr<ClientContextCoro> clientCtx,
+                                      const size_t totalSize,
+                                      const size_t alreadyRead = 0) {
+        if (clientCtx->buffer.size() < totalSize || alreadyRead > totalSize) {
             throw std::runtime_error("Buffer too small for requested read size");
         }
 
-        size_t totalRead = 0;
+        size_t totalRead = alreadyRead;
         while (totalRead < totalSize) {
-            const size_t remaining = clientCtx->buffer.size() - totalRead;
+            const size_t remaining = totalSize - totalRead;
             const size_t read = co_await clientCtx->socket->read(
                 {clientCtx->buffer.data() + totalRead, remaining},
                 co_await GetCancellationToken()
@@ -87,6 +98,10 @@ namespace {
             totalRead = safeAdd(totalRead, read);
         }
     }
+
+    [[nodiscard]] CoroTask<size_t> writeAll(SocketPtr socket,
+                                            std::span<const uint8_t> data,
+                                            CancellationTokenOpt ct);
 
     struct MultiFdAwaiter final : SchedulerAware<EpollScheduler> {
         struct FdInfo final {
@@ -147,7 +162,7 @@ struct Socks5Negotiation final {
 
         constexpr size_t kHeaderSize = 2;
         clientCtx->buffer.resize(kHeaderSize);
-        co_await readUntil(clientCtx, kHeaderSize);
+        co_await readUntil(clientCtx, kHeaderSize, 1);
 
         result.version = clientCtx->buffer[0];
         result.nmethodLength = clientCtx->buffer[1];
@@ -184,10 +199,9 @@ struct Socks5Negotiation final {
     clientCtx->buffer.resize(2);
     clientCtx->buffer[0] = Socks5::Version;
     clientCtx->buffer[1] = selectedMethod;
-    const size_t length = co_await clientCtx->socket->write(
-        {clientCtx->buffer.data(),
-            clientCtx->buffer.size()},
-            co_await GetCancellationToken());
+    const size_t length = co_await writeAll(clientCtx->socket,
+                                           {clientCtx->buffer.data(), clientCtx->buffer.size()},
+                                           co_await GetCancellationToken());
     if (length != clientCtx->buffer.size()) {
         throw std::runtime_error("Failed to write to client");
     }
@@ -200,14 +214,69 @@ struct Socks5Negotiation final {
 [[nodiscard]] CoroTask<size_t> writeAll(SocketPtr socket, std::span<const uint8_t> data, CancellationTokenOpt ct) {
     size_t offset = 0;
     while (offset < data.size()) {
-        const size_t written =
-                co_await socket->write({const_cast<uint8_t *>(data.data()) + offset, data.size() - offset}, std::move(ct));
+        CancellationTokenOpt writeToken;
+        if (ct) {
+            writeToken.emplace(ct->clone());
+        }
+        const size_t written = co_await socket->write(
+            {const_cast<uint8_t *>(data.data()) + offset, data.size() - offset}, std::move(writeToken));
         if (written == 0) {
             throw std::runtime_error("Socket closed during write");
         }
         offset += written;
     }
     co_return offset;
+}
+
+[[nodiscard]] CoroTask<> detectClientProtocol(const std::shared_ptr<ClientContextCoro> clientCtx) {
+    clientCtx->buffer.resize(1);
+    co_await readUntil(clientCtx, 1);
+    clientCtx->protocol = clientCtx->buffer.front() == Socks5::Version ? ClientProtocol::Socks5
+                                                                       : ClientProtocol::HttpConnect;
+}
+
+[[nodiscard]] CoroTask<std::expected<void, HttpConnect::Error>> readHttpConnectRequest(
+    const std::shared_ptr<ClientContextCoro> clientCtx) {
+    while (true) {
+        const std::string_view request(reinterpret_cast<const char *>(clientCtx->buffer.data()),
+                                       clientCtx->buffer.size());
+        if (request.find("\r\n\r\n") != std::string_view::npos) {
+            const auto parsed = HttpConnect::parseRequest(clientCtx->buffer);
+            if (!parsed) {
+                co_return std::unexpected(parsed.error());
+            }
+            clientCtx->targetEndpoint = parsed->target;
+            clientCtx->prefetchedClientData.assign(clientCtx->buffer.begin() +
+                                                        static_cast<std::ptrdiff_t>(parsed->headerSize),
+                                                    clientCtx->buffer.end());
+            co_return std::expected<void, HttpConnect::Error>{};
+        }
+        if (clientCtx->buffer.size() >= HttpConnect::MaxHeaderSize) {
+            co_return std::unexpected(HttpConnect::Error{
+                HttpConnect::Status::RequestHeaderFieldsTooLarge, "HTTP request headers exceed 16 KiB"});
+        }
+
+        const size_t oldSize = clientCtx->buffer.size();
+        const size_t nextSize = std::min(HttpConnect::MaxHeaderSize, safeAdd(oldSize, size_t{1024}));
+        clientCtx->buffer.resize(nextSize);
+        const size_t bytesRead = co_await clientCtx->socket->read(
+            {clientCtx->buffer.data() + oldSize, nextSize - oldSize}, co_await GetCancellationToken());
+        if (bytesRead == 0) {
+            throw std::runtime_error("Connection closed during HTTP CONNECT request");
+        }
+        if (bytesRead > nextSize - oldSize) {
+            throw std::runtime_error("Socket read overflow");
+        }
+        clientCtx->buffer.resize(safeAdd(oldSize, bytesRead));
+    }
+}
+
+[[nodiscard]] CoroTask<> sendHttpConnectResponse(const std::shared_ptr<ClientContextCoro> clientCtx,
+                                                 const HttpConnect::Status status,
+                                                 CancellationTokenOpt ct) {
+    const std::string_view response = HttpConnect::response(status);
+    const auto *data = reinterpret_cast<const uint8_t *>(response.data());
+    co_await writeAll(clientCtx->socket, {data, response.size()}, std::move(ct));
 }
 
 // SOCKS5 request header (RFC 1928)
@@ -558,6 +627,20 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
     auto *scheduler = co_await GetScheduler{};
     state->scheduler = scheduler;
 
+    size_t prefetchedOffset = 0;
+    while (prefetchedOffset < clientCtx->prefetchedClientData.size()) {
+        const std::span<const uint8_t> remaining(clientCtx->prefetchedClientData.data() + prefetchedOffset,
+                                                 clientCtx->prefetchedClientData.size() - prefetchedOffset);
+        const size_t written = co_await state->backend->writeAsync(remaining, state->cts.getToken());
+        if (written == 0 || written > remaining.size()) {
+            throw std::runtime_error("Backend closed while forwarding prefetched CONNECT data");
+        }
+        prefetchedOffset = safeAdd(prefetchedOffset, written);
+        state->proxyStats->totalOutBytes.fetch_add(written, std::memory_order_relaxed);
+        state->idleTimer.arm();
+    }
+    clientCtx->prefetchedClientData.clear();
+
     auto clientToBackend = forwardClientToBackend(state);
     auto backendToClient = forwardBackendToClient(state);
 
@@ -591,24 +674,56 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
 [[nodiscard]] CoroTask<> handleClient(const BackendFactory backendFactory,
                                       const std::shared_ptr<ClientContextCoro> client,
                                       const std::shared_ptr<ProxyStats> &proxyStats) {
+    bool tunnelEstablished = false;
+    bool failed = false;
     try {
-        co_await handleSocks5Handshake(client);
-        co_await handleSocks5Request(client);
+        co_await detectClientProtocol(client);
+        if (client->protocol == ClientProtocol::Socks5) {
+            co_await handleSocks5Handshake(client);
+            co_await handleSocks5Request(client);
+        } else {
+            if (const auto request = co_await readHttpConnectRequest(client); !request) {
+                co_await sendHttpConnectResponse(client, request.error().status, co_await GetCancellationToken());
+                client->closeSocket();
+                co_return;
+            }
+        }
 
         const auto backendSocket = backendFactory(client->targetEndpoint);
         CancellationTokenSource cts;
 
         if (const auto connectResult = co_await backendSocket->connectAsync(client->targetEndpoint, cts.getToken());
             connectResult != ResultCode::Ok) {
-            sendSocks5FailureSync(client);
+            if (client->protocol == ClientProtocol::Socks5) {
+                sendSocks5FailureSync(client);
+            } else {
+                co_await sendHttpConnectResponse(client, HttpConnect::Status::BadGateway, cts.getToken());
+            }
             client->closeSocket();
             co_return;
         }
 
-        co_await sendSocks5Success(client, cts.getToken());
+        if (client->protocol == ClientProtocol::Socks5) {
+            co_await sendSocks5Success(client, cts.getToken());
+        } else {
+            co_await sendHttpConnectResponse(client, HttpConnect::Status::ConnectionEstablished, cts.getToken());
+        }
+        tunnelEstablished = true;
         co_await forwardData(client, backendSocket, std::move(cts), proxyStats);
     } catch (...) {
-        sendSocks5FailureSync(client);
+        failed = true;
+    }
+
+    if (failed && !tunnelEstablished) {
+        if (client->protocol == ClientProtocol::HttpConnect) {
+            try {
+                co_await sendHttpConnectResponse(client, HttpConnect::Status::BadRequest, co_await GetCancellationToken());
+            } catch (...) {
+            }
+        } else {
+            sendSocks5FailureSync(client);
+        }
+        client->closeSocket();
     }
 }
 
@@ -667,8 +782,8 @@ SSHProxy::SSHProxy(CancellationTokenSource &cts_) :
 }
 
 SSHProxy::~SSHProxy() {
-    log_v("~SSHProxy\n");
     requestStop();
+    waitForFinish();
     libssh2_exit();
 }
 
@@ -684,7 +799,6 @@ void SSHProxy::start(const ProxyConfig &proxyConfig,
 }
 
 void SSHProxy::requestStop() noexcept {
-    log_d("SSHProxy::requestStop\n");
     cts.requestStop();
     isStopRequested = true;
 }
@@ -699,8 +813,13 @@ void SSHProxy::mainLoop(const std::optional<StartCallback> &startCb, const std::
     try {
         EpollScheduler sched(cts);
         auto task = startServer(config.value(), proxyStats, isStopRequested);
+        // std::thread th([&c = cts] {
+        //     std::this_thread::sleep_for(std::chrono::microseconds(0));
+        //     c.requestStop();
+        // });
+        // th.detach();
         task.start(sched);
-        log_d("SOCKS5 proxy started on port: {}\n", config.value().listenPort);
+        log_d("SOCKS5 / HTTP CONNECT proxy started on port: {}\n", config.value().listenPort);
         log_d("Proxy started. Press Ctrl+C to stop...\n");
         if (startCb) {
             startCb.value()();

@@ -58,7 +58,7 @@ class ProxyService : VpnService() {
                 val listenPort = intent.getIntExtra(EXTRA_LISTEN_PORT, 10803)
                 val vpnMode = intent.getBooleanExtra(EXTRA_VPN_MODE, false)
                 val notification = buildNotification(
-                    if (vpnMode) "VPN proxy running" else "SOCKS5 proxy running on port $listenPort"
+                    if (vpnMode) "VPN proxy running" else "SOCKS5 / HTTP proxy running on port $listenPort"
                 )
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     startForeground(

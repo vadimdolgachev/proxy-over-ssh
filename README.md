@@ -1,13 +1,14 @@
 # proxy_over_ssh
 
 A **C++23 SSH-based asynchronous proxy** built on **libssh2 + OpenSSL** using coroutines and epoll.
-The proxy exposes a local **SOCKS5** server and forwards traffic through an SSH connection using `direct-tcpip` channels.
+The proxy accepts **SOCKS5** and **HTTP/1.1 CONNECT** clients on one local port and forwards traffic through SSH
+`direct-tcpip` channels. The protocol is detected automatically for each connection.
 
 ---
 
 ## Features
 
-- **SOCKS5 proxy** with support for domain names, IPv4, and IPv6
+- **SOCKS5 and HTTP CONNECT proxy** with support for domain names, IPv4, and IPv6
 - **SSH tunneling** via `direct-tcpip` channels
 - **Async I/O** using C++20/23 coroutines with custom epoll scheduler
 - **Transport-agnostic architecture** - proxy is decoupled from backend implementation
@@ -60,20 +61,26 @@ export PROXY_PRIVATE_KEY="your_base64_key_content"
 
 ### Command Line Options
 
-| Option | Description |
-|--------|-------------|
-| `--ssh-user` | SSH username |
-| `--ssh-host` | SSH server IP address |
-| `--ssh-port` | SSH server port |
-| `--ssh-private-key-path` | Path to private key file |
-| `--ssh-private-key` | Private key content (supports `\n` for newlines and `$ENV_VAR` for environment variables) |
-| `--listen-port` | Local SOCKS5 proxy port |
+| Option                   | Description                                                                               |
+|--------------------------|-------------------------------------------------------------------------------------------|
+| `--ssh-user`             | SSH username                                                                              |
+| `--ssh-host`             | SSH server IP address                                                                     |
+| `--ssh-port`             | SSH server port                                                                           |
+| `--ssh-private-key-path` | Path to private key file                                                                  |
+| `--ssh-private-key`      | Private key content (supports `\n` for newlines and `$ENV_VAR` for environment variables) |
+| `--listen-port`          | Shared local SOCKS5 and HTTP CONNECT proxy port                                           |
 
 ### Test with curl
 
 ```bash
 curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
+
+# HTTP/1.1 CONNECT (used automatically for this HTTPS URL)
+curl --proxy http://127.0.0.1:1080 https://ifconfig.me
 ```
+
+The HTTP endpoint supports tunneling with `CONNECT` only. It does not implement ordinary HTTP request forwarding or
+proxy authentication.
 
 ---
 
@@ -81,8 +88,8 @@ curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Client    │────▶│   SOCKS5    │────▶│   Backend   │
-│  (curl)     │     │   Proxy     │     │  (SshSocket)│
+│   Client    │────▶│ SOCKS5/HTTP │────▶│   Backend   │
+│  (curl)     │     │CONNECT Proxy│     │  (SshSocket)│
 └─────────────┘     └─────────────┘     └─────────────┘
                           │                    │
                           │                    ▼
@@ -110,7 +117,8 @@ sudo systemctl start proxy_over_ssh
 
 ```
 ├── main.cpp           # Entry point, config parsing, factory creation
-├── SSHProxy.h/cpp     # SOCKS5 proxy implementation
+├── SSHProxy.h/cpp     # Protocol detection and proxy connection lifecycle
+├── HttpConnect.h/cpp  # HTTP/1.1 CONNECT parsing and responses
 ├── BackendSocket.h    # Abstract interface for backend connections
 ├── SshSocket.h/cpp    # SSH tunneling implementation
 ├── Socket.h/cpp       # Socket abstraction with coroutine awaiters

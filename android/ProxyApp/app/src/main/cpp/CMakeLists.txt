@@ -105,6 +105,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         ${PROXY_OVER_SSH_DIR}/SshSocket.cpp
         ${PROXY_OVER_SSH_DIR}/SshSessionHandler.cpp
         ${PROXY_OVER_SSH_DIR}/Endpoint.cpp
+        ${PROXY_OVER_SSH_DIR}/HttpConnect.cpp
         ${PROXY_OVER_SSH_DIR}/SessionPool.cpp
         ${PROXY_OVER_SSH_DIR}/CancellationToken.cpp
         ${PROXY_OVER_SSH_DIR}/CoroTask.cpp
