@@ -17,6 +17,8 @@ namespace Constants {
     constexpr size_t THREAD_POOL_SIZE = 4;
 
     constexpr auto PRINT_STATS_INTERVAL = std::chrono::seconds(1);
+
+    constexpr auto CLIENT_SETUP_TIMEOUT = std::chrono::seconds(30);
 } // namespace Constants
 
 #endif // PROXY_OVER_SSH_CONSTANTS_H

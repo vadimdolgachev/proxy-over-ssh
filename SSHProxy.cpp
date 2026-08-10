@@ -2,8 +2,11 @@
 // Created by vadim on 31.10.2025.
 //
 
+#include <chrono>
+#include <exception>
 #include <format>
 #include <limits>
+#include <mutex>
 #include <ranges>
 #include <span>
 #include <string>
@@ -77,6 +80,7 @@ namespace {
 
     [[nodiscard]] CoroTask<> readUntil(const std::shared_ptr<ClientContextCoro> clientCtx,
                                       const size_t totalSize,
+                                      const CancellationTokenSource &setupCts,
                                       const size_t alreadyRead = 0) {
         if (clientCtx->buffer.size() < totalSize || alreadyRead > totalSize) {
             throw std::runtime_error("Buffer too small for requested read size");
@@ -87,7 +91,7 @@ namespace {
             const size_t remaining = totalSize - totalRead;
             const size_t read = co_await clientCtx->socket->read(
                 {clientCtx->buffer.data() + totalRead, remaining},
-                co_await GetCancellationToken()
+                setupCts.getToken()
             );
             if (read == 0) {
                 throw std::runtime_error("Connection closed during read");
@@ -119,14 +123,24 @@ namespace {
 
         void await_suspend(const std::coroutine_handle<> h) {
             handle = h;
-            for (const auto &[fd, events]: fds) {
-                this->getScheduler()->add(events, fd, h);
+            std::vector<int> registeredFds;
+            registeredFds.reserve(fds.size());
+            try {
+                for (const auto &[fd, events]: fds) {
+                    this->getScheduler()->add(events, fd, h);
+                    registeredFds.push_back(fd);
+                }
+            } catch (...) {
+                for (const int fd: registeredFds) {
+                    this->getScheduler()->rollbackAdd(fd, h);
+                }
+                throw;
             }
         }
 
         std::vector<int> await_resume() {
             for (const auto &[fd, _]: fds) {
-                this->getScheduler()->remove(fd, handle);
+                this->getScheduler()->rollbackAdd(fd, handle);
             }
             std::vector<int> ready;
             for (const auto &[fd, _]: fds) {
@@ -157,12 +171,13 @@ struct Socks5Negotiation final {
     std::span<const uint8_t> nmethodsData;
 
 
-    [[nodiscard]] static CoroTask<Socks5Negotiation> parse(const std::shared_ptr<ClientContextCoro> clientCtx) {
+    [[nodiscard]] static CoroTask<Socks5Negotiation> parse(const std::shared_ptr<ClientContextCoro> clientCtx,
+                                                           const CancellationTokenSource &setupCts) {
         Socks5Negotiation result;
 
         constexpr size_t kHeaderSize = 2;
         clientCtx->buffer.resize(kHeaderSize);
-        co_await readUntil(clientCtx, kHeaderSize, 1);
+        co_await readUntil(clientCtx, kHeaderSize, setupCts, 1);
 
         result.version = clientCtx->buffer[0];
         result.nmethodLength = clientCtx->buffer[1];
@@ -181,14 +196,15 @@ struct Socks5Negotiation final {
         }
 
         clientCtx->buffer.resize(result.nmethodLength);
-        co_await readUntil(clientCtx, result.nmethodLength);
+        co_await readUntil(clientCtx, result.nmethodLength, setupCts);
         result.nmethodsData = {clientCtx->buffer.data(), result.nmethodLength};
         co_return result;
     }
 };
 
-[[nodiscard]] CoroTask<> handleSocks5Handshake(const std::shared_ptr<ClientContextCoro> clientCtx) {
-    const auto negotiation = co_await Socks5Negotiation::parse(clientCtx);
+[[nodiscard]] CoroTask<> handleSocks5Handshake(const std::shared_ptr<ClientContextCoro> clientCtx,
+                                               const CancellationTokenSource &setupCts) {
+    const auto negotiation = co_await Socks5Negotiation::parse(clientCtx, setupCts);
 
     const bool hasNoAuth = std::ranges::find_if(negotiation.nmethodsData, [](const auto c) {
                                return c == Socks5::Auth::NoAuth;
@@ -201,7 +217,7 @@ struct Socks5Negotiation final {
     clientCtx->buffer[1] = selectedMethod;
     const size_t length = co_await writeAll(clientCtx->socket,
                                            {clientCtx->buffer.data(), clientCtx->buffer.size()},
-                                           co_await GetCancellationToken());
+                                           setupCts.getToken());
     if (length != clientCtx->buffer.size()) {
         throw std::runtime_error("Failed to write to client");
     }
@@ -228,15 +244,17 @@ struct Socks5Negotiation final {
     co_return offset;
 }
 
-[[nodiscard]] CoroTask<> detectClientProtocol(const std::shared_ptr<ClientContextCoro> clientCtx) {
+[[nodiscard]] CoroTask<> detectClientProtocol(const std::shared_ptr<ClientContextCoro> clientCtx,
+                                              const CancellationTokenSource &setupCts) {
     clientCtx->buffer.resize(1);
-    co_await readUntil(clientCtx, 1);
+    co_await readUntil(clientCtx, 1, setupCts);
     clientCtx->protocol = clientCtx->buffer.front() == Socks5::Version ? ClientProtocol::Socks5
                                                                        : ClientProtocol::HttpConnect;
 }
 
 [[nodiscard]] CoroTask<std::expected<void, HttpConnect::Error>> readHttpConnectRequest(
-    const std::shared_ptr<ClientContextCoro> clientCtx) {
+    const std::shared_ptr<ClientContextCoro> clientCtx,
+    const CancellationTokenSource &setupCts) {
     while (true) {
         const std::string_view request(reinterpret_cast<const char *>(clientCtx->buffer.data()),
                                        clientCtx->buffer.size());
@@ -260,7 +278,7 @@ struct Socks5Negotiation final {
         const size_t nextSize = std::min(HttpConnect::MaxHeaderSize, safeAdd(oldSize, size_t{1024}));
         clientCtx->buffer.resize(nextSize);
         const size_t bytesRead = co_await clientCtx->socket->read(
-            {clientCtx->buffer.data() + oldSize, nextSize - oldSize}, co_await GetCancellationToken());
+            {clientCtx->buffer.data() + oldSize, nextSize - oldSize}, setupCts.getToken());
         if (bytesRead == 0) {
             throw std::runtime_error("Connection closed during HTTP CONNECT request");
         }
@@ -294,11 +312,13 @@ struct Socks5Request final {
     uint8_t atyp;
     Endpoint targetEndpoint;
 
-    [[nodiscard]] static CoroTask<Socks5Request> readRequest(const std::shared_ptr<ClientContextCoro> clientCtx) {
-        auto readBytes = [&clientCtx](auto &buffer, size_t &offset, const size_t n) -> CoroTask<void> {
+    [[nodiscard]] static CoroTask<Socks5Request> readRequest(const std::shared_ptr<ClientContextCoro> clientCtx,
+                                                             const CancellationTokenSource &setupCts) {
+        auto readBytes = [&clientCtx, &setupCts](auto &buffer, size_t &offset, const size_t n) -> CoroTask<void> {
             buffer.resize(offset + n);
             while (offset < buffer.size()) {
-                const size_t read = co_await clientCtx->socket->read({buffer.data() + offset, buffer.size() - offset}, co_await GetCancellationToken());
+                const size_t read = co_await clientCtx->socket->read({buffer.data() + offset, buffer.size() - offset},
+                                                                     setupCts.getToken());
                 if (read == 0) {
                     throw std::runtime_error("Socket closed during SOCKS5 request");
                 }
@@ -427,8 +447,9 @@ struct Socks5Response final {
     }
 };
 
-[[nodiscard]] CoroTask<> handleSocks5Request(const std::shared_ptr<ClientContextCoro> clientCtx) {
-    const auto req = co_await Socks5Request::readRequest(clientCtx);
+[[nodiscard]] CoroTask<> handleSocks5Request(const std::shared_ptr<ClientContextCoro> clientCtx,
+                                             const CancellationTokenSource &setupCts) {
+    const auto req = co_await Socks5Request::readRequest(clientCtx, setupCts);
     clientCtx->targetEndpoint = req.targetEndpoint;
 }
 
@@ -671,45 +692,88 @@ template<typename ReadFunc, typename WriteFunc, typename SourceIsEofFunc, typena
     state->closeAll();
 }
 
+struct ClientSetupState final {
+    CancellationTokenSource cts;
+    std::atomic_bool finished = false;
+};
+
+struct ClientSetupGuard final {
+    explicit ClientSetupGuard(std::shared_ptr<ClientSetupState> state_) : state(std::move(state_)) {}
+
+    ~ClientSetupGuard() {
+        state->finished.store(true);
+    }
+
+    std::shared_ptr<ClientSetupState> state;
+};
+
+[[nodiscard]] CoroTask<> enforceClientSetupTimeout(const std::shared_ptr<ClientSetupState> state) {
+    try {
+        co_await TimerAwaiter{Constants::CLIENT_SETUP_TIMEOUT, co_await GetCancellationToken{}};
+    } catch (const CancellationTokenException &) {
+        co_return;
+    }
+    if (!state->finished.load()) {
+        state->cts.requestStop();
+    }
+}
+
 [[nodiscard]] CoroTask<> handleClient(const BackendFactory backendFactory,
                                       const std::shared_ptr<ClientContextCoro> client,
                                       const std::shared_ptr<ProxyStats> &proxyStats) {
+    const auto setupState = std::make_shared<ClientSetupState>();
+    const ClientSetupGuard setupGuard(setupState);
+    auto setupTimeout = enforceClientSetupTimeout(setupState);
+    setupTimeout.startDetached(*co_await GetScheduler{});
+
     bool tunnelEstablished = false;
     bool failed = false;
     try {
-        co_await detectClientProtocol(client);
+        co_await detectClientProtocol(client, setupState->cts);
         if (client->protocol == ClientProtocol::Socks5) {
-            co_await handleSocks5Handshake(client);
-            co_await handleSocks5Request(client);
+            co_await handleSocks5Handshake(client, setupState->cts);
+            co_await handleSocks5Request(client, setupState->cts);
         } else {
-            if (const auto request = co_await readHttpConnectRequest(client); !request) {
-                co_await sendHttpConnectResponse(client, request.error().status, co_await GetCancellationToken());
+            if (const auto request = co_await readHttpConnectRequest(client, setupState->cts); !request) {
+                co_await sendHttpConnectResponse(client, request.error().status, setupState->cts.getToken());
                 client->closeSocket();
                 co_return;
             }
         }
 
-        const auto backendSocket = backendFactory(client->targetEndpoint);
-        CancellationTokenSource cts;
+        const auto backendSocket = backendFactory ? backendFactory(client->targetEndpoint) : nullptr;
 
-        if (const auto connectResult = co_await backendSocket->connectAsync(client->targetEndpoint, cts.getToken());
+        if (backendSocket == nullptr) {
+            if (client->protocol == ClientProtocol::Socks5) {
+                sendSocks5FailureSync(client);
+            } else {
+                co_await sendHttpConnectResponse(client, HttpConnect::Status::BadGateway, setupState->cts.getToken());
+            }
+            client->closeSocket();
+            co_return;
+        }
+
+        if (const auto connectResult =
+                co_await backendSocket->connectAsync(client->targetEndpoint, setupState->cts.getToken());
             connectResult != ResultCode::Ok) {
             if (client->protocol == ClientProtocol::Socks5) {
                 sendSocks5FailureSync(client);
             } else {
-                co_await sendHttpConnectResponse(client, HttpConnect::Status::BadGateway, cts.getToken());
+                co_await sendHttpConnectResponse(client, HttpConnect::Status::BadGateway, setupState->cts.getToken());
             }
             client->closeSocket();
             co_return;
         }
 
         if (client->protocol == ClientProtocol::Socks5) {
-            co_await sendSocks5Success(client, cts.getToken());
+            co_await sendSocks5Success(client, setupState->cts.getToken());
         } else {
-            co_await sendHttpConnectResponse(client, HttpConnect::Status::ConnectionEstablished, cts.getToken());
+            co_await sendHttpConnectResponse(client, HttpConnect::Status::ConnectionEstablished,
+                                             setupState->cts.getToken());
         }
+        setupState->finished.store(true);
         tunnelEstablished = true;
-        co_await forwardData(client, backendSocket, std::move(cts), proxyStats);
+        co_await forwardData(client, backendSocket, CancellationTokenSource{}, proxyStats);
     } catch (...) {
         failed = true;
     }
@@ -748,8 +812,12 @@ CoroTask<> printProxyStats(const std::shared_ptr<const ProxyStats> stats,
                                      std::atomic_bool &isStopRequested) {
     Socket serverSocket;
     serverSocket.setReuseAddr(true);
-    log_d("Listening port: {}\n", config.listenPort);
-    if (!serverSocket.bind(Endpoint(config.listenPort))) {
+    sockaddr_in listenAddress{};
+    listenAddress.sin_family = AF_INET;
+    listenAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    listenAddress.sin_port = htons(config.listenPort);
+    log_d("Listening endpoint: 127.0.0.1:{}\n", config.listenPort);
+    if (!serverSocket.bind(Endpoint(listenAddress))) {
         throw std::runtime_error(
                 std::format("Failed to bind server socket on port {}: {}", config.listenPort, std::strerror(errno)));
     }
@@ -774,11 +842,45 @@ CoroTask<> printProxyStats(const std::shared_ptr<const ProxyStats> stats,
     }
 }
 
+struct ServerOutcome final {
+    void setFailure(std::exception_ptr failure_) {
+        std::lock_guard lock(mutex);
+        if (failure == nullptr) {
+            failure = std::move(failure_);
+        }
+    }
+
+    [[nodiscard]] std::exception_ptr getFailure() const {
+        std::lock_guard lock(mutex);
+        return failure;
+    }
+
+private:
+    mutable std::mutex mutex;
+    std::exception_ptr failure;
+};
+
+[[nodiscard]] CoroTask<> superviseServer(const ProxyConfig config,
+                                         const std::shared_ptr<ProxyStats> proxyStats,
+                                         std::atomic_bool &isStopRequested,
+                                         CancellationTokenSource &cts,
+                                         const std::shared_ptr<ServerOutcome> outcome) {
+    try {
+        co_await startServer(config, proxyStats, isStopRequested);
+    } catch (...) {
+        outcome->setFailure(std::current_exception());
+    }
+    isStopRequested.store(true);
+    cts.requestStop();
+}
+
 } // namespace
 
 SSHProxy::SSHProxy(CancellationTokenSource &cts_) :
     cts(cts_) {
-    libssh2_init(0);
+    if (const int result = libssh2_init(0); result != 0) {
+        throw std::runtime_error(std::format("libssh2_init failed: {}", result));
+    }
 }
 
 SSHProxy::~SSHProxy() {
@@ -789,13 +891,14 @@ SSHProxy::~SSHProxy() {
 
 void SSHProxy::start(const ProxyConfig &proxyConfig,
                      const std::optional<StartCallback> &startCb,
-                     const std::optional<FinishCallback> &stopCb) {
+                     const std::optional<FinishCallback> &stopCb,
+                     const std::optional<ErrorCallback> &errorCb) {
     if (mainThread != std::nullopt) {
         throw std::runtime_error("Already started");
     }
     this->config = proxyConfig;
     isStopRequested = false;
-    mainThread = std::jthread([this, startCb, stopCb] { mainLoop(startCb, stopCb); });
+    mainThread = std::jthread([this, startCb, stopCb, errorCb] { mainLoop(startCb, stopCb, errorCb); });
 }
 
 void SSHProxy::requestStop() noexcept {
@@ -804,32 +907,78 @@ void SSHProxy::requestStop() noexcept {
 }
 
 void SSHProxy::waitForFinish() {
-    if (mainThread != std::nullopt) {
+    if (mainThread != std::nullopt && mainThread.value().joinable()) {
         mainThread.value().join();
     }
 }
 
-void SSHProxy::mainLoop(const std::optional<StartCallback> &startCb, const std::optional<FinishCallback> &stopCb) {
+void SSHProxy::mainLoop(const std::optional<StartCallback> &startCb,
+                        const std::optional<FinishCallback> &stopCb,
+                        const std::optional<ErrorCallback> &errorCb) {
+    std::exception_ptr failure;
     try {
         EpollScheduler sched(cts);
-        auto task = startServer(config.value(), proxyStats, isStopRequested);
-        // std::thread th([&c = cts] {
-        //     std::this_thread::sleep_for(std::chrono::microseconds(0));
-        //     c.requestStop();
-        // });
-        // th.detach();
-        task.start(sched);
-        log_d("SOCKS5 / HTTP CONNECT proxy started on port: {}\n", config.value().listenPort);
-        log_d("Proxy started. Press Ctrl+C to stop...\n");
-        if (startCb) {
-            startCb.value()();
+        const auto outcome = std::make_shared<ServerOutcome>();
+        auto supervisor = superviseServer(config.value(), proxyStats, isStopRequested, cts, outcome);
+        supervisor.startDetached(sched);
+
+        failure = outcome->getFailure();
+        if (failure == nullptr) {
+            try {
+                log_d("SOCKS5 / HTTP CONNECT proxy started on port: {}\n", config.value().listenPort);
+                log_d("Proxy started. Press Ctrl+C to stop...\n");
+                if (startCb) {
+                    startCb.value()();
+                }
+            } catch (...) {
+                failure = std::current_exception();
+                cts.requestStop();
+            }
         }
-        sched.run();
-        log_d("Proxy finished\n");
-        if (stopCb) {
+
+        try {
+            sched.run();
+        } catch (...) {
+            if (failure == nullptr) {
+                failure = std::current_exception();
+            }
+            cts.requestStop();
+        }
+        if (failure == nullptr) {
+            failure = outcome->getFailure();
+        }
+    } catch (...) {
+        failure = std::current_exception();
+    }
+
+    if (failure != nullptr) {
+        std::string message = "Unknown proxy failure";
+        try {
+            std::rethrow_exception(failure);
+        } catch (const std::exception &e) {
+            message = e.what();
+        } catch (...) {
+        }
+        log_e("Proxy exception: {}\n", message);
+        if (errorCb) {
+            try {
+                errorCb.value()(-1, message);
+            } catch (const std::exception &e) {
+                log_e("Error callback exception: {}\n", e.what());
+            } catch (...) {
+                log_e("Unknown error callback exception\n");
+            }
+        }
+    }
+
+    log_d("Proxy finished\n");
+    if (stopCb) {
+        try {
             stopCb.value()();
+        } catch (const std::exception &e) {
+            log_e("Finish callback exception: {}\n", e.what());
+        } catch (...) {
+            log_e("Unknown finish callback exception\n");
         }
-    } catch (std::exception &e) {
-        log_d("Exception: {}\n", e.what());
     }
 }

@@ -36,7 +36,7 @@ struct ProxyStats final {
 
 using StartCallback = std::function<void()>;
 using FinishCallback = std::function<void()>;
-using ErrorCallback = std::function<void(int)>;
+using ErrorCallback = std::function<void(int, const std::string &)>;
 
 class SSHProxy {
 public:
@@ -46,14 +46,17 @@ public:
 
     void start(const ProxyConfig &proxyConfig,
                const std::optional<StartCallback> &startCb,
-               const std::optional<FinishCallback> &stopCb);
+               const std::optional<FinishCallback> &stopCb,
+               const std::optional<ErrorCallback> &errorCb = std::nullopt);
 
     void requestStop() noexcept;
 
     void waitForFinish();
 
 private:
-    void mainLoop(const std::optional<StartCallback> &startCb, const std::optional<FinishCallback> &stopCb);
+    void mainLoop(const std::optional<StartCallback> &startCb,
+                  const std::optional<FinishCallback> &stopCb,
+                  const std::optional<ErrorCallback> &errorCb);
 
     std::optional<ProxyConfig> config;
     std::optional<std::jthread> mainThread;

@@ -182,7 +182,10 @@ Java_io_sshproxy_app_ProxyNative_nativeStart(JNIEnv *env, jobject /*thiz*/,
         };
         ctx->proxy->start(proxyConfig,
                           onProxyStarted,
-                          onProxyFinished);
+                          onProxyFinished,
+                          [](const int code, const std::string &message) {
+                              CallErrorMethodOnListener(code, message.c_str());
+                          });
     } catch (const std::exception &e) {
         env->ThrowNew(env->FindClass("java/lang/RuntimeException"), e.what());
     }

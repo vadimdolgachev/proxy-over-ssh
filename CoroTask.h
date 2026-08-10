@@ -354,8 +354,10 @@ public:
         try {
             scheduler.registerDetached(coro);
             coro.resume();
-        } catch (const std::exception &e) {
+        } catch (...) {
+            scheduler.unregisterDetached(coro);
             coro.destroy();
+            throw;
         }
     }
 
