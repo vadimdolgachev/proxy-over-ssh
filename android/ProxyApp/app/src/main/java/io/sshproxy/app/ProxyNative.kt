@@ -16,7 +16,7 @@ class ProxyNative: ProxyListener {
     private external fun nativeCreate(): Long
     private external fun nativeStart(
         handle: Long, sshHost: String, sshPort: Int,
-        sshUsername: String, privateKeyData: String?, listenPort: Int
+        sshUsername: String, privateKeyData: String?, hostKeySha256: String, listenPort: Int
     )
     private external fun nativeStop(handle: Long)
     private external fun nativeDestroy(handle: Long)
@@ -27,13 +27,13 @@ class ProxyNative: ProxyListener {
 
     fun start(
         sshHost: String, sshPort: Int,
-        sshUsername: String, privateKeyData: String?, listenPort: Int
+        sshUsername: String, privateKeyData: String?, hostKeySha256: String, listenPort: Int
     ) {
         if (handle == 0L) {
             handle = nativeCreate()
         }
         registerListener(this)
-        nativeStart(handle, sshHost, sshPort, sshUsername, privateKeyData, listenPort)
+        nativeStart(handle, sshHost, sshPort, sshUsername, privateKeyData, hostKeySha256, listenPort)
     }
 
     fun startTunnel(tunFd: Int, socksPort: Int) {

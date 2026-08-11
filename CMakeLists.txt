@@ -73,6 +73,8 @@ add_executable(proxy_over_ssh main.cpp
         CompletionSignal.h
         SshSessionHandler.h
         SshSessionHandler.cpp
+        SshHostKey.cpp
+        SshHostKey.h
         CancellationToken.cpp
         CancellationToken.h
         CoroTask.cpp
@@ -82,6 +84,7 @@ target_link_libraries(proxy_over_ssh PRIVATE
         OpenSSL::SSL
         libssh2
 )
+add_dependencies(proxy_over_ssh crypto ssl)
 target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion -Wsign-conversion -Wnull-dereference -Wno-unused-variable -Wno-unused-parameter -Wno-unused-private-field -Werror=uninitialized -Wno-unused-function -fno-omit-frame-pointer)
 
 #sudo sysctl vm.mmap_rnd_bits=30
@@ -141,4 +144,22 @@ if (PROXY_BUILD_TESTS AND NOT ANDROID)
             $<$<STREQUAL:${SANITIZER},thread>:-fsanitize=thread>
     )
     add_test(NAME http_connect COMMAND http_connect_test)
+
+    add_executable(ssh_host_key_test
+            tests/SshHostKeyTest.cpp
+            SshHostKey.cpp
+    )
+    target_include_directories(ssh_host_key_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(ssh_host_key_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_compile_options(ssh_host_key_test PRIVATE
+            $<$<STREQUAL:${SANITIZER},address>:-fsanitize=address>
+            $<$<STREQUAL:${SANITIZER},thread>:-fsanitize=thread>
+    )
+    target_link_options(ssh_host_key_test PRIVATE
+            $<$<STREQUAL:${SANITIZER},address>:-fsanitize=address>
+            $<$<STREQUAL:${SANITIZER},thread>:-fsanitize=thread>
+    )
+    target_link_libraries(ssh_host_key_test PRIVATE OpenSSL::Crypto)
+    add_dependencies(ssh_host_key_test crypto)
+    add_test(NAME ssh_host_key COMMAND ssh_host_key_test)
 endif ()

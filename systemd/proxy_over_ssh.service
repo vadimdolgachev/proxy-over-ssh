@@ -10,6 +10,7 @@ ExecStart=proxy_over_ssh \
   --ssh-user ${USER} \
   --ssh-host ${IP_ADDRESS} \
   --ssh-port 22 \
+  --ssh-host-key-sha256 ${SSH_HOST_KEY_SHA256} \
   --ssh-private-key ${SSH_PRIVATE_KEY} \
   --listen-port ${LISTEN_PORT}
 

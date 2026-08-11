@@ -83,6 +83,7 @@ namespace {
 
         const auto sshUser = requireStr("--ssh-user");
         const auto sshHost = requireStr("--ssh-host");
+        const auto sshHostKeySha256 = requireStr("--ssh-host-key-sha256");
         const auto sshPrivateKeyPath = requireStr("--ssh-private-key-path");
         const auto sshPrivateKey = requireStr("--ssh-private-key");
         const auto sshPort = parseUint16("--ssh-port");
@@ -93,6 +94,9 @@ namespace {
         }
         if (!sshHost) {
             return std::unexpected(sshHost.error());
+        }
+        if (!sshHostKeySha256) {
+            return std::unexpected(sshHostKeySha256.error());
         }
         if (!sshPrivateKey && !sshPrivateKeyPath) {
             return std::unexpected("Either --ssh-private-key or --ssh-private-key-path must be provided");
@@ -117,6 +121,7 @@ namespace {
                 .username = std::string(*sshUser),
                 .host = std::string(*sshHost),
                 .port = *sshPort,
+                .hostKeySha256 = std::string(*sshHostKeySha256),
                 .privateKeyPath = sshPrivateKeyPathOpt,
                 .privateKeyData = sshPrivateKeyOpt,
             },

@@ -170,6 +170,7 @@ class MainActivity : ComponentActivity() {
     private fun startProxyInternal() {
         val id = selectedProfileId ?: return
         val profile = profileStore.getProfile(id) ?: return
+        if (!SshProfile.isValidHostKeySha256(profile.hostKeySha256)) return
         val settings = settingsStore.getSettings()
 
         val intent = Intent(this, ProxyService::class.java).apply {
@@ -178,6 +179,7 @@ class MainActivity : ComponentActivity() {
             putExtra(ProxyService.EXTRA_PORT, profile.port)
             putExtra(ProxyService.EXTRA_USERNAME, profile.username)
             putExtra(ProxyService.EXTRA_KEY, profile.privateKeyBase64)
+            putExtra(ProxyService.EXTRA_HOST_KEY_SHA256, profile.hostKeySha256)
             putExtra(ProxyService.EXTRA_LISTEN_PORT, settings.socksPort)
             putExtra(ProxyService.EXTRA_VPN_MODE, settings.vpnMode)
             putExtra(ProxyService.EXTRA_DNS_ADDRESS, settings.dnsAddress)

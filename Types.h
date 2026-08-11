@@ -12,6 +12,7 @@ enum class ResultCode {
     ErrIO,
     ErrTimeout,
     ErrInvalidPrivateKey,
+    ErrHostKeyVerification,
     ErrUnknown,
 };
 

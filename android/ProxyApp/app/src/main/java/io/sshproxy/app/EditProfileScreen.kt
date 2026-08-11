@@ -47,6 +47,7 @@ fun EditProfileScreen(
     var port by rememberSaveable { mutableStateOf((profile?.port ?: 22).toString()) }
     var username by rememberSaveable { mutableStateOf(profile?.username ?: "") }
     var privateKey by rememberSaveable { mutableStateOf(profile?.privateKeyBase64 ?: "") }
+    var hostKeySha256 by rememberSaveable { mutableStateOf(profile?.hostKeySha256 ?: "") }
 
     val context = LocalContext.current
 
@@ -60,7 +61,8 @@ fun EditProfileScreen(
     }
 
     val normalizedKey = SshProfile.normalizeKey(privateKey)
-    val canSave = name.isNotBlank() && host.isNotBlank() && username.isNotBlank() && normalizedKey.isNotBlank()
+    val canSave = name.isNotBlank() && host.isNotBlank() && username.isNotBlank()
+        && normalizedKey.isNotBlank() && SshProfile.isValidHostKeySha256(hostKeySha256)
 
     Scaffold(
         topBar = {
@@ -114,6 +116,16 @@ fun EditProfileScreen(
                 singleLine = true,
             )
 
+            OutlinedTextField(
+                value = hostKeySha256,
+                onValueChange = { hostKeySha256 = it },
+                label = { Text("SSH Host Key SHA-256") },
+                supportingText = { Text("Example: SHA256:base64-fingerprint") },
+                isError = hostKeySha256.isNotBlank() && !SshProfile.isValidHostKeySha256(hostKeySha256),
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+            )
+
             Spacer(modifier = Modifier.height(4.dp))
 
             Text("Private Key", style = MaterialTheme.typography.titleSmall)
@@ -150,6 +162,7 @@ fun EditProfileScreen(
                             port = parsedPort,
                             username = username,
                             privateKeyBase64 = normalizedKey,
+                            hostKeySha256 = hostKeySha256.trim(),
                         )
                     )
                 },

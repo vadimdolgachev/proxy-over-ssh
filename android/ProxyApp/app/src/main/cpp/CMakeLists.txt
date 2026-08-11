@@ -104,6 +104,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         ${PROXY_OVER_SSH_DIR}/Socket.cpp
         ${PROXY_OVER_SSH_DIR}/SshSocket.cpp
         ${PROXY_OVER_SSH_DIR}/SshSessionHandler.cpp
+        ${PROXY_OVER_SSH_DIR}/SshHostKey.cpp
         ${PROXY_OVER_SSH_DIR}/Endpoint.cpp
         ${PROXY_OVER_SSH_DIR}/HttpConnect.cpp
         ${PROXY_OVER_SSH_DIR}/SessionPool.cpp
@@ -157,6 +158,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
         libssh2
         dl z log android
 )
+add_dependencies(${CMAKE_PROJECT_NAME} crypto ssl)
 
 target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
         -Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -Wno-unused-private-field

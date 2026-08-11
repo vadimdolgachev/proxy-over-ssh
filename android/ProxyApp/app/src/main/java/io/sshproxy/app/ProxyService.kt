@@ -33,6 +33,7 @@ class ProxyService : VpnService() {
         const val EXTRA_PORT = "ssh_port"
         const val EXTRA_USERNAME = "ssh_username"
         const val EXTRA_KEY = "ssh_key"
+        const val EXTRA_HOST_KEY_SHA256 = "ssh_host_key_sha256"
         const val EXTRA_LISTEN_PORT = "listen_port"
         const val EXTRA_VPN_MODE = "vpn_mode"
         const val EXTRA_DNS_ADDRESS = "dns_address"
@@ -73,6 +74,7 @@ class ProxyService : VpnService() {
                     intent.getIntExtra(EXTRA_PORT, 22),
                     intent.getStringExtra(EXTRA_USERNAME) ?: return START_NOT_STICKY,
                     intent.getStringExtra(EXTRA_KEY),
+                    intent.getStringExtra(EXTRA_HOST_KEY_SHA256) ?: return START_NOT_STICKY,
                     listenPort
                 )
 

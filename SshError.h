@@ -15,6 +15,7 @@ namespace SshError {
             case ResultCode::ErrIO: return "ErrIO";
             case ResultCode::ErrTimeout: return "ErrTimeout";
             case ResultCode::ErrInvalidPrivateKey: return "ErrInvalidPrivateKey";
+            case ResultCode::ErrHostKeyVerification: return "ErrHostKeyVerification";
             case ResultCode::ErrUnknown: return "ErrUnknown";
             default: return "Unknown ResultCode";
         }

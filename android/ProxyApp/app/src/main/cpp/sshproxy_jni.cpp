@@ -143,6 +143,7 @@ Java_io_sshproxy_app_ProxyNative_nativeStart(JNIEnv *env, jobject /*thiz*/,
                                              jint sshPort,
                                              jstring sshUsername,
                                              jstring privateKeyData,
+                                             jstring hostKeySha256,
                                              jint listenPort) {
     if (handle == 0) {
         env->ThrowNew(env->FindClass("java/lang/IllegalArgumentException"), "Invalid handle");
@@ -155,11 +156,13 @@ Java_io_sshproxy_app_ProxyNative_nativeStart(JNIEnv *env, jobject /*thiz*/,
     const char *userStr = env->GetStringUTFChars(sshUsername, nullptr);
     const char *keyStr =
             privateKeyData != nullptr ? env->GetStringUTFChars(privateKeyData, nullptr) : nullptr;
+    const char *hostKeySha256Str = env->GetStringUTFChars(hostKeySha256, nullptr);
 
     SSHConfig sshConfig;
     sshConfig.host = hostStr;
     sshConfig.port = static_cast<uint16_t>(sshPort);
     sshConfig.username = userStr;
+    sshConfig.hostKeySha256 = hostKeySha256Str;
     if (keyStr != nullptr) {
         sshConfig.privateKeyData = normalizeKeyData(std::string(keyStr));
     }
@@ -170,6 +173,7 @@ Java_io_sshproxy_app_ProxyNative_nativeStart(JNIEnv *env, jobject /*thiz*/,
     if (keyStr != nullptr) {
         env->ReleaseStringUTFChars(privateKeyData, keyStr);
     }
+    env->ReleaseStringUTFChars(hostKeySha256, hostKeySha256Str);
 
     try {
         const auto factory = [sshConfig, sessionPool = ctx->sessionPool](

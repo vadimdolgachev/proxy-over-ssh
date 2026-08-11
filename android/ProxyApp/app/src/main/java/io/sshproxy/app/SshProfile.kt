@@ -13,6 +13,7 @@ data class SshProfile(
     val port: Int = 22,
     val username: String,
     val privateKeyBase64: String,
+    val hostKeySha256: String = "",
 ) {
     fun toJson(): JSONObject {
         return JSONObject().apply {
@@ -22,6 +23,7 @@ data class SshProfile(
             put("port", port)
             put("username", username)
             put("privateKeyBase64", privateKeyBase64)
+            put("hostKeySha256", hostKeySha256)
         }
     }
 
@@ -34,6 +36,7 @@ data class SshProfile(
                 port = json.getInt("port"),
                 username = json.getString("username"),
                 privateKeyBase64 = json.getString("privateKeyBase64"),
+                hostKeySha256 = json.optString("hostKeySha256"),
             )
         }
 
@@ -52,6 +55,11 @@ data class SshProfile(
             }
 
             return text.trim()
+        }
+
+        fun isValidHostKeySha256(fingerprint: String): Boolean {
+            val digest = fingerprint.trim().removePrefix("SHA256:").removeSuffix("=")
+            return digest.length == 43 && digest.all { it.isLetterOrDigit() || it == '+' || it == '/' }
         }
     }
 }

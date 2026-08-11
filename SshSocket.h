@@ -17,6 +17,7 @@
 #include "Endpoint.h"
 #include "SSHProxy.h"
 #include "SessionPool.h"
+#include "SshHostKey.h"
 #include "SshSessionHandler.h"
 
 class SshSocket;
@@ -31,6 +32,7 @@ public:
         DISCONNECTED,
         TCP_CONNECTED,
         SSH_HANDSHAKE,
+        SSH_HOST_VERIFIED,
         SSH_AUTHENTICATED,
         CHANNEL_CREATED,
         ERROR
@@ -65,13 +67,15 @@ private:
 
     ResultCode performHandshake();
 
+    ResultCode verifyHostKey();
+
     ResultCode performAuthentication();
 
     ResultCode createChannel();
 
-    int getBlockDirections() const;
+    [[nodiscard]] uint32_t getPollEvents(uint32_t defaultEvents) const;
 
-    static uint32_t computePollEvents(int directions, uint32_t defaultEvents);
+    static uint32_t computePollEvents(int directions, uint32_t defaultEvents) noexcept;
 
     ResultCode advanceConnection();
 
@@ -85,13 +89,14 @@ private:
 
     std::shared_ptr<SessionPool> sessionPool;
     SSHConfig sshConfig;
+    SshHostKey::Sha256Digest expectedHostKeySha256 = {};
     Endpoint sshServerEndpoint;
     std::optional<SshSessionHandler> sessionHandle;
     LIBSSH2_CHANNEL *libSsh2Channel = nullptr;
     int pendingDirections = 0;
     State connectionState = State::DISCONNECTED;
     Endpoint targetEndpoint;
-    std::mutex sshMutex;
+    mutable std::mutex sshMutex;
 };
 
 struct SshSocketAwaiterBase : SchedulerAware<EpollScheduler> {
@@ -99,9 +104,7 @@ protected:
     SshSocketAwaiterBase(std::shared_ptr<SshSocket> socket_,
                          const CancellationTokenOpt &cancellationToken_);
 
-    [[nodiscard]] uint32_t computePollEvents(uint32_t defaultEvents) const;
-
-    void onSuspend(std::coroutine_handle<> h, uint32_t defaultEvents);
+    void onSuspend(std::coroutine_handle<> h, uint32_t events);
 
     void onResume();
 
@@ -115,7 +118,7 @@ struct SshConnectAwaiter final : SshSocketAwaiterBase {
                       Endpoint targetEndpoint_,
                       const CancellationTokenOpt &cancellationToken_);
 
-    [[nodiscard]] bool await_ready() const noexcept;
+    [[nodiscard]] bool await_ready() const;
 
     void await_suspend(std::coroutine_handle<> h);
 
@@ -128,13 +131,17 @@ private:
 
 struct SshFdWaitAwaiter final : SshSocketAwaiterBase {
     SshFdWaitAwaiter(std::shared_ptr<SshSocket> socket_,
-                     const CancellationTokenOpt &cancellationToken_);
+                     const CancellationTokenOpt &cancellationToken_,
+                     uint32_t events_);
 
     [[nodiscard]] bool await_ready() const noexcept;
 
     void await_suspend(std::coroutine_handle<> h);
 
     void await_resume();
+
+private:
+    uint32_t events;
 };
 
 using SshSocketPtr = std::shared_ptr<SshSocket>;

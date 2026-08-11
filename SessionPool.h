@@ -27,7 +27,7 @@ public:
 
     std::optional<SshSessionHandler> acquire();
 
-    void release(SshSessionHandler handler);
+    [[nodiscard]] bool release(SshSessionHandler handler) noexcept;
 
     void cleanup();
 

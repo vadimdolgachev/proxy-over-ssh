@@ -18,6 +18,7 @@ struct SSHConfig final {
     std::string username;
     std::string host;
     std::uint16_t port;
+    std::string hostKeySha256;
     std::optional<std::string> privateKeyPath = {};
     std::optional<std::string> privateKeyData = {};
 };

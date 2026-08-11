@@ -52,17 +52,18 @@ ResultCode SshSocket::handleLibSsh2ChannelResult(const LIBSSH2_CHANNEL *const ch
     return ResultCode::Ok;
 }
 
-int SshSocket::getBlockDirections() const {
+uint32_t SshSocket::getPollEvents(const uint32_t defaultEvents) const {
+    std::lock_guard lock(sshMutex);
     if (pendingDirections != 0) {
-        return pendingDirections;
+        return computePollEvents(pendingDirections, defaultEvents);
     }
     if (sessionHandle && sessionHandle->sshSession) {
-        return sessionHandle->sshSession->blockDirections();
+        return computePollEvents(sessionHandle->sshSession->blockDirections(), defaultEvents);
     }
-    return 0;
+    return defaultEvents;
 }
 
-uint32_t SshSocket::computePollEvents(const int directions, const uint32_t defaultEvents) {
+uint32_t SshSocket::computePollEvents(const int directions, const uint32_t defaultEvents) noexcept {
     uint32_t events = 0;
     if (directions & LIBSSH2_SESSION_BLOCK_INBOUND) {
         events |= EpollScheduler::PollIn;
@@ -103,6 +104,12 @@ ResultCode SshSocket::tryConnectNonBlocking() {
 SshSocket::SshSocket(SSHConfig sshConfig_, const std::shared_ptr<SessionPool> &sessionPool_) :
     sessionPool(sessionPool_),
     sshConfig(std::move(sshConfig_)) {
+    const auto fingerprint = SshHostKey::parseSha256Fingerprint(sshConfig.hostKeySha256);
+    if (!fingerprint) {
+        throw std::invalid_argument(fingerprint.error());
+    }
+    expectedHostKeySha256 = *fingerprint;
+
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(sshConfig.port);
@@ -188,6 +195,15 @@ ResultCode SshSocket::advanceConnection() {
             return rc;
         }
         case State::SSH_HANDSHAKE: {
+            const auto rc = verifyHostKey();
+            if (rc == ResultCode::Ok) {
+                connectionState = State::SSH_HOST_VERIFIED;
+            } else {
+                connectionState = State::ERROR;
+            }
+            return rc;
+        }
+        case State::SSH_HOST_VERIFIED: {
             const auto rc = performAuthentication();
             if (rc == ResultCode::Ok) {
                 connectionState = State::SSH_AUTHENTICATED;
@@ -214,6 +230,7 @@ ResultCode SshSocket::advanceConnection() {
 }
 
 ResultCode SshSocket::performHandshake() {
+    std::lock_guard lock(sshMutex);
     if (sessionHandle->sshSession == nullptr) {
         try {
             sessionHandle->sshSession = std::make_unique<SshSession>();
@@ -226,7 +243,27 @@ ResultCode SshSocket::performHandshake() {
     return handleLibSsh2Result(rc, "performHandshake");
 }
 
+ResultCode SshSocket::verifyHostKey() {
+    std::lock_guard lock(sshMutex);
+    if (!sessionHandle || sessionHandle->sshSession == nullptr) {
+        return ResultCode::ErrHostKeyVerification;
+    }
+
+    size_t hostKeySize = 0;
+    int hostKeyType = 0;
+    if (const char *const hostKey =
+                libssh2_session_hostkey(sessionHandle->sshSession->raw(), &hostKeySize, &hostKeyType);
+        hostKey == nullptr || hostKeySize == 0 ||
+        !SshHostKey::matchesSha256(std::span{reinterpret_cast<const std::uint8_t *>(hostKey), hostKeySize},
+                                   expectedHostKeySha256)) {
+        log_e("SSH host-key verification failed for {}:{}\n", sshConfig.host, sshConfig.port);
+        return ResultCode::ErrHostKeyVerification;
+    }
+    return ResultCode::Ok;
+}
+
 ResultCode SshSocket::performAuthentication() {
+    std::lock_guard lock(sshMutex);
     if (sessionHandle->sshSession == nullptr) {
         return ResultCode::ErrUnknown;
     }
@@ -256,6 +293,7 @@ ResultCode SshSocket::performAuthentication() {
 }
 
 ResultCode SshSocket::createChannel() {
+    std::lock_guard lock(sshMutex);
     if (sessionHandle->sshSession == nullptr) {
         return ResultCode::ErrUnknown;
     }
@@ -295,19 +333,22 @@ CoroTask<ResultCode> SshSocket::connectAsync(const Endpoint &targetEndpoint_, Ca
 
 CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer, CancellationTokenOpt ct) {
     while (true) {
-        if (libSsh2Channel == nullptr) {
-            co_return 0;
-        }
-
         ssize_t n;
         bool eof;
+        uint32_t waitEvents = EpollScheduler::PollIn;
         {
             std::lock_guard lock(sshMutex);
+            if (libSsh2Channel == nullptr) {
+                co_return 0;
+            }
             n = libssh2_channel_read(libSsh2Channel,
                                      reinterpret_cast<char *>(buffer.data()),
                                      buffer.size());
             eof = n <= 0 && libssh2_channel_eof(libSsh2Channel) != 0;
-            if (sessionHandle && sessionHandle->sshSession) {
+            if (n == LIBSSH2_ERROR_EAGAIN && sessionHandle && sessionHandle->sshSession) {
+                waitEvents = computePollEvents(sessionHandle->sshSession->blockDirections(),
+                                               EpollScheduler::PollIn);
+            } else if (n > 0 && sessionHandle && sessionHandle->sshSession) {
                 libssh2_keepalive_send(sessionHandle->sshSession->raw(), nullptr);
             }
         }
@@ -321,8 +362,13 @@ CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer, CancellationTok
         }
 
         if (n == LIBSSH2_ERROR_EAGAIN) {
-            co_await SshFdWaitAwaiter{shared_from_this(), ct};
+            co_await SshFdWaitAwaiter{shared_from_this(), ct, waitEvents};
             continue;
+        }
+
+        {
+            std::lock_guard lock(sshMutex);
+            connectionState = State::ERROR;
         }
 
         int sockErr = 0;
@@ -336,19 +382,22 @@ CoroTask<size_t> SshSocket::readAsync(std::span<uint8_t> buffer, CancellationTok
 
 CoroTask<size_t> SshSocket::writeAsync(const std::span<const uint8_t> data, CancellationTokenOpt ct) {
     while (true) {
-        if (libSsh2Channel == nullptr) {
-            co_return 0;
-        }
-
         ssize_t n;
         bool eof;
+        uint32_t waitEvents = EpollScheduler::PollOut;
         {
             std::lock_guard lock(sshMutex);
+            if (libSsh2Channel == nullptr) {
+                co_return 0;
+            }
             n = libssh2_channel_write(libSsh2Channel,
                                       reinterpret_cast<const char *>(data.data()),
                                       data.size());
             eof = n == LIBSSH2_ERROR_EAGAIN && libssh2_channel_eof(libSsh2Channel) != 0;
-            if (sessionHandle && sessionHandle->sshSession) {
+            if (n == LIBSSH2_ERROR_EAGAIN && sessionHandle && sessionHandle->sshSession) {
+                waitEvents = computePollEvents(sessionHandle->sshSession->blockDirections(),
+                                               EpollScheduler::PollOut);
+            } else if (n > 0 && sessionHandle && sessionHandle->sshSession) {
                 libssh2_keepalive_send(sessionHandle->sshSession->raw(), nullptr);
             }
         }
@@ -362,8 +411,13 @@ CoroTask<size_t> SshSocket::writeAsync(const std::span<const uint8_t> data, Canc
         }
 
         if (n == LIBSSH2_ERROR_EAGAIN) {
-            co_await SshFdWaitAwaiter{shared_from_this(), ct};
+            co_await SshFdWaitAwaiter{shared_from_this(), ct, waitEvents};
             continue;
+        }
+
+        {
+            std::lock_guard lock(sshMutex);
+            connectionState = State::ERROR;
         }
 
         int sockErr = 0;
@@ -376,47 +430,72 @@ CoroTask<size_t> SshSocket::writeAsync(const std::span<const uint8_t> data, Canc
 }
 
 int SshSocket::fd() const noexcept {
-    if (sessionHandle != std::nullopt && sessionHandle->tcpSocket != nullptr) {
-        return sessionHandle->tcpSocket->fd();
+    try {
+        std::lock_guard lock(sshMutex);
+        if (sessionHandle != std::nullopt && sessionHandle->tcpSocket != nullptr) {
+            return sessionHandle->tcpSocket->fd();
+        }
+    } catch (...) {
     }
     return -1;
 }
 
 bool SshSocket::isEof() const noexcept {
-    if (libSsh2Channel == nullptr) {
+    try {
+        std::lock_guard lock(sshMutex);
+        if (libSsh2Channel == nullptr) {
+            return true;
+        }
+        return libssh2_channel_eof(libSsh2Channel) != 0;
+    } catch (...) {
         return true;
     }
-    const int eof = libssh2_channel_eof(libSsh2Channel);
-    return eof != 0;
 }
 
 
 void SshSocket::close() noexcept {
-    if (libSsh2Channel != nullptr) {
+    std::optional<SshSessionHandler> handleToRelease;
+    bool reusable = false;
+    try {
         std::lock_guard lock(sshMutex);
-        libssh2_channel_close(libSsh2Channel);
-        libssh2_channel_free(libSsh2Channel);
+        reusable = connectionState == State::CHANNEL_CREATED;
+        if (libSsh2Channel != nullptr) {
+            const int closeResult = libssh2_channel_close(libSsh2Channel);
+            const int freeResult = libssh2_channel_free(libSsh2Channel);
+            reusable = reusable && closeResult == 0 && freeResult == 0;
+            libSsh2Channel = nullptr;
+        }
+
+        if (sessionHandle) {
+            handleToRelease = std::move(*sessionHandle);
+            sessionHandle.reset();
+        }
+        connectionState = State::DISCONNECTED;
+        pendingDirections = 0;
+    } catch (...) {
+        reusable = false;
         libSsh2Channel = nullptr;
+        try {
+            if (sessionHandle) {
+                handleToRelease = std::move(*sessionHandle);
+                sessionHandle.reset();
+            }
+        } catch (...) {
+        }
+        connectionState = State::DISCONNECTED;
+        pendingDirections = 0;
     }
 
-    if (sessionHandle == std::nullopt) {
+    if (!handleToRelease) {
         return;
     }
-
-    if (sessionPool != nullptr && connectionState != State::ERROR) {
-        sessionPool->release(std::move(sessionHandle.value()));
-    } else {
-        if (sessionHandle->tcpSocket != nullptr) {
-            shutdown(sessionHandle->tcpSocket->fd(), SHUT_RDWR);
-        }
-        if (sessionPool != nullptr) {
-            sessionPool->invalidate(*sessionHandle);
-        }
+    if (reusable && sessionPool != nullptr) {
+        std::ignore = sessionPool->release(std::move(*handleToRelease));
+        return;
     }
-
-    sessionHandle = std::nullopt;
-    connectionState = State::DISCONNECTED;
-    pendingDirections = 0;
+    if (handleToRelease->tcpSocket != nullptr) {
+        shutdown(handleToRelease->tcpSocket->fd(), SHUT_RDWR);
+    }
 }
 
 SshSocketAwaiterBase::SshSocketAwaiterBase(std::shared_ptr<SshSocket> socket_,
@@ -425,33 +504,39 @@ SshSocketAwaiterBase::SshSocketAwaiterBase(std::shared_ptr<SshSocket> socket_,
     cancellationToken(cancellationToken_) {
 }
 
-uint32_t SshSocketAwaiterBase::computePollEvents(const uint32_t defaultEvents) const {
-    const int directions = socket->getBlockDirections();
-    return SshSocket::computePollEvents(directions, defaultEvents);
-}
-
-void SshSocketAwaiterBase::onSuspend(const std::coroutine_handle<> h, const uint32_t defaultEvents) {
+void SshSocketAwaiterBase::onSuspend(const std::coroutine_handle<> h, uint32_t events) {
     assert(getScheduler() != nullptr);
     handle = h;
-    uint32_t events = computePollEvents(defaultEvents);
     events |= EpollScheduler::PollErr | EpollScheduler::PollHUp;
-    if (cancellationToken) {
-        if (cancellationToken->isStopped()) {
-            getScheduler()->remove(socket->fd(), handle);
-            throw CancellationTokenException();
-        }
-        getScheduler()->add(EpollScheduler::PollIn, cancellationToken->getFd(), h);
+    bool cancellationRegistered = false;
+    if (cancellationToken && cancellationToken->isStopped()) {
+        throw CancellationTokenException();
     }
-    getScheduler()->add(events, socket->fd(), h);
+    try {
+        if (cancellationToken) {
+            getScheduler()->add(EpollScheduler::PollIn, cancellationToken->getFd(), h);
+            cancellationRegistered = true;
+        }
+        getScheduler()->add(events, socket->fd(), h);
+    } catch (...) {
+        getScheduler()->rollbackAdd(socket->fd(), h);
+        if (cancellationRegistered) {
+            getScheduler()->rollbackAdd(cancellationToken->getFd(), h);
+        }
+        handle = nullptr;
+        throw;
+    }
 }
 
 void SshSocketAwaiterBase::onResume() {
-    if (cancellationToken && handle) {
-        getScheduler()->remove(cancellationToken->getFd(), handle);
+    if (handle) {
+        getScheduler()->rollbackAdd(socket->fd(), handle);
+        if (cancellationToken) {
+            getScheduler()->rollbackAdd(cancellationToken->getFd(), handle);
+        }
     }
     if (cancellationToken && cancellationToken->isStopped()) {
         cancellationToken->drain();
-        getScheduler()->remove(socket->fd(), handle);
         throw CancellationTokenException();
     }
 }
@@ -463,7 +548,7 @@ SshConnectAwaiter::SshConnectAwaiter(std::shared_ptr<SshSocket> socket_,
     targetEndpoint(std::move(targetEndpoint_)) {
 }
 
-bool SshConnectAwaiter::await_ready() const noexcept {
+bool SshConnectAwaiter::await_ready() const {
     if (socket->connectionState == SshSocket::State::CHANNEL_CREATED) {
         return true;
     }
@@ -484,7 +569,7 @@ bool SshConnectAwaiter::await_ready() const noexcept {
 }
 
 void SshConnectAwaiter::await_suspend(const std::coroutine_handle<> h) {
-    onSuspend(h, EpollScheduler::PollIn | EpollScheduler::PollRdHUp);
+    onSuspend(h, socket->getPollEvents(EpollScheduler::PollIn | EpollScheduler::PollRdHUp));
 }
 
 void SshConnectAwaiter::await_resume() {
@@ -496,8 +581,10 @@ void SshConnectAwaiter::await_resume() {
 }
 
 SshFdWaitAwaiter::SshFdWaitAwaiter(std::shared_ptr<SshSocket> socket_,
-                                   const CancellationTokenOpt &cancellationToken_) :
-    SshSocketAwaiterBase(std::move(socket_), cancellationToken_) {
+                                   const CancellationTokenOpt &cancellationToken_,
+                                   const uint32_t events_) :
+    SshSocketAwaiterBase(std::move(socket_), cancellationToken_),
+    events(events_) {
 }
 
 bool SshFdWaitAwaiter::await_ready() const noexcept {
@@ -508,7 +595,7 @@ bool SshFdWaitAwaiter::await_ready() const noexcept {
 }
 
 void SshFdWaitAwaiter::await_suspend(const std::coroutine_handle<> h) {
-    onSuspend(h, EpollScheduler::PollIn);
+    onSuspend(h, events);
 }
 
 void SshFdWaitAwaiter::await_resume() {

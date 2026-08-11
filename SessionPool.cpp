@@ -50,17 +50,26 @@ std::optional<SshSessionHandler> SessionPool::acquire() {
     return std::nullopt;
 }
 
-void SessionPool::release(SshSessionHandler handler) {
-    std::lock_guard lock(mutex);
-    if (handler.sshSession == nullptr || handler.tcpSocket == nullptr) {
-        log_v("SessionPool: Discarding empty session\n");
-        return;
-    }
+bool SessionPool::release(SshSessionHandler handler) noexcept {
+    try {
+        std::lock_guard lock(mutex);
+        if (handler.sshSession == nullptr || handler.tcpSocket == nullptr) {
+            log_v("SessionPool: Discarding empty session\n");
+            return false;
+        }
+        if (maxSessions == 0) {
+            return false;
+        }
 
-    if (sessions.size() > maxSessions) {
-        sessions.pop_front();
+        if (sessions.size() >= maxSessions) {
+            sessions.pop_front();
+        }
+        sessions.push_back(std::move(handler));
+        return true;
+    } catch (...) {
+        log_e("SessionPool: failed to release session\n");
+        return false;
     }
-    sessions.push_back(std::move(handler));
 }
 
 void SessionPool::cleanup() {
