@@ -1,0 +1,3 @@
+[submodule "third_party/coro_lite"]
+	path = third_party/coro_lite
+	url = https://github.com/vadimdolgachev/coro_lite

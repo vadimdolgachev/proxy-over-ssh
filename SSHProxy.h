@@ -41,7 +41,7 @@ using ErrorCallback = std::function<void(int, const std::string &)>;
 
 class SSHProxy {
 public:
-    explicit SSHProxy(CancellationTokenSource &cts_);
+    explicit SSHProxy(CoroLite::CancellationTokenSource &cts_);
 
     ~SSHProxy();
 
@@ -61,7 +61,7 @@ private:
 
     std::optional<ProxyConfig> config;
     std::optional<std::jthread> mainThread;
-    CancellationTokenSource &cts;
+    CoroLite::CancellationTokenSource &cts;
     std::shared_ptr<ProxyStats> proxyStats = std::make_shared<ProxyStats>();
     std::atomic_bool isStopRequested = true;
     std::unique_ptr<std::jthread> proxyStatsThread;

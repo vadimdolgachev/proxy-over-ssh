@@ -5,6 +5,8 @@
 #include "SshSessionHandler.h"
 #include "Constants.h"
 
+using namespace CoroLite;
+
 SshSession::SshSession() : libSsh2Session(libssh2_session_init()) {
     if (libSsh2Session == nullptr) {
         throw std::runtime_error("libssh2_session_init() failed");

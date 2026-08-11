@@ -14,6 +14,8 @@
 #include "SessionPool.h"
 #include "SshSocket.h"
 
+using namespace CoroLite;
+
 namespace {
     std::string parsePrivateKey(const std::string_view privateKey) {
         using namespace std::string_view_literals;

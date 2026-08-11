@@ -17,6 +17,8 @@
 #include "SshSocket.h"
 #include "Types.h"
 
+using namespace CoroLite;
+
 ResultCode SshSocket::handleLibSsh2Result(const int rc, const char *operation) {
     if (rc == LIBSSH2_ERROR_EAGAIN) {
         if (sessionHandle && sessionHandle->sshSession) {

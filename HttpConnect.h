@@ -27,7 +27,7 @@ namespace HttpConnect {
     };
 
     struct Request final {
-        Endpoint target;
+        CoroLite::Endpoint target;
         size_t headerSize = 0;
     };
 

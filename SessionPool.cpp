@@ -11,6 +11,8 @@
 #include "Logger.h"
 #include "Socket.h"
 
+using namespace CoroLite;
+
 SessionPool::SessionPool(const size_t maxSessions_) : maxSessions(maxSessions_) {
     log_d("SessionPool created with max {} sessions\n", maxSessions);
 }

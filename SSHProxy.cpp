@@ -32,6 +32,8 @@
 #include "Socket.h"
 #include "Types.h"
 
+using namespace CoroLite;
+
 namespace {
     enum class ClientProtocol {
         Unknown,

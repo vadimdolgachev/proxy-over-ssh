@@ -17,11 +17,13 @@ class IBackendSocket {
 public:
     virtual ~IBackendSocket() = default;
 
-    virtual CoroTask<size_t> readAsync(std::span<uint8_t> buffer, CancellationTokenOpt ct) = 0;
+    virtual CoroLite::CoroTask<size_t> readAsync(std::span<uint8_t> buffer, CoroLite::CancellationTokenOpt ct) = 0;
 
-    virtual CoroTask<size_t> writeAsync(std::span<const uint8_t> data, CancellationTokenOpt ct) = 0;
+    virtual CoroLite::CoroTask<size_t> writeAsync(std::span<const uint8_t> data,
+                                                  CoroLite::CancellationTokenOpt ct) = 0;
 
-    virtual CoroTask<ResultCode> connectAsync(const Endpoint &target, CancellationTokenOpt ct) = 0;
+    virtual CoroLite::CoroTask<ResultCode> connectAsync(const CoroLite::Endpoint &target,
+                                                        CoroLite::CancellationTokenOpt ct) = 0;
 
     [[nodiscard]] virtual bool isEof() const = 0;
 
@@ -31,6 +33,6 @@ public:
 };
 
 using BackendSocketPtr = std::shared_ptr<IBackendSocket>;
-using BackendFactory = std::function<BackendSocketPtr(const Endpoint &target)>;
+using BackendFactory = std::function<BackendSocketPtr(const CoroLite::Endpoint &target)>;
 
 #endif //PROXY_OVER_SSH_BACKENDSOCKET_H

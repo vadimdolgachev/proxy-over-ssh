@@ -97,10 +97,11 @@ namespace SshError {
             return;
         }
         if (context.empty()) {
-            log_e("ERROR: {} libssh2 error: {} ({})\n", operation, libSsh2Error, libSsh2ErrorToString(libSsh2Error));
+            CoroLite::log_e("ERROR: {} libssh2 error: {} ({})\n", operation, libSsh2Error,
+                            libSsh2ErrorToString(libSsh2Error));
         } else {
-            log_e("ERROR: {} libssh2 error: {} ({}), context: {}\n", operation, libSsh2Error,
-                  libSsh2ErrorToString(libSsh2Error), context);
+            CoroLite::log_e("ERROR: {} libssh2 error: {} ({}), context: {}\n", operation, libSsh2Error,
+                            libSsh2ErrorToString(libSsh2Error), context);
         }
     }
 
@@ -111,9 +112,9 @@ namespace SshError {
             return;
         }
         if (context.empty()) {
-            log_e("ERROR: {} result: {}\n", operation, toString(rc));
+            CoroLite::log_e("ERROR: {} result: {}\n", operation, toString(rc));
         } else {
-            log_e("ERROR: {} result: {}, context: {}\n", operation, toString(rc), context);
+            CoroLite::log_e("ERROR: {} result: {}, context: {}\n", operation, toString(rc), context);
         }
     }
 } // namespace SshError

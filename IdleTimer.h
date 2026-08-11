@@ -27,7 +27,7 @@ public:
 
 private:
     const std::chrono::seconds timeout;
-    Timer timer;
+    CoroLite::Timer timer;
 };
 
 // NOLINTBEGIN(readability-make-member-function-const)

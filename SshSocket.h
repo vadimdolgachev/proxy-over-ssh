@@ -46,11 +46,14 @@ public:
 
     ~SshSocket() override;
 
-    [[nodiscard]] CoroTask<ResultCode> connectAsync(const Endpoint &targetEndpoint_, CancellationTokenOpt ct) override;
+    [[nodiscard]] CoroLite::CoroTask<ResultCode> connectAsync(const CoroLite::Endpoint &targetEndpoint_,
+                                                              CoroLite::CancellationTokenOpt ct) override;
 
-    [[nodiscard]] CoroTask<size_t> readAsync(std::span<uint8_t> buffer, CancellationTokenOpt ct) override;
+    [[nodiscard]] CoroLite::CoroTask<size_t> readAsync(std::span<uint8_t> buffer,
+                                                       CoroLite::CancellationTokenOpt ct) override;
 
-    [[nodiscard]] CoroTask<size_t> writeAsync(std::span<const uint8_t> data, CancellationTokenOpt ct) override;
+    [[nodiscard]] CoroLite::CoroTask<size_t> writeAsync(std::span<const uint8_t> data,
+                                                        CoroLite::CancellationTokenOpt ct) override;
 
     [[nodiscard]] int fd() const noexcept override;
 
@@ -90,33 +93,33 @@ private:
     std::shared_ptr<SessionPool> sessionPool;
     SSHConfig sshConfig;
     SshHostKey::Sha256Digest expectedHostKeySha256 = {};
-    Endpoint sshServerEndpoint;
+    CoroLite::Endpoint sshServerEndpoint;
     std::optional<SshSessionHandler> sessionHandle;
     LIBSSH2_CHANNEL *libSsh2Channel = nullptr;
     int pendingDirections = 0;
     State connectionState = State::DISCONNECTED;
-    Endpoint targetEndpoint;
+    CoroLite::Endpoint targetEndpoint;
     mutable std::mutex sshMutex;
 };
 
-struct SshSocketAwaiterBase : SchedulerAware<EpollScheduler> {
+struct SshSocketAwaiterBase : CoroLite::SchedulerAware<CoroLite::EpollScheduler> {
 protected:
     SshSocketAwaiterBase(std::shared_ptr<SshSocket> socket_,
-                         const CancellationTokenOpt &cancellationToken_);
+                         const CoroLite::CancellationTokenOpt &cancellationToken_);
 
     void onSuspend(std::coroutine_handle<> h, uint32_t events);
 
     void onResume();
 
     std::shared_ptr<SshSocket> socket;
-    const CancellationTokenOpt &cancellationToken;
+    const CoroLite::CancellationTokenOpt &cancellationToken;
     std::coroutine_handle<> handle;
 };
 
 struct SshConnectAwaiter final : SshSocketAwaiterBase {
     SshConnectAwaiter(std::shared_ptr<SshSocket> socket_,
-                      Endpoint targetEndpoint_,
-                      const CancellationTokenOpt &cancellationToken_);
+                      CoroLite::Endpoint targetEndpoint_,
+                      const CoroLite::CancellationTokenOpt &cancellationToken_);
 
     [[nodiscard]] bool await_ready() const;
 
@@ -125,13 +128,13 @@ struct SshConnectAwaiter final : SshSocketAwaiterBase {
     void await_resume();
 
 private:
-    Endpoint targetEndpoint;
+    CoroLite::Endpoint targetEndpoint;
     mutable int connectErrno = 0;
 };
 
 struct SshFdWaitAwaiter final : SshSocketAwaiterBase {
     SshFdWaitAwaiter(std::shared_ptr<SshSocket> socket_,
-                     const CancellationTokenOpt &cancellationToken_,
+                     const CoroLite::CancellationTokenOpt &cancellationToken_,
                      uint32_t events_);
 
     [[nodiscard]] bool await_ready() const noexcept;

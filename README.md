@@ -36,6 +36,15 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
+The local `coro_lite` repository must exist at `/home/vadim/CLionProjects/coro_lite`. Initialize the submodule before
+configuring the proxy:
+
+```bash
+git -c protocol.file.allow=always submodule update --init --recursive
+```
+
+See [`coro_lite`](third_party/coro_lite/README.md) for runtime integration, API, and standalone test instructions.
+
 ---
 
 ## Usage
@@ -145,10 +154,9 @@ sudo systemctl start proxy_over_ssh
 ├── HttpConnect.h/cpp  # HTTP/1.1 CONNECT parsing and responses
 ├── BackendSocket.h    # Abstract interface for backend connections
 ├── SshSocket.h/cpp    # SSH tunneling implementation
-├── Socket.h/cpp       # Socket abstraction with coroutine awaiters
-├── CoroTask.h         # Coroutine infrastructure (EpollScheduler, CoroTask)
-├── Endpoint.h/cpp     # Network endpoint abstraction
 ├── Types.h            # Common types (ResultCode, Socks5 constants)
-├── Logger.h           # Logging utilities
+├── third_party/
+│   └── coro_lite/     # Coroutine scheduler, sockets, cancellation, timers, and endpoints
+├── android/ProxyApp/  # Android VPN application and JNI integration
 └── systemd/           # Systemd service file
 ```

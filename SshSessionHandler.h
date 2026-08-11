@@ -23,7 +23,7 @@ public:
 
     SshSession &operator=(SshSession &&handler) noexcept;
 
-    [[nodiscard]] int handshake(const SocketPtr &socket) noexcept;
+    [[nodiscard]] int handshake(const CoroLite::SocketPtr &socket) noexcept;
 
     [[nodiscard]] int disconnect() noexcept;
 
@@ -37,7 +37,7 @@ private:
 
 struct SshSessionHandler final {
     std::unique_ptr<SshSession> sshSession;
-    SocketPtr tcpSocket;
+    CoroLite::SocketPtr tcpSocket;
     std::chrono::steady_clock::time_point lastUsed;
 };
 

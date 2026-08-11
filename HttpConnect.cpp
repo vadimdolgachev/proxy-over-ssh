@@ -8,6 +8,8 @@
 #include <netinet/in.h>
 #include <system_error>
 
+using namespace CoroLite;
+
 namespace {
     using HttpConnect::Error;
     using HttpConnect::Request;

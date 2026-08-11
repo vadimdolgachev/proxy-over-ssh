@@ -4,6 +4,8 @@
 #include <string_view>
 #include <vector>
 
+using namespace CoroLite;
+
 namespace {
     [[nodiscard]] std::vector<uint8_t> bytes(const std::string_view text) {
         return {text.begin(), text.end()};

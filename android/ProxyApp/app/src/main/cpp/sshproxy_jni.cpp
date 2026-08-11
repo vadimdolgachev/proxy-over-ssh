@@ -15,6 +15,8 @@ extern "C" {
 #include "hev-main.h"
 }
 
+using namespace CoroLite;
+
 namespace {
     std::string normalizeKeyData(std::string key) {
         size_t pos = 0;

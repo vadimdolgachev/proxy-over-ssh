@@ -9,6 +9,11 @@ get_filename_component(PROXY_OVER_SSH_DIR
 )
 message(STATUS "PROXY_OVER_SSH_DIR = ${PROXY_OVER_SSH_DIR}")
 
+add_subdirectory(
+        ${PROXY_OVER_SSH_DIR}/third_party/coro_lite
+        ${CMAKE_CURRENT_BINARY_DIR}/coro_lite
+)
+
 include(${PROXY_OVER_SSH_DIR}/cmake/CPM.cmake)
 
 CPMAddPackage(
@@ -101,15 +106,11 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         sshproxy_jni.cpp
         hev-compat.c
         ${PROXY_OVER_SSH_DIR}/SSHProxy.cpp
-        ${PROXY_OVER_SSH_DIR}/Socket.cpp
         ${PROXY_OVER_SSH_DIR}/SshSocket.cpp
         ${PROXY_OVER_SSH_DIR}/SshSessionHandler.cpp
         ${PROXY_OVER_SSH_DIR}/SshHostKey.cpp
-        ${PROXY_OVER_SSH_DIR}/Endpoint.cpp
         ${PROXY_OVER_SSH_DIR}/HttpConnect.cpp
         ${PROXY_OVER_SSH_DIR}/SessionPool.cpp
-        ${PROXY_OVER_SSH_DIR}/CancellationToken.cpp
-        ${PROXY_OVER_SSH_DIR}/CoroTask.cpp
         ${HEV_TUNNEL_SOURCES}
         ${HEV_CORE_SOURCES}
         ${YAML_SOURCES}
@@ -153,6 +154,7 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
 )
 
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
+        CoroLite::coro_lite
         OpenSSL::Crypto
         OpenSSL::SSL
         libssh2

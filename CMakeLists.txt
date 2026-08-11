@@ -3,6 +3,8 @@ project(proxy_over_ssh)
 
 set(CMAKE_CXX_STANDARD 23)
 
+add_subdirectory(third_party/coro_lite)
+
 include(cmake/CPM.cmake)
 
 CPMAddPackage(
@@ -57,29 +59,20 @@ CPMAddPackage(
 add_executable(proxy_over_ssh main.cpp
         SSHProxy.cpp
         SSHProxy.h
-        CoroTask.h
-        Timer.h
-        Socket.cpp
-        Socket.h
         SshSocket.cpp
         SshSocket.h
-        Endpoint.cpp
-        Endpoint.h
         HttpConnect.cpp
         HttpConnect.h
         SessionPool.cpp
         SessionPool.h
         IdleTimer.h
-        CompletionSignal.h
         SshSessionHandler.h
         SshSessionHandler.cpp
         SshHostKey.cpp
         SshHostKey.h
-        CancellationToken.cpp
-        CancellationToken.h
-        CoroTask.cpp
 )
 target_link_libraries(proxy_over_ssh PRIVATE
+        CoroLite::coro_lite
         OpenSSL::Crypto
         OpenSSL::SSL
         libssh2
@@ -111,29 +104,12 @@ endif ()
 option(PROXY_BUILD_TESTS "Build proxy unit tests" OFF)
 if (PROXY_BUILD_TESTS AND NOT ANDROID)
     enable_testing()
-    add_executable(coro_task_lifecycle_test
-            tests/CoroTaskLifecycleTest.cpp
-            CancellationToken.cpp
-            CoroTask.cpp
-    )
-    target_include_directories(coro_task_lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_options(coro_task_lifecycle_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
-    target_compile_options(coro_task_lifecycle_test PRIVATE
-            $<$<STREQUAL:${SANITIZER},address>:-fsanitize=address>
-            $<$<STREQUAL:${SANITIZER},thread>:-fsanitize=thread>
-    )
-    target_link_options(coro_task_lifecycle_test PRIVATE
-            $<$<STREQUAL:${SANITIZER},address>:-fsanitize=address>
-            $<$<STREQUAL:${SANITIZER},thread>:-fsanitize=thread>
-    )
-    add_test(NAME coro_task_lifecycle COMMAND coro_task_lifecycle_test)
-
     add_executable(http_connect_test
             tests/HttpConnectTest.cpp
             HttpConnect.cpp
-            Endpoint.cpp
     )
     target_include_directories(http_connect_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(http_connect_test PRIVATE CoroLite::coro_lite)
     target_compile_options(http_connect_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     target_compile_options(http_connect_test PRIVATE
             $<$<STREQUAL:${SANITIZER},address>:-fsanitize=address>
