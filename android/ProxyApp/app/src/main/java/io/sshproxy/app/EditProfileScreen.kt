@@ -27,6 +27,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -37,6 +38,7 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun EditProfileScreen(
     profile: SshProfile?,
+    errorMessage: String?,
     onSave: (SshProfile) -> Unit,
     onBack: () -> Unit,
 ) {
@@ -46,7 +48,7 @@ fun EditProfileScreen(
     var host by rememberSaveable { mutableStateOf(profile?.host ?: "") }
     var port by rememberSaveable { mutableStateOf((profile?.port ?: 22).toString()) }
     var username by rememberSaveable { mutableStateOf(profile?.username ?: "") }
-    var privateKey by rememberSaveable { mutableStateOf(profile?.privateKeyBase64 ?: "") }
+    var privateKey by remember { mutableStateOf(profile?.privateKeyBase64 ?: "") }
     var hostKeySha256 by rememberSaveable { mutableStateOf(profile?.hostKeySha256 ?: "") }
 
     val context = LocalContext.current
@@ -61,8 +63,10 @@ fun EditProfileScreen(
     }
 
     val normalizedKey = SshProfile.normalizeKey(privateKey)
+    val parsedPort = port.toIntOrNull()
+    val isPortValid = parsedPort != null && parsedPort in 1..65535
     val canSave = name.isNotBlank() && host.isNotBlank() && username.isNotBlank()
-        && normalizedKey.isNotBlank() && SshProfile.isValidHostKeySha256(hostKeySha256)
+        && normalizedKey.isNotBlank() && SshProfile.isValidHostKeySha256(hostKeySha256) && isPortValid
 
     Scaffold(
         topBar = {
@@ -104,6 +108,8 @@ fun EditProfileScreen(
                 value = port,
                 onValueChange = { port = it },
                 label = { Text("SSH Port") },
+                supportingText = { if (!isPortValid) Text("Enter a port from 1 to 65535") },
+                isError = !isPortValid,
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
             )
@@ -151,15 +157,22 @@ fun EditProfileScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
+            errorMessage?.let { message ->
+                Text(
+                    text = message,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+
             Button(
                 onClick = {
-                    val parsedPort = port.toIntOrNull() ?: 22
                     onSave(
                         SshProfile(
                             id = existingId,
                             name = name,
                             host = host,
-                            port = parsedPort,
+                            port = checkNotNull(parsedPort),
                             username = username,
                             privateKeyBase64 = normalizedKey,
                             hostKeySha256 = hostKeySha256.trim(),

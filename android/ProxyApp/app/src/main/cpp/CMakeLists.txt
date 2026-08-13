@@ -14,50 +14,108 @@ add_subdirectory(
         ${CMAKE_CURRENT_BINARY_DIR}/coro_lite
 )
 
-include(${PROXY_OVER_SSH_DIR}/cmake/CPM.cmake)
+include(ExternalProject)
 
-CPMAddPackage(
-        NAME openssl-cmake
-        GITHUB_REPOSITORY janbar/openssl-cmake
-        GIT_TAG master
-        OPTIONS
-        "BUILD_SHARED_LIBS OFF"
-        "WITH_APPS OFF"
-        "CMAKE_POSITION_INDEPENDENT_CODE ON"
+find_program(PERL_EXECUTABLE perl REQUIRED)
+find_program(MAKE_EXECUTABLE NAMES make gmake REQUIRED)
+
+file(GLOB NDK_PREBUILT_DIRS LIST_DIRECTORIES true "${ANDROID_NDK}/toolchains/llvm/prebuilt/*")
+list(LENGTH NDK_PREBUILT_DIRS NDK_PREBUILT_COUNT)
+if (NOT NDK_PREBUILT_COUNT EQUAL 1)
+    message(FATAL_ERROR "Expected one Android NDK host toolchain, found ${NDK_PREBUILT_COUNT}")
+endif ()
+list(GET NDK_PREBUILT_DIRS 0 NDK_PREBUILT_DIR)
+
+if (ANDROID_ABI STREQUAL "arm64-v8a")
+    set(OPENSSL_ANDROID_TARGET android-arm64)
+elseif (ANDROID_ABI STREQUAL "armeabi-v7a")
+    set(OPENSSL_ANDROID_TARGET android-arm)
+else ()
+    message(FATAL_ERROR "Unsupported Android ABI for OpenSSL: ${ANDROID_ABI}")
+endif ()
+
+string(REGEX REPLACE "^android-" "" OPENSSL_ANDROID_API "${ANDROID_PLATFORM}")
+set(NATIVE_DEPS_DIR "${CMAKE_CURRENT_BINARY_DIR}/native-deps")
+set(OPENSSL_INSTALL_DIR "${NATIVE_DEPS_DIR}/openssl")
+set(LIBSSH2_INSTALL_DIR "${NATIVE_DEPS_DIR}/libssh2")
+set(OPENSSL_INCLUDE_DIR "${OPENSSL_INSTALL_DIR}/include")
+set(OPENSSL_SSL_LIBRARY "${OPENSSL_INSTALL_DIR}/lib/libssl.a")
+set(OPENSSL_CRYPTO_LIBRARY "${OPENSSL_INSTALL_DIR}/lib/libcrypto.a")
+set(LIBSSH2_INCLUDE_DIR "${LIBSSH2_INSTALL_DIR}/include")
+set(LIBSSH2_LIBRARY "${LIBSSH2_INSTALL_DIR}/lib/libssh2.a")
+file(MAKE_DIRECTORY "${OPENSSL_INCLUDE_DIR}" "${LIBSSH2_INCLUDE_DIR}")
+
+ExternalProject_Add(openssl_android
+        URL https://github.com/openssl/openssl/releases/download/openssl-3.5.7/openssl-3.5.7.tar.gz
+        URL_HASH SHA256=a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8
+        PREFIX "${NATIVE_DEPS_DIR}/openssl-project"
+        BINARY_DIR "${NATIVE_DEPS_DIR}/openssl-build"
+        CONFIGURE_COMMAND
+            ${CMAKE_COMMAND} -E env
+            "ANDROID_NDK_ROOT=${ANDROID_NDK}"
+            "PATH=${NDK_PREBUILT_DIR}/bin:$ENV{PATH}"
+            ${PERL_EXECUTABLE} <SOURCE_DIR>/Configure
+            ${OPENSSL_ANDROID_TARGET}
+            -D__ANDROID_API__=${OPENSSL_ANDROID_API}
+            -Wno-macro-redefined
+            no-shared no-tests no-module
+            --prefix=${OPENSSL_INSTALL_DIR}
+            --openssldir=${OPENSSL_INSTALL_DIR}/ssl
+            --libdir=lib
+        BUILD_COMMAND
+            ${CMAKE_COMMAND} -E env
+            "ANDROID_NDK_ROOT=${ANDROID_NDK}"
+            "PATH=${NDK_PREBUILT_DIR}/bin:$ENV{PATH}"
+            ${MAKE_EXECUTABLE} -j4 build_sw
+        INSTALL_COMMAND
+            ${CMAKE_COMMAND} -E env
+            "ANDROID_NDK_ROOT=${ANDROID_NDK}"
+            "PATH=${NDK_PREBUILT_DIR}/bin:$ENV{PATH}"
+            ${MAKE_EXECUTABLE} install_sw
+        BUILD_BYPRODUCTS "${OPENSSL_CRYPTO_LIBRARY}" "${OPENSSL_SSL_LIBRARY}"
 )
 
-set(OPENSSL_ROOT_DIR ${openssl-cmake_BINARY_DIR})
-set(OPENSSL_INCLUDE_DIR ${openssl-cmake_BINARY_DIR}/include)
-set(OPENSSL_SSL_LIBRARY ${openssl-cmake_BINARY_DIR}/ssl/libssl_1_1.a)
-set(OPENSSL_CRYPTO_LIBRARY ${openssl-cmake_BINARY_DIR}/crypto/libcrypto_1_1.a)
-
-add_library(OpenSSL::SSL STATIC IMPORTED GLOBAL)
-set_target_properties(OpenSSL::SSL PROPERTIES
-        IMPORTED_LOCATION ${OPENSSL_SSL_LIBRARY}
-        INTERFACE_INCLUDE_DIRECTORIES ${OPENSSL_INCLUDE_DIR}
+ExternalProject_Add(libssh2_android_project
+        URL https://libssh2.org/download/libssh2-1.11.1.tar.gz
+        URL_HASH SHA256=d9ec76cbe34db98eec3539fe2c899d26b0c837cb3eb466a56b0f109cabf658f7
+        PREFIX "${NATIVE_DEPS_DIR}/libssh2-project"
+        DEPENDS openssl_android
+        CMAKE_ARGS
+            -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
+            -DANDROID_ABI=${ANDROID_ABI}
+            -DANDROID_PLATFORM=${ANDROID_PLATFORM}
+            -DANDROID_STL=${ANDROID_STL}
+            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+            -DCMAKE_INSTALL_PREFIX=${LIBSSH2_INSTALL_DIR}
+            -DCMAKE_INSTALL_LIBDIR=lib
+            -DBUILD_EXAMPLES=OFF
+            -DBUILD_TESTING=OFF
+            -DBUILD_SHARED_LIBS=OFF
+            -DBUILD_STATIC_LIBS=ON
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+            -DENABLE_ZLIB_COMPRESSION=ON
+            -DCRYPTO_BACKEND=OpenSSL
+            -DOPENSSL_ROOT_DIR=${OPENSSL_INSTALL_DIR}
+            -DOPENSSL_INCLUDE_DIR=${OPENSSL_INCLUDE_DIR}
+            -DOPENSSL_SSL_LIBRARY=${OPENSSL_SSL_LIBRARY}
+            -DOPENSSL_CRYPTO_LIBRARY=${OPENSSL_CRYPTO_LIBRARY}
+        BUILD_BYPRODUCTS "${LIBSSH2_LIBRARY}"
 )
 
 add_library(OpenSSL::Crypto STATIC IMPORTED GLOBAL)
 set_target_properties(OpenSSL::Crypto PROPERTIES
-        IMPORTED_LOCATION ${OPENSSL_CRYPTO_LIBRARY}
-        INTERFACE_INCLUDE_DIRECTORIES ${OPENSSL_INCLUDE_DIR}
+        IMPORTED_LOCATION "${OPENSSL_CRYPTO_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${OPENSSL_INCLUDE_DIR}"
 )
+add_dependencies(OpenSSL::Crypto openssl_android)
 
-CPMAddPackage(
-        NAME libssh2
-        GITHUB_REPOSITORY libssh2/libssh2
-        GIT_TAG libssh2-1.11.1
-        OPTIONS
-        "CMAKE_POLICY_VERSION_MINIMUM 3.5"
-        "BUILD_EXAMPLES OFF"
-        "BUILD_TESTING OFF"
-        "BUILD_SHARED_LIBS OFF"
-        "BUILD_STATIC_LIBS ON"
-        "CMAKE_POSITION_INDEPENDENT_CODE ON"
-        "ENABLE_ZLIB_COMPRESSION ON"
-        "CRYPTO_BACKEND OpenSSL"
-        "OPENSSL_ROOT_DIR ${OPENSSL_ROOT_DIR}"
+add_library(libssh2_android STATIC IMPORTED GLOBAL)
+set_target_properties(libssh2_android PROPERTIES
+        IMPORTED_LOCATION "${LIBSSH2_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${LIBSSH2_INCLUDE_DIR}"
+        INTERFACE_LINK_LIBRARIES OpenSSL::Crypto
 )
+add_dependencies(libssh2_android libssh2_android_project)
 
 # hev-socks5-tunnel sources (local copy)
 set(HEV_DIR ${CMAKE_CURRENT_SOURCE_DIR}/hev-socks5-tunnel)
@@ -156,11 +214,10 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
         CoroLite::coro_lite
         OpenSSL::Crypto
-        OpenSSL::SSL
-        libssh2
+        libssh2_android
         dl z log android
 )
-add_dependencies(${CMAKE_PROJECT_NAME} crypto ssl)
+add_dependencies(${CMAKE_PROJECT_NAME} libssh2_android_project)
 
 target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
         -Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -Wno-unused-private-field

@@ -10,7 +10,7 @@
         tools:ignore="QueryAllPackagesPermission" />
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
@@ -34,6 +34,9 @@
             android:foregroundServiceType="specialUse"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Maintains a user-requested SSH proxy and optional VPN tunnel" />
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>

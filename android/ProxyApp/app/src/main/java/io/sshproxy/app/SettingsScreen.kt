@@ -77,6 +77,10 @@ fun SettingsScreen(
     }
 
     val selectedPackages = if (vpnAppMode == VpnAppMode.ALL_APPS) excludedPackages else includedPackages
+    val parsedPort = socksPort.toIntOrNull()
+    val isPortValid = parsedPort != null && parsedPort in 1..65535
+    val hasSelectedApps = !vpnMode || vpnAppMode != VpnAppMode.SELECTED_APPS || includedPackages.isNotEmpty()
+    val canSave = isPortValid && dnsAddress.isNotBlank() && hasSelectedApps
 
     BackHandler(enabled = true) {
         onBack()
@@ -88,18 +92,17 @@ fun SettingsScreen(
                 title = { Text("Settings") },
                 navigationIcon = {
                     IconButton(onClick = {
-                        val port = socksPort.toIntOrNull() ?: 10803
                         onSaveSettings(
                             AppSettings(
                                 dnsAddress = dnsAddress,
-                                socksPort = port,
+                                socksPort = checkNotNull(parsedPort),
                                 vpnMode = vpnMode,
                                 vpnAppMode = vpnAppMode,
                                 excludedPackages = excludedPackages,
                                 includedPackages = includedPackages,
                             )
                         )
-                    }) {
+                    }, enabled = canSave) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
@@ -155,6 +158,8 @@ fun SettingsScreen(
                 value = socksPort,
                 onValueChange = { socksPort = it },
                 label = { Text("Proxy Port") },
+                supportingText = { if (!isPortValid) Text("Enter a port from 1 to 65535") },
+                isError = !isPortValid,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp),
@@ -206,6 +211,15 @@ fun SettingsScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                 )
+
+                if (!hasSelectedApps) {
+                    Text(
+                        "Select at least one installed app before saving",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                    )
+                }
 
                 Spacer(modifier = Modifier.height(8.dp))
 

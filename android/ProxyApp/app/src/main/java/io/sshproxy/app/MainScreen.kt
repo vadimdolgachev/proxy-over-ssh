@@ -45,7 +45,8 @@ sealed class Screen {
 fun MainScreen(
     profiles: List<SshProfile>,
     selectedProfileId: String?,
-    isProxyRunning: Boolean,
+    proxyStatus: ProxyStatus,
+    errorMessage: String?,
     vpnMode: Boolean,
     onSelectProfile: (String) -> Unit,
     onStartProxy: () -> Unit,
@@ -55,19 +56,20 @@ fun MainScreen(
     onDeleteProfile: (String) -> Unit,
     onSettings: () -> Unit,
 ) {
+    val isProxyActive = proxyStatus.isActive
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("SSH Proxy") },
                 actions = {
-                    IconButton(onClick = onSettings, enabled = !isProxyRunning) {
+                    IconButton(onClick = onSettings, enabled = !isProxyActive) {
                         Icon(Icons.Default.Settings, contentDescription = "Settings")
                     }
                 },
             )
         },
         floatingActionButton = {
-            if (!isProxyRunning) {
+            if (!isProxyActive) {
                 FloatingActionButton(onClick = onAddProfile) {
                     Icon(Icons.Default.Add, contentDescription = "Add profile")
                 }
@@ -109,7 +111,7 @@ fun MainScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(vertical = 4.dp)
-                                .clickable(enabled = !isProxyRunning) {
+                                .clickable(enabled = !isProxyActive) {
                                     onEditProfile(profile.id)
                                 },
                             colors = CardDefaults.cardColors(
@@ -128,7 +130,7 @@ fun MainScreen(
                                 RadioButton(
                                     selected = isSelected,
                                     onClick = { onSelectProfile(profile.id) },
-                                    enabled = !isProxyRunning,
+                                    enabled = !isProxyActive,
                                 )
                                 Column(
                                     modifier = Modifier.weight(1f),
@@ -142,7 +144,7 @@ fun MainScreen(
                                         style = MaterialTheme.typography.bodySmall,
                                     )
                                 }
-                                if (!isProxyRunning) {
+                                if (!isProxyActive) {
                                     IconButton(onClick = { onDeleteProfile(profile.id) }) {
                                         Icon(
                                             Icons.Default.Delete,
@@ -157,6 +159,15 @@ fun MainScreen(
                 }
             }
 
+            errorMessage?.let { message ->
+                Text(
+                    text = message,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                )
+            }
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -165,14 +176,19 @@ fun MainScreen(
             ) {
                 Button(
                     onClick = onStartProxy,
-                    enabled = !isProxyRunning && selectedProfileId != null,
+                    enabled = !isProxyActive && selectedProfileId != null,
                     modifier = Modifier.weight(1f),
                 ) {
-                    Text(if (vpnMode) "Start VPN" else "Start Proxy")
+                    Text(
+                        when (proxyStatus.state) {
+                            ProxyState.STARTING -> "Starting…"
+                            else -> if (vpnMode) "Start VPN" else "Start Proxy"
+                        }
+                    )
                 }
                 OutlinedButton(
                     onClick = onStopProxy,
-                    enabled = isProxyRunning,
+                    enabled = isProxyActive,
                     modifier = Modifier.weight(1f),
                 ) {
                     Text("Stop")

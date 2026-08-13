@@ -64,15 +64,34 @@ data class SshProfile(
     }
 }
 
-class ProfileStore(context: Context) {
+class ProfileStore internal constructor(
+    context: Context,
+    private val cipher: ProfileCipher = AndroidKeystoreProfileCipher(),
+    preferenceName: String = PREFERENCE_NAME,
+) {
 
-    private val prefs = context.getSharedPreferences("ssh_profiles", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences(preferenceName, Context.MODE_PRIVATE)
 
     fun getProfiles(): List<SshProfile> {
-        val json = prefs.getString(KEY_PROFILES, null) ?: return emptyList()
-        val array = JSONArray(json)
-        return (0 until array.length()).map { i ->
-            SshProfile.fromJson(array.getJSONObject(i))
+        val encrypted = prefs.getString(KEY_PROFILES_ENCRYPTED, null)
+        if (encrypted != null) {
+            return parseProfiles(cipher.decrypt(encrypted))
+        }
+
+        val legacyJson = prefs.getString(KEY_PROFILES_LEGACY, null) ?: return emptyList()
+        val profiles = parseProfiles(legacyJson)
+        writeProfiles(profiles)
+        return profiles
+    }
+
+    private fun parseProfiles(json: String): List<SshProfile> {
+        try {
+            val array = JSONArray(json)
+            return (0 until array.length()).map { i ->
+                SshProfile.fromJson(array.getJSONObject(i))
+            }
+        } catch (e: Exception) {
+            throw ProfileStorageException("Unable to read SSH profiles; the saved data was preserved", e)
         }
     }
 
@@ -99,7 +118,14 @@ class ProfileStore(context: Context) {
     private fun writeProfiles(profiles: List<SshProfile>) {
         val array = JSONArray()
         profiles.forEach { array.put(it.toJson()) }
-        prefs.edit().putString(KEY_PROFILES, array.toString()).apply()
+        val encrypted = cipher.encrypt(array.toString())
+        if (!prefs.edit()
+                .putString(KEY_PROFILES_ENCRYPTED, encrypted)
+                .remove(KEY_PROFILES_LEGACY)
+                .commit()
+        ) {
+            throw ProfileStorageException("Unable to save encrypted SSH profiles")
+        }
     }
 
     fun getRunningProfileId(): String? = prefs.getString(KEY_RUNNING_PROFILE, null)
@@ -111,7 +137,9 @@ class ProfileStore(context: Context) {
     }
 
     companion object {
-        private const val KEY_PROFILES = "profiles_json"
+        private const val PREFERENCE_NAME = "ssh_profiles"
+        private const val KEY_PROFILES_LEGACY = "profiles_json"
+        private const val KEY_PROFILES_ENCRYPTED = "profiles_encrypted_v1"
         private const val KEY_RUNNING_PROFILE = "running_profile_id"
     }
 }
