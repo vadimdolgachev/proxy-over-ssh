@@ -234,8 +234,6 @@ class ProxyService : VpnService(), ProxyListener {
         } catch (e: Exception) {
             Log.e(TAG, "Proxy shutdown failed", e)
         } finally {
-            runCatching { profileStore.setRunningProfileId(null) }
-                .onFailure { Log.e(TAG, "Unable to clear the running profile", it) }
             stopForeground(STOP_FOREGROUND_REMOVE)
             if (error == null) updateStatus(ProxyStatus(ProxyState.STOPPED))
             cleanupInProgress = false
