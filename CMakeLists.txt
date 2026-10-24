@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 4.1)
-project(proxy_over_ssh)
+include(cmake/ProxyVersion.cmake)
+project(proxy_over_ssh VERSION "${PROXY_OVER_SSH_VERSION}")
 
 set(CMAKE_CXX_STANDARD 23)
 
@@ -79,6 +80,7 @@ target_link_libraries(proxy_over_ssh PRIVATE
         libssh2
         byedpi_runtime
 )
+target_include_directories(proxy_over_ssh PRIVATE "${PROXY_VERSION_INCLUDE_DIR}")
 add_dependencies(proxy_over_ssh crypto ssl)
 target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion -Wsign-conversion -Wnull-dereference -Wno-unused-variable -Wno-unused-parameter -Wno-unused-private-field -Werror=uninitialized -Wno-unused-function -fno-omit-frame-pointer)
 

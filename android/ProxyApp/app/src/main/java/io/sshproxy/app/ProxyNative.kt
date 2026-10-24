@@ -85,5 +85,9 @@ class ProxyNative(private val listener: ProxyListener) {
         init {
             System.loadLibrary("proxyapp")
         }
+
+        @Keep
+        @JvmStatic
+        external fun getVersion(): String
     }
 }

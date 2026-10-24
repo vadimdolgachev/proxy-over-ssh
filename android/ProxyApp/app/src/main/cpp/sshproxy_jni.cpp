@@ -12,6 +12,7 @@
 #include "CancellationToken.h"
 #include "Endpoint.h"
 #include "Logger.h"
+#include "ProxyVersion.h"
 #include "SSHProxy.h"
 #include "SessionPool.h"
 #include "SshSocket.h"
@@ -280,6 +281,11 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
                        gMethodProtectSocket != nullptr && !env->ExceptionCheck();
     env->DeleteLocalRef(listenerClass);
     return valid ? JNI_VERSION_1_6 : JNI_ERR;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_io_sshproxy_app_ProxyNative_getVersion(JNIEnv *env, jclass) {
+    return env->NewStringUTF(ProxyVersion::Version.data());
 }
 
 extern "C" JNIEXPORT jlong JNICALL

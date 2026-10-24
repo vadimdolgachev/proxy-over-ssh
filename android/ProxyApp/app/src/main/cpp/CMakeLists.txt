@@ -8,6 +8,7 @@ get_filename_component(PROXY_OVER_SSH_DIR
     ABSOLUTE
 )
 message(STATUS "PROXY_OVER_SSH_DIR = ${PROXY_OVER_SSH_DIR}")
+include(${PROXY_OVER_SSH_DIR}/cmake/ProxyVersion.cmake)
 
 add_subdirectory(
         ${PROXY_OVER_SSH_DIR}/third_party/coro_lite
@@ -179,6 +180,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
+        ${PROXY_VERSION_INCLUDE_DIR}
         ${PROXY_OVER_SSH_DIR}
         ${HEV_DIR}/src
         ${HEV_DIR}/src/misc

@@ -4,6 +4,7 @@
 #include <csignal>
 #include <expected>
 #include <format>
+#include <iostream>
 #include <memory>
 #include <string_view>
 #include <unordered_map>
@@ -12,6 +13,7 @@
 #include "ByeDpiRuntime.h"
 #include "CancellationToken.h"
 #include "Logger.h"
+#include "ProxyVersion.h"
 #include "SSHProxy.h"
 #include "SessionPool.h"
 #include "SshSocket.h"
@@ -144,6 +146,10 @@ extern "C" void onSignalTerm(int) {
 }
 
 int main(const int argc, char **argv) {
+    log_e("proxy_over_ssh version: {}\n", ProxyVersion::Version);
+    if (argc == 2 && std::string_view(argv[1]) == "--version") {
+        return 0;
+    }
     std::signal(SIGTERM, onSignalTerm);
     std::signal(SIGINT, onSignalTerm);
     std::atomic_bool byeDpiFailed = false;

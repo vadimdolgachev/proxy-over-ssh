@@ -1,0 +1,10 @@
+#ifndef PROXY_VERSION_H
+#define PROXY_VERSION_H
+
+#include <string_view>
+
+namespace ProxyVersion {
+    inline constexpr std::string_view Version = "@PROXY_OVER_SSH_VERSION@";
+}
+
+#endif // PROXY_VERSION_H

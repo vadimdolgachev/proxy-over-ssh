@@ -56,6 +56,7 @@ fun SettingsScreen(
     var searchQuery by rememberSaveable { mutableStateOf("") }
 
     val context = LocalContext.current
+    val proxyVersion = remember { ProxyNative.getVersion() }
     val ownPackage = context.packageName
     // remember, not rememberSaveable: the list is rebuilt from the package manager and is not
     // parcelable, so it must not end up in the saved instance state.
@@ -326,7 +327,13 @@ fun SettingsScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+                Text("About", style = MaterialTheme.typography.titleMedium)
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("Android app: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+                    style = MaterialTheme.typography.bodyMedium)
+                Text("proxy_over_ssh: $proxyVersion", style = MaterialTheme.typography.bodyMedium)
+            }
         }
     }
 }
