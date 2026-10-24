@@ -8,6 +8,7 @@ interface ProxyListener {
     fun onFinished()
     fun onError(code: Long, msg: String)
     fun onTunnelFinished(code: Long)
+    fun protectSocket(fd: Int): Boolean
 }
 
 class ProxyNative(private val listener: ProxyListener) {
@@ -23,6 +24,9 @@ class ProxyNative(private val listener: ProxyListener) {
         privateKeyData: String?,
         hostKeySha256: String,
         listenPort: Int,
+        protectSockets: Boolean,
+        byeDpiEnabled: Boolean,
+        byeDpiArgs: String,
     )
     private external fun nativeStop(handle: Long)
     private external fun nativeDestroy(handle: Long)
@@ -36,13 +40,19 @@ class ProxyNative(private val listener: ProxyListener) {
         privateKeyData: String?,
         hostKeySha256: String,
         listenPort: Int,
+        protectSockets: Boolean,
+        byeDpiEnabled: Boolean,
+        byeDpiArgs: String,
     ) {
         if (handle == 0L) {
             handle = nativeCreate()
             check(handle != 0L) { "Failed to create native proxy context" }
             nativeRegisterListener(handle, listener)
         }
-        nativeStart(handle, sshHost, sshPort, sshUsername, privateKeyData, hostKeySha256, listenPort)
+        nativeStart(
+            handle, sshHost, sshPort, sshUsername, privateKeyData, hostKeySha256, listenPort,
+            protectSockets, byeDpiEnabled, byeDpiArgs,
+        )
     }
 
     fun startTunnel(tunFd: Int, socksPort: Int) {

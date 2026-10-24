@@ -13,6 +13,7 @@ add_subdirectory(
         ${PROXY_OVER_SSH_DIR}/third_party/coro_lite
         ${CMAKE_CURRENT_BINARY_DIR}/coro_lite
 )
+include(${PROXY_OVER_SSH_DIR}/cmake/ByeDpi.cmake)
 
 include(ExternalProject)
 
@@ -215,6 +216,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
         CoroLite::coro_lite
         OpenSSL::Crypto
         libssh2_android
+        byedpi_runtime
         dl z log android
 )
 add_dependencies(${CMAKE_PROJECT_NAME} libssh2_android_project)

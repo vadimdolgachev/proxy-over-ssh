@@ -31,6 +31,8 @@ class MainActivity : ComponentActivity() {
     private var proxyStatus by mutableStateOf(ProxyStatus())
     private var profileStorageError by mutableStateOf<String?>(null)
     private var appSettings by mutableStateOf(AppSettings())
+    private var pendingAutoStartName: String? = null
+    private var pendingVpnProfileId: String? = null
 
     private var proxyService: ProxyService? = null
     private val statusListener = ProxyService.StatusListener { proxyStatus = it }
@@ -39,6 +41,7 @@ class MainActivity : ComponentActivity() {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             proxyService = (service as ProxyService.LocalBinder).getService()
             proxyService!!.addStatusListener(statusListener)
+            processPendingAutoStart()
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -54,8 +57,13 @@ class MainActivity : ComponentActivity() {
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
+        val profileId = pendingVpnProfileId
+        pendingVpnProfileId = null
+        if (profileId == null) return@registerForActivityResult
         if (result.resultCode == RESULT_OK) {
-            startProxyInternal()
+            startProxyInternal(profileId)
+        } else {
+            reportStartError("VPN permission was not granted; profile was not started")
         }
     }
 
@@ -63,7 +71,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        // Explicit automation starts should not be blocked by the optional notification prompt.
+        if (savedInstanceState == null && !intent.hasExtra(EXTRA_PROFILE_NAME)
+            && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+        ) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED
             ) {
@@ -78,6 +89,8 @@ class MainActivity : ComponentActivity() {
 
         val runningId = profileStore.getRunningProfileId()
         selectedProfileId = runningId?.takeIf { id -> profiles.any { it.id == id } }
+        pendingAutoStartName = savedInstanceState?.getString(STATE_AUTO_START_NAME)
+        pendingVpnProfileId = savedInstanceState?.getString(STATE_VPN_PROFILE_ID)
 
         setContent {
             ProxyAppTheme {
@@ -147,13 +160,26 @@ class MainActivity : ComponentActivity() {
                             appSettings = newSettings
                             currentScreen = Screen.Main
                         },
-                        onBack = {
+                        onClose = {
                             currentScreen = Screen.Main
                         },
                     )
                 }
             }
         }
+        acceptAutoStartIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        acceptAutoStartIntent(intent)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString(STATE_AUTO_START_NAME, pendingAutoStartName)
+        outState.putString(STATE_VPN_PROFILE_ID, pendingVpnProfileId)
+        super.onSaveInstanceState(outState)
     }
 
     override fun onStart() {
@@ -166,6 +192,31 @@ class MainActivity : ComponentActivity() {
         proxyService?.removeStatusListener(statusListener)
         super.onStop()
         unbindService(serviceConnection)
+        proxyService = null
+    }
+
+    private fun acceptAutoStartIntent(intent: Intent) {
+        if (!intent.hasExtra(EXTRA_PROFILE_NAME)) return
+        pendingAutoStartName = intent.getStringExtra(EXTRA_PROFILE_NAME) ?: ""
+        // Consume the request so activity recreation does not start the profile again.
+        intent.removeExtra(EXTRA_PROFILE_NAME)
+        currentScreen = Screen.Main
+        processPendingAutoStart()
+    }
+
+    private fun processPendingAutoStart() {
+        // Wait for the existing service's real status before deciding whether to start it.
+        if (proxyService == null) return
+        val name = pendingAutoStartName ?: return
+        pendingAutoStartName = null
+        try {
+            reloadProfilesOrThrow()
+            val profile = ProfileSelection.requireByName(profiles, name)
+            Log.i(TAG, "Auto-start requested for profile '${profile.name}'")
+            requestProfileStart(profile)
+        } catch (e: Exception) {
+            reportStartError(e.message ?: "Unable to select SSH profile")
+        }
     }
 
     private fun reloadProfiles() {
@@ -189,26 +240,64 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startProxy() {
-        if (appSettings.vpnMode) {
-            val vpnIntent = VpnService.prepare(this)
-            if (vpnIntent != null) {
-                vpnPermissionLauncher.launch(vpnIntent)
-                return
-            }
-        }
-        startProxyInternal()
+        val profile = profiles.firstOrNull { it.id == selectedProfileId } ?: return
+        requestProfileStart(profile)
     }
 
-    private fun startProxyInternal() {
-        val id = selectedProfileId ?: return
-        val profile = profiles.firstOrNull { it.id == id } ?: return
-        if (!SshProfile.isValidHostKeySha256(profile.hostKeySha256)) return
-        val intent = Intent(this, ProxyService::class.java).apply {
-            action = ProxyService.ACTION_START
-            putExtra(ProxyService.EXTRA_PROFILE_ID, profile.id)
+    private fun requestProfileStart(profile: SshProfile) {
+        try {
+            if (proxyStatus.isActive) {
+                require(proxyService?.currentProfileId == profile.id) {
+                    "Another SSH profile is active; stop it before starting '${profile.name}'"
+                }
+                profileStorageError = null
+                selectedProfileId = profile.id
+                Log.i(TAG, "Profile '${profile.name}' is already active")
+                return
+            }
+            pendingVpnProfileId?.let { pendingId ->
+                require(pendingId == profile.id) { "VPN permission is pending for another SSH profile" }
+                return
+            }
+            require(SshProfile.isValidHostKeySha256(profile.hostKeySha256)) { "Invalid SSH host-key fingerprint" }
+            appSettings = settingsStore.getSettings()
+            profileStorageError = null
+            selectedProfileId = profile.id
+            if (appSettings.vpnMode) {
+                val vpnIntent = VpnService.prepare(this)
+                if (vpnIntent != null) {
+                    pendingVpnProfileId = profile.id
+                    vpnPermissionLauncher.launch(vpnIntent)
+                    return
+                }
+            }
+            startProxyInternal(profile.id)
+        } catch (e: Exception) {
+            if (pendingVpnProfileId == profile.id) pendingVpnProfileId = null
+            reportStartError(e.message ?: "Unable to start SSH profile")
         }
-        startForegroundService(intent)
-        proxyStatus = ProxyStatus(ProxyState.STARTING)
+    }
+
+    private fun startProxyInternal(profileId: String) {
+        try {
+            val profile = requireNotNull(profiles.firstOrNull { it.id == profileId }) { "SSH profile no longer exists" }
+            require(SshProfile.isValidHostKeySha256(profile.hostKeySha256)) { "Invalid SSH host-key fingerprint" }
+            selectedProfileId = profile.id
+            val intent = Intent(this, ProxyService::class.java).apply {
+                action = ProxyService.ACTION_START
+                putExtra(ProxyService.EXTRA_PROFILE_ID, profile.id)
+            }
+            startForegroundService(intent)
+            proxyStatus = ProxyStatus(ProxyState.STARTING)
+            Log.i(TAG, "Starting SSH profile '${profile.name}'")
+        } catch (e: Exception) {
+            reportStartError(e.message ?: "Unable to start SSH profile")
+        }
+    }
+
+    private fun reportStartError(message: String) {
+        profileStorageError = message
+        Log.e(TAG, "Profile start failed: $message")
     }
 
     private fun stopProxy() {
@@ -219,7 +308,10 @@ class MainActivity : ComponentActivity() {
         proxyStatus = ProxyStatus(ProxyState.STOPPING)
     }
 
-    private companion object {
-        const val TAG = "MainActivity"
+    companion object {
+        const val EXTRA_PROFILE_NAME = "profile_name"
+        private const val TAG = "MainActivity"
+        private const val STATE_AUTO_START_NAME = "auto_start_name"
+        private const val STATE_VPN_PROFILE_ID = "vpn_profile_id"
     }
 }

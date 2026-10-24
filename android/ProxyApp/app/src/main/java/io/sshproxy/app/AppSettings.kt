@@ -3,6 +3,8 @@ package io.sshproxy.app
 import android.content.Context
 import org.json.JSONArray
 
+const val DEFAULT_BYEDPI_ARGS = "--oob 1 -s 2 -M h,d -A torst -T 3 -f -1 -r 3+s -S --auto=none"
+
 data class AppSettings(
     val dnsAddress: String = "1.1.1.1",
     val socksPort: Int = 1080,
@@ -10,6 +12,8 @@ data class AppSettings(
     val vpnAppMode: VpnAppMode = VpnAppMode.ALL_APPS,
     val excludedPackages: Set<String> = emptySet(),
     val includedPackages: Set<String> = emptySet(),
+    val byeDpiEnabled: Boolean = false,
+    val byeDpiArgs: String = DEFAULT_BYEDPI_ARGS,
 )
 
 enum class VpnAppMode {
@@ -30,6 +34,8 @@ class SettingsStore(context: Context) {
                 VpnAppMode.SELECTED_APPS else VpnAppMode.ALL_APPS,
             excludedPackages = loadStringSet(KEY_EXCLUDED_PACKAGES),
             includedPackages = loadStringSet(KEY_INCLUDED_PACKAGES),
+            byeDpiEnabled = prefs.getBoolean(KEY_BYEDPI_ENABLED, false),
+            byeDpiArgs = prefs.getString(KEY_BYEDPI_ARGS, DEFAULT_BYEDPI_ARGS) ?: DEFAULT_BYEDPI_ARGS,
         )
     }
 
@@ -41,6 +47,8 @@ class SettingsStore(context: Context) {
             putString(KEY_VPN_APP_MODE, settings.vpnAppMode.name)
             putString(KEY_EXCLUDED_PACKAGES, setToJson(settings.excludedPackages))
             putString(KEY_INCLUDED_PACKAGES, setToJson(settings.includedPackages))
+            putBoolean(KEY_BYEDPI_ENABLED, settings.byeDpiEnabled)
+            putString(KEY_BYEDPI_ARGS, settings.byeDpiArgs)
             apply()
         }
     }
@@ -64,5 +72,7 @@ class SettingsStore(context: Context) {
         private const val KEY_VPN_APP_MODE = "vpn_app_mode"
         private const val KEY_EXCLUDED_PACKAGES = "excluded_pkgs"
         private const val KEY_INCLUDED_PACKAGES = "included_pkgs"
+        private const val KEY_BYEDPI_ENABLED = "byedpi_enabled"
+        private const val KEY_BYEDPI_ARGS = "byedpi_args"
     }
 }

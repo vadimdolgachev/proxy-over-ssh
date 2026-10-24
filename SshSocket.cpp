@@ -6,11 +6,13 @@
 #include <chrono>
 #include <libssh2.h>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
+#include "ByeDpiRuntime.h"
 #include "Logger.h"
 #include "SessionPool.h"
 #include "SshError.h"
@@ -29,8 +31,17 @@ ResultCode SshSocket::handleLibSsh2Result(const int rc, const char *operation) {
         return ResultCode::ErrAgain;
     }
     if (rc != 0) {
+        char *message = nullptr;
+        int length = 0;
+        if (sessionHandle && sessionHandle->sshSession) {
+            libssh2_session_last_error(sessionHandle->sshSession->raw(), &message, &length, 0);
+        }
+        const auto detail = message != nullptr && length > 0
+                                    ? std::string_view(message, static_cast<std::size_t>(length)).substr(0, 512)
+                                    : std::string_view{};
+        log_e("SSH {} failed for {}:{} via {}: {} ({}), detail='{}'\n", operation, sshConfig.host, sshConfig.port,
+              sshConfig.byeDpi ? "ByeDPI" : "direct TCP", rc, SshError::libSsh2ErrorToString(rc), detail);
         sessionHandle = std::nullopt;
-        SshError::logError(operation, rc);
         return SshError::libSsh2ToResultCode(rc);
     }
     pendingDirections = 0;
@@ -80,6 +91,9 @@ uint32_t SshSocket::computePollEvents(const int directions, const uint32_t defau
 }
 
 ResultCode SshSocket::tryConnectNonBlocking() {
+    if (sshConfig.byeDpi && !sshConfig.byeDpi->isRunning()) {
+        return ResultCode::ErrIO;
+    }
     if (sessionPool != nullptr && sessionHandle == std::nullopt) {
         if (auto opt = sessionPool->acquire()) {
             sessionHandle = std::move(*opt);
@@ -136,10 +150,12 @@ SshSocket::~SshSocket() {
 
 ResultCode SshSocket::tryTcpConnect() {
     if (sessionHandle == std::nullopt) {
+        log_d("SSH transport connecting to {}:{} via {}\n", sshConfig.host, sshConfig.port,
+              sshConfig.byeDpi ? "ByeDPI" : "direct TCP");
         sessionHandle = SshSessionHandler{
-            .sshSession = nullptr,
-            .tcpSocket = std::make_unique<Socket>(),
-            .lastUsed = std::chrono::steady_clock::now(),
+                .sshSession = nullptr,
+                .tcpSocket = std::make_unique<Socket>(),
+                .lastUsed = std::chrono::steady_clock::now(),
         };
     }
 
@@ -148,7 +164,15 @@ ResultCode SshSocket::tryTcpConnect() {
     }
 
     const int fd = sessionHandle->tcpSocket->fd();
-    auto [storage, len] = sshServerEndpoint.sockaddrStorage();
+    auto endpoint = sshServerEndpoint;
+    if (sshConfig.byeDpi) {
+        sockaddr_in loopback{};
+        loopback.sin_family = AF_INET;
+        loopback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        loopback.sin_port = htons(sshConfig.byeDpi->port());
+        endpoint = Endpoint(loopback);
+    }
+    auto [storage, len] = endpoint.sockaddrStorage();
 
     if (const int rc = connect(fd, reinterpret_cast<const sockaddr *>(&storage), len); rc == 0) {
         connectionState = State::TCP_CONNECTED;
@@ -185,11 +209,27 @@ ResultCode SshSocket::advanceConnection() {
                 return ResultCode::ErrAgain;
             }
             connectionState = rc == ResultCode::Ok ? State::TCP_CONNECTED : State::ERROR;
+            if (rc == ResultCode::Ok) {
+                log_d("SSH transport TCP connected ({})\n", sshConfig.byeDpi ? "local ByeDPI" : "SSH server");
+            } else {
+                log_e("SSH transport TCP connect failed for {}:{}: errno={} ({})\n", sshConfig.host, sshConfig.port,
+                      errno, std::strerror(errno));
+            }
             return rc;
         }
         case State::TCP_CONNECTED: {
+            const auto rc = connectThroughByeDpi();
+            if (rc == ResultCode::Ok) {
+                connectionState = State::SocksConnected;
+            } else if (rc != ResultCode::ErrAgain) {
+                connectionState = State::ERROR;
+            }
+            return rc;
+        }
+        case State::SocksConnected: {
             const auto rc = performHandshake();
             if (rc == ResultCode::Ok) {
+                log_d("SSH handshake completed for {}:{}\n", sshConfig.host, sshConfig.port);
                 connectionState = State::SSH_HANDSHAKE;
             } else if (rc != ResultCode::ErrAgain) {
                 connectionState = State::ERROR;
@@ -231,9 +271,31 @@ ResultCode SshSocket::advanceConnection() {
     return ResultCode::ErrUnknown;
 }
 
+ResultCode SshSocket::connectThroughByeDpi() {
+    if (!sshConfig.byeDpi) {
+        return ResultCode::Ok;
+    }
+    if (!socksClient) {
+        socksClient.emplace(sshServerEndpoint);
+    }
+    const auto result = socksClient->advance(sessionHandle->tcpSocket->fd());
+    if (result == ResultCode::ErrAgain) {
+        pendingDirections = socksClient->wantsRead() ? LIBSSH2_SESSION_BLOCK_INBOUND : LIBSSH2_SESSION_BLOCK_OUTBOUND;
+    } else {
+        pendingDirections = 0;
+        if (result != ResultCode::Ok) {
+            log_e("ByeDPI SSH transport failed: {}\n", socksClient->error());
+        } else {
+            log_d("ByeDPI SOCKS5 CONNECT established to {}:{}\n", sshConfig.host, sshConfig.port);
+        }
+    }
+    return result;
+}
+
 ResultCode SshSocket::performHandshake() {
     std::lock_guard lock(sshMutex);
     if (sessionHandle->sshSession == nullptr) {
+        log_d("SSH handshake starting for {}:{}\n", sshConfig.host, sshConfig.port);
         try {
             sessionHandle->sshSession = std::make_unique<SshSession>();
         } catch (const std::exception &e) {
@@ -474,6 +536,7 @@ void SshSocket::close() noexcept {
         }
         connectionState = State::DISCONNECTED;
         pendingDirections = 0;
+        socksClient.reset();
     } catch (...) {
         reusable = false;
         libSsh2Channel = nullptr;

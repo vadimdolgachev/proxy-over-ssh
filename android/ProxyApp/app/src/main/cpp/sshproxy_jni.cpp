@@ -8,6 +8,7 @@
 #include <thread>
 #include <utility>
 
+#include "ByeDpiRuntime.h"
 #include "CancellationToken.h"
 #include "Endpoint.h"
 #include "Logger.h"
@@ -27,6 +28,7 @@ namespace {
     jmethodID gMethodOnFinished = nullptr;
     jmethodID gMethodOnError = nullptr;
     jmethodID gMethodOnTunnelFinished = nullptr;
+    jmethodID gMethodProtectSocket = nullptr;
 
     std::string normalizeKeyData(std::string key) {
         size_t pos = 0;
@@ -74,6 +76,7 @@ namespace {
 
     struct ProxyContext final {
         CancellationTokenSource cancellationTokenSource;
+        std::shared_ptr<ByeDpiRuntime> byeDpi;
         std::shared_ptr<SessionPool> sessionPool = std::make_shared<SessionPool>();
         std::unique_ptr<SSHProxy> proxy = std::make_unique<SSHProxy>(cancellationTokenSource);
         std::thread tunnelThread;
@@ -133,7 +136,7 @@ namespace {
         if (ctx == nullptr || method == nullptr) {
             return;
         }
-        AttachedEnv attached;
+        const AttachedEnv attached;
         auto *const env = attached.get();
         if (env == nullptr) {
             return;
@@ -151,7 +154,7 @@ namespace {
         if (ctx == nullptr || method == nullptr) {
             return;
         }
-        AttachedEnv attached;
+        const AttachedEnv attached;
         auto *const env = attached.get();
         if (env == nullptr) {
             return;
@@ -169,7 +172,7 @@ namespace {
         if (ctx == nullptr || gMethodOnError == nullptr) {
             return;
         }
-        AttachedEnv attached;
+        const AttachedEnv attached;
         auto *const env = attached.get();
         if (env == nullptr) {
             return;
@@ -185,6 +188,23 @@ namespace {
         }
         clearCallbackException(env);
         env->DeleteLocalRef(listener);
+    }
+
+    bool protectSocket(ProxyContext *ctx, const int fd) {
+        const AttachedEnv attached;
+        auto *const env = attached.get();
+        if (env == nullptr) {
+            return false;
+        }
+        const auto listener = acquireListener(env, ctx);
+        if (listener == nullptr) {
+            return false;
+        }
+        const jboolean result = env->CallBooleanMethod(listener, gMethodProtectSocket, static_cast<jint>(fd));
+        const bool success = !env->ExceptionCheck() && result == JNI_TRUE;
+        clearCallbackException(env);
+        env->DeleteLocalRef(listener);
+        return success;
     }
 
     void replaceListener(JNIEnv *env, ProxyContext *ctx, jobject listener) {
@@ -254,8 +274,10 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     gMethodOnFinished = env->GetMethodID(listenerClass, "onFinished", "()V");
     gMethodOnError = env->GetMethodID(listenerClass, "onError", "(JLjava/lang/String;)V");
     gMethodOnTunnelFinished = env->GetMethodID(listenerClass, "onTunnelFinished", "(J)V");
+    gMethodProtectSocket = env->GetMethodID(listenerClass, "protectSocket", "(I)Z");
     const bool valid = gMethodOnStarted != nullptr && gMethodOnFinished != nullptr &&
-                       gMethodOnError != nullptr && gMethodOnTunnelFinished != nullptr && !env->ExceptionCheck();
+                       gMethodOnError != nullptr && gMethodOnTunnelFinished != nullptr &&
+                       gMethodProtectSocket != nullptr && !env->ExceptionCheck();
     env->DeleteLocalRef(listenerClass);
     return valid ? JNI_VERSION_1_6 : JNI_ERR;
 }
@@ -291,7 +313,10 @@ Java_io_sshproxy_app_ProxyNative_nativeStart(JNIEnv *env,
                         jstring sshUsername,
                         jstring privateKeyData,
                         jstring hostKeySha256,
-                        const jint listenPort) {
+                        const jint listenPort,
+                        const jboolean protectSockets,
+                        const jboolean byeDpiEnabled,
+                        jstring byeDpiArgs) {
     try {
         auto *const ctx = requireContext(handle);
         const UtfString host(env, sshHost, "SSH host");
@@ -306,6 +331,20 @@ Java_io_sshproxy_app_ProxyNative_nativeStart(JNIEnv *env,
         if (privateKeyData != nullptr) {
             const UtfString privateKey(env, privateKeyData, "SSH private key");
             sshConfig.privateKeyData = normalizeKeyData(privateKey.str());
+        }
+
+        if (byeDpiEnabled == JNI_TRUE) {
+            const UtfString options(env, byeDpiArgs, "ByeDPI arguments");
+            ByeDpiRuntime::SocketProtector protector;
+            if (protectSockets == JNI_TRUE) {
+                protector = [ctx](const int fd) { return protectSocket(ctx, fd); };
+            }
+            ctx->byeDpi = std::make_shared<ByeDpiRuntime>(options.str(), std::move(protector), [ctx](const int error) {
+                // Post the cause before cancellation can post a generic onFinished notification.
+                callErrorMethod(ctx, -error, "Embedded ByeDPI stopped unexpectedly");
+                ctx->cancellationTokenSource.requestStop();
+            });
+            sshConfig.byeDpi = ctx->byeDpi;
         }
 
         const auto factory = [sshConfig, sessionPool = ctx->sessionPool](const Endpoint &) -> BackendSocketPtr {
@@ -329,7 +368,11 @@ Java_io_sshproxy_app_ProxyNative_nativeStart(JNIEnv *env,
 extern "C" JNIEXPORT void JNICALL
 Java_io_sshproxy_app_ProxyNative_nativeStop(JNIEnv *env, jobject, const jlong handle) {
     try {
-        requireContext(handle)->proxy->requestStop();
+        const auto *const ctx = requireContext(handle);
+        if (ctx->byeDpi) {
+            ctx->byeDpi->requestStop();
+        }
+        ctx->proxy->requestStop();
     } catch (const std::exception &e) {
         throwJavaException(env, "java/lang/RuntimeException", e.what());
     }
@@ -342,6 +385,9 @@ Java_io_sshproxy_app_ProxyNative_nativeDestroy(JNIEnv *env, jobject, const jlong
     }
     auto *const ctx = reinterpret_cast<ProxyContext *>(handle);
     try {
+        if (ctx->byeDpi) {
+            ctx->byeDpi->requestStop();
+        }
         ctx->proxy->requestStop();
         ctx->proxy->waitForFinish();
         if (ctx->tunnelThread.joinable()) {
@@ -351,6 +397,10 @@ Java_io_sshproxy_app_ProxyNative_nativeDestroy(JNIEnv *env, jobject, const jlong
     } catch (const std::exception &e) {
         throwJavaException(env, "java/lang/RuntimeException", e.what());
     }
+    // Keep the Java listener and its mutex alive until every ByeDPI callback has finished.
+    ctx->proxy.reset();
+    ctx->sessionPool.reset();
+    ctx->byeDpi.reset();
     deleteListener(env, ctx);
     delete ctx;
 }

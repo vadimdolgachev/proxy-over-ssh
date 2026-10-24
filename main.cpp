@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <csignal>
 #include <expected>
@@ -8,6 +9,7 @@
 #include <unordered_map>
 
 #include "BackendSocket.h"
+#include "ByeDpiRuntime.h"
 #include "CancellationToken.h"
 #include "Logger.h"
 #include "SSHProxy.h"
@@ -20,7 +22,7 @@ namespace {
     std::string parsePrivateKey(const std::string_view privateKey) {
         using namespace std::string_view_literals;
         auto content = std::string(privateKey);
-        if (content.starts_with("$")) {
+        if (content.starts_with('$')) {
             for (const auto pattern: {"$"sv, "{"sv, "}"sv}) {
                 size_t pos = 0;
                 while ((pos = content.find(pattern, pos)) != std::string::npos) {
@@ -45,6 +47,7 @@ namespace {
     struct AppConfig {
         SSHConfig ssh;
         std::uint16_t listenPort;
+        std::optional<std::string> byeDpiArgs;
     };
 
     std::expected<AppConfig, std::string> parseConfig(const int argc, char **argv) {
@@ -75,9 +78,7 @@ namespace {
             }
 
             std::uint16_t value{};
-            auto [ptr, ec] = std::from_chars(v->data(), v->data() + v->size(), value);
-
-            if (ec != std::errc{}) {
+            if (const auto [ptr, ec] = std::from_chars(v->data(), v->data() + v->size(), value); ec != std::errc{}) {
                 return std::unexpected("Invalid integer value for " + std::string(key));
             }
             return value;
@@ -128,6 +129,9 @@ namespace {
                 .privateKeyData = sshPrivateKeyOpt,
             },
             .listenPort = *listenPort,
+            .byeDpiArgs = args.contains("--byedpi-args")
+                                  ? std::optional<std::string>(args.at("--byedpi-args"))
+                                  : std::nullopt,
         };
     }
 
@@ -141,23 +145,41 @@ extern "C" void onSignalTerm(int) {
 
 int main(const int argc, char **argv) {
     std::signal(SIGTERM, onSignalTerm);
-    if (const auto appConfig = parseConfig(argc, argv)) {
-        auto sessionPool = std::make_shared<SessionPool>(25);
+    std::signal(SIGINT, onSignalTerm);
+    std::atomic_bool byeDpiFailed = false;
+    try {
+        auto appConfig = parseConfig(argc, argv);
+        if (!appConfig) {
+            log_e("Failed to parse arguments: {}\n", appConfig.error());
+            return 1;
+        }
+        if (appConfig->byeDpiArgs) {
+            appConfig->ssh.byeDpi = std::make_shared<ByeDpiRuntime>(
+                    *appConfig->byeDpiArgs, ByeDpiRuntime::SocketProtector{}, [&](int) {
+                        byeDpiFailed.store(true);
+                        cancellationTokenSource.requestStop();
+                    });
+        }
+        auto sessionPool = std::make_shared<SessionPool>(Constants::SESSION_POOL_MAX_SIZE);
         const auto factory = [sshConfig = appConfig->ssh, sessionPool](const Endpoint &) -> BackendSocketPtr {
             return std::make_shared<SshSocket>(sshConfig, sessionPool);
         };
 
-        ProxyConfig proxyConfig {
+        const ProxyConfig proxyConfig {
             .backendFactory = factory,
             .listenPort = appConfig->listenPort,
         };
 
-        auto proxy = std::make_unique<SSHProxy>(cancellationTokenSource);
+        const auto proxy = std::make_unique<SSHProxy>(cancellationTokenSource);
         proxy->start(proxyConfig, std::nullopt, std::nullopt);
         proxy->waitForFinish();
-    } else {
-        log_e("Failed to parse arguments: {}\n", appConfig.error());
+        if (appConfig->ssh.byeDpi) {
+            appConfig->ssh.byeDpi->requestStop();
+        }
+    } catch (const std::exception &error) {
+        log_e("Failed to run proxy: {}\n", error.what());
+        return 1;
     }
     log_d("Exit\n");
-    return 0;
+    return byeDpiFailed.load() ? 1 : 0;
 }

@@ -17,6 +17,7 @@
 #include "Endpoint.h"
 #include "SSHProxy.h"
 #include "SessionPool.h"
+#include "Socks5Client.h"
 #include "SshHostKey.h"
 #include "SshSessionHandler.h"
 
@@ -31,6 +32,7 @@ public:
     enum class State {
         DISCONNECTED,
         TCP_CONNECTED,
+        SocksConnected,
         SSH_HANDSHAKE,
         SSH_HOST_VERIFIED,
         SSH_AUTHENTICATED,
@@ -70,6 +72,8 @@ private:
 
     ResultCode performHandshake();
 
+    ResultCode connectThroughByeDpi();
+
     ResultCode verifyHostKey();
 
     ResultCode performAuthentication();
@@ -94,6 +98,7 @@ private:
     SSHConfig sshConfig;
     SshHostKey::Sha256Digest expectedHostKeySha256 = {};
     CoroLite::Endpoint sshServerEndpoint;
+    std::optional<Socks5Client> socksClient;
     std::optional<SshSessionHandler> sessionHandle;
     LIBSSH2_CHANNEL *libSsh2Channel = nullptr;
     int pendingDirections = 0;

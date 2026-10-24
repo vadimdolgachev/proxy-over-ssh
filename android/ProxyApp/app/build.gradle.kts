@@ -14,7 +14,8 @@ android {
     ndkVersion = "29.0.14206865"
 
     defaultConfig {
-        applicationId = "io.sshproxy.app"
+        applicationId = providers.gradleProperty("profileTestApplicationId").orElse("io.sshproxy.app").get()
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         minSdk = 26
         targetSdk = 36
         versionCode = 1
@@ -40,6 +41,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.getByName("debug")
             externalNativeBuild {
                 cmake {
                     arguments += "-DCMAKE_BUILD_TYPE=Release"

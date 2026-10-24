@@ -48,6 +48,9 @@ class ProxyService : VpnService(), ProxyListener {
     val currentStatus: ProxyStatus
         get() = status
 
+    val currentProfileId: String?
+        get() = pendingStart?.profileId
+
     val isProxyRunning: Boolean
         get() = status.state == ProxyState.RUNNING
 
@@ -105,6 +108,9 @@ class ProxyService : VpnService(), ProxyListener {
                 profile.privateKeyBase64,
                 profile.hostKeySha256,
                 settings.socksPort,
+                settings.vpnMode,
+                settings.byeDpiEnabled,
+                settings.byeDpiArgs,
             )
         } catch (e: Exception) {
             failRun(runGeneration, e.message ?: "Unable to start proxy")
@@ -165,6 +171,8 @@ class ProxyService : VpnService(), ProxyListener {
             }
         }
     }
+
+    override fun protectSocket(fd: Int): Boolean = protect(fd)
 
     private fun postForCurrentRun(block: (PendingStart) -> Unit) {
         val callbackGeneration = pendingStart?.generation ?: return

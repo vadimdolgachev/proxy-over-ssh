@@ -4,6 +4,7 @@ project(proxy_over_ssh)
 set(CMAKE_CXX_STANDARD 23)
 
 add_subdirectory(third_party/coro_lite)
+include(cmake/ByeDpi.cmake)
 
 include(cmake/CPM.cmake)
 
@@ -76,6 +77,7 @@ target_link_libraries(proxy_over_ssh PRIVATE
         OpenSSL::Crypto
         OpenSSL::SSL
         libssh2
+        byedpi_runtime
 )
 add_dependencies(proxy_over_ssh crypto ssl)
 target_compile_options(proxy_over_ssh PRIVATE -Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion -Wsign-conversion -Wnull-dereference -Wno-unused-variable -Wno-unused-parameter -Wno-unused-private-field -Werror=uninitialized -Wno-unused-function -fno-omit-frame-pointer)
@@ -138,4 +140,50 @@ if (PROXY_BUILD_TESTS AND NOT ANDROID)
     target_link_libraries(ssh_host_key_test PRIVATE OpenSSL::Crypto)
     add_dependencies(ssh_host_key_test crypto)
     add_test(NAME ssh_host_key COMMAND ssh_host_key_test)
+
+    foreach(test_name socks5_client byedpi_runtime byedpi_arguments)
+        if (test_name STREQUAL "socks5_client")
+            set(test_source tests/Socks5ClientTest.cpp)
+        elseif (test_name STREQUAL "byedpi_runtime")
+            set(test_source tests/ByeDpiRuntimeTest.cpp)
+        else ()
+            set(test_source tests/ByeDpiArgumentsTest.cpp)
+        endif ()
+        add_executable(${test_name}_test ${test_source})
+        target_link_libraries(${test_name}_test PRIVATE byedpi_runtime)
+        target_compile_options(${test_name}_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+        target_compile_options(${test_name}_test PRIVATE
+                $<$<STREQUAL:${SANITIZER},address>:-fsanitize=address>
+                $<$<STREQUAL:${SANITIZER},thread>:-fsanitize=thread>
+        )
+        add_test(NAME ${test_name} COMMAND ${test_name}_test)
+        set_tests_properties(${test_name} PROPERTIES TIMEOUT 30)
+    endforeach()
+    target_link_options(byedpi_runtime_test PRIVATE "LINKER:--wrap=pthread_sigmask")
+    add_test(NAME byedpi_sigpipe COMMAND byedpi_runtime_test --sigpipe)
+    add_test(NAME byedpi_signal_startup COMMAND byedpi_runtime_test --signal-setup-failure)
+    set_tests_properties(byedpi_sigpipe byedpi_signal_startup PROPERTIES TIMEOUT 30)
+    add_executable(byedpi_cache_test tests/ByeDpiCacheTest.c)
+    target_include_directories(byedpi_cache_test PRIVATE third_party/byedpi)
+    target_link_libraries(byedpi_cache_test PRIVATE byedpi_engine)
+    add_executable(byedpi_lifecycle_test tests/ByeDpiLifecycleTest.cpp)
+    target_link_libraries(byedpi_lifecycle_test PRIVATE byedpi_runtime)
+    target_link_options(byedpi_lifecycle_test PRIVATE "LINKER:--wrap=accept4" "LINKER:--wrap=epoll_wait")
+    foreach(test_name byedpi_cache byedpi_lifecycle)
+        target_compile_options(${test_name}_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+        target_compile_options(${test_name}_test PRIVATE
+                $<$<STREQUAL:${SANITIZER},address>:-fsanitize=address>
+                $<$<STREQUAL:${SANITIZER},thread>:-fsanitize=thread>)
+        add_test(NAME ${test_name} COMMAND ${test_name}_test)
+        set_tests_properties(${test_name} PROPERTIES TIMEOUT 30)
+    endforeach()
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME byedpi_failure COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/ByeDpiFailureTest.py $<TARGET_FILE:proxy_over_ssh>)
+        set_tests_properties(byedpi_failure PROPERTIES TIMEOUT 20)
+        add_test(NAME byedpi_ssh COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/ByeDpiSshTest.py $<TARGET_FILE:proxy_over_ssh>)
+        set_tests_properties(byedpi_ssh PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    endif ()
 endif ()

@@ -7,12 +7,15 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
 
 #include "BackendSocket.h"
 #include "CancellationToken.h"
+
+class ByeDpiRuntime;
 
 struct SSHConfig final {
     std::string username;
@@ -21,6 +24,7 @@ struct SSHConfig final {
     std::string hostKeySha256;
     std::optional<std::string> privateKeyPath = {};
     std::optional<std::string> privateKeyData = {};
+    std::shared_ptr<ByeDpiRuntime> byeDpi = {};
 };
 
 struct ProxyConfig final {

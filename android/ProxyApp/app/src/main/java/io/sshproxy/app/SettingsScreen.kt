@@ -1,6 +1,7 @@
 package io.sshproxy.app
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -29,6 +30,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -36,17 +38,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 
-data class AppInfo(
-    val name: String,
-    val packageName: String,
-)
-
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun SettingsScreen(
     settings: AppSettings,
     onSaveSettings: (AppSettings) -> Unit,
-    onBack: () -> Unit,
+    onClose: () -> Unit,
 ) {
     var vpnMode by rememberSaveable { mutableStateOf(settings.vpnMode) }
     var dnsAddress by rememberSaveable { mutableStateOf(settings.dnsAddress) }
@@ -54,11 +51,15 @@ fun SettingsScreen(
     var vpnAppMode by rememberSaveable { mutableStateOf(settings.vpnAppMode) }
     var excludedPackages by rememberSaveable { mutableStateOf(settings.excludedPackages) }
     var includedPackages by rememberSaveable { mutableStateOf(settings.includedPackages) }
+    var byeDpiEnabled by rememberSaveable { mutableStateOf(settings.byeDpiEnabled) }
+    var byeDpiArgs by rememberSaveable { mutableStateOf(settings.byeDpiArgs) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
 
     val context = LocalContext.current
     val ownPackage = context.packageName
-    val installedApps = rememberSaveable {
+    // remember, not rememberSaveable: the list is rebuilt from the package manager and is not
+    // parcelable, so it must not end up in the saved instance state.
+    val installedApps = remember {
         val pm = context.packageManager
         pm.getInstalledApplications(0)
             .filter { it.packageName != ownPackage }
@@ -77,13 +78,42 @@ fun SettingsScreen(
     }
 
     val selectedPackages = if (vpnAppMode == VpnAppMode.ALL_APPS) excludedPackages else includedPackages
-    val parsedPort = socksPort.toIntOrNull()
+    val orderedApps = remember(filteredApps, selectedPackages) {
+        AppListOrdering.prioritize(filteredApps, selectedPackages)
+    }
+
+    val parsedPort = socksPort.trim().toIntOrNull()
     val isPortValid = parsedPort != null && parsedPort in 1..65535
     val hasSelectedApps = !vpnMode || vpnAppMode != VpnAppMode.SELECTED_APPS || includedPackages.isNotEmpty()
-    val canSave = isPortValid && dnsAddress.isNotBlank() && hasSelectedApps
+    val isDnsValid = dnsAddress.isNotBlank()
+    val canSave = isPortValid && isDnsValid && hasSelectedApps
 
+    // The values the user is currently editing. parsedPort is -1 while the port is invalid, so such
+    // a state never compares equal to the stored settings.
+    val editedSettings = AppSettings(
+        dnsAddress = dnsAddress.trim(),
+        socksPort = parsedPort ?: -1,
+        vpnMode = vpnMode,
+        vpnAppMode = vpnAppMode,
+        excludedPackages = excludedPackages,
+        includedPackages = includedPackages,
+        byeDpiEnabled = byeDpiEnabled,
+        byeDpiArgs = byeDpiArgs,
+    )
+    val hasChanges = editedSettings != settings
+
+    val applySettings = {
+        if (canSave && hasChanges) {
+            onSaveSettings(editedSettings)
+        } else {
+            onClose()
+        }
+    }
+
+    // The toolbar arrow and the system back button behave the same way: valid values are applied,
+    // invalid ones are discarded instead of blocking the exit.
     BackHandler(enabled = true) {
-        onBack()
+        applySettings()
     }
 
     Scaffold(
@@ -91,18 +121,7 @@ fun SettingsScreen(
             TopAppBar(
                 title = { Text("Settings") },
                 navigationIcon = {
-                    IconButton(onClick = {
-                        onSaveSettings(
-                            AppSettings(
-                                dnsAddress = dnsAddress,
-                                socksPort = checkNotNull(parsedPort),
-                                vpnMode = vpnMode,
-                                vpnAppMode = vpnAppMode,
-                                excludedPackages = excludedPackages,
-                                includedPackages = includedPackages,
-                            )
-                        )
-                    }, enabled = canSave) {
+                    IconButton(onClick = { applySettings() }, enabled = canSave) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
@@ -145,6 +164,8 @@ fun SettingsScreen(
                 value = dnsAddress,
                 onValueChange = { dnsAddress = it },
                 label = { Text("DNS Server") },
+                supportingText = { if (!isDnsValid) Text("DNS server is required") },
+                isError = !isDnsValid,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp),
@@ -165,6 +186,31 @@ fun SettingsScreen(
                     .padding(horizontal = 16.dp),
                 singleLine = true,
             )
+
+            Spacer(modifier = Modifier.height(16.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("ByeDPI", style = MaterialTheme.typography.bodyLarge)
+                Switch(checked = byeDpiEnabled, onCheckedChange = { byeDpiEnabled = it })
+            }
+            Text(
+                "Route the SSH connection through ByeDPI",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
+            if (byeDpiEnabled) {
+                OutlinedTextField(
+                    value = byeDpiArgs,
+                    onValueChange = { byeDpiArgs = it },
+                    label = { Text("ByeDPI arguments") },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                    minLines = 2,
+                )
+            }
 
             if (vpnMode) {
                 Spacer(modifier = Modifier.height(24.dp))
@@ -241,11 +287,12 @@ fun SettingsScreen(
                         .height(400.dp)
                         .padding(horizontal = 16.dp),
                 ) {
-                    items(filteredApps, key = { it.packageName }) { app ->
+                    items(orderedApps, key = { it.packageName }) { app ->
                         val checked = app.packageName in selectedPackages
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .animateItem()
                                 .padding(vertical = 2.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
@@ -261,6 +308,10 @@ fun SettingsScreen(
                                         includedPackages = packages
                                     }
                                 },
+                            )
+                            AppIcon(
+                                packageName = app.packageName,
+                                modifier = Modifier.padding(end = 12.dp),
                             )
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(app.name, style = MaterialTheme.typography.bodyMedium)
