@@ -110,7 +110,7 @@ class ProxyService : VpnService(), ProxyListener {
                 settings.socksPort,
                 settings.vpnMode,
                 settings.byeDpiEnabled,
-                settings.byeDpiArgs,
+                ByeDpiPresets.effectiveByeDpiArgs(settings.byeDpiArgs, settings.byeDpiDebugLevel),
             )
         } catch (e: Exception) {
             failRun(runGeneration, e.message ?: "Unable to start proxy")

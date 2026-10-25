@@ -14,6 +14,7 @@ data class AppSettings(
     val includedPackages: Set<String> = emptySet(),
     val byeDpiEnabled: Boolean = false,
     val byeDpiArgs: String = DEFAULT_BYEDPI_ARGS,
+    val byeDpiDebugLevel: Int = 0,
 )
 
 enum class VpnAppMode {
@@ -36,6 +37,7 @@ class SettingsStore(context: Context) {
             includedPackages = loadStringSet(KEY_INCLUDED_PACKAGES),
             byeDpiEnabled = prefs.getBoolean(KEY_BYEDPI_ENABLED, false),
             byeDpiArgs = prefs.getString(KEY_BYEDPI_ARGS, DEFAULT_BYEDPI_ARGS) ?: DEFAULT_BYEDPI_ARGS,
+            byeDpiDebugLevel = prefs.getInt(KEY_BYEDPI_DEBUG_LEVEL, 0).coerceIn(0, 2),
         )
     }
 
@@ -49,6 +51,7 @@ class SettingsStore(context: Context) {
             putString(KEY_INCLUDED_PACKAGES, setToJson(settings.includedPackages))
             putBoolean(KEY_BYEDPI_ENABLED, settings.byeDpiEnabled)
             putString(KEY_BYEDPI_ARGS, settings.byeDpiArgs)
+            putInt(KEY_BYEDPI_DEBUG_LEVEL, settings.byeDpiDebugLevel)
             apply()
         }
     }
@@ -74,5 +77,6 @@ class SettingsStore(context: Context) {
         private const val KEY_INCLUDED_PACKAGES = "included_pkgs"
         private const val KEY_BYEDPI_ENABLED = "byedpi_enabled"
         private const val KEY_BYEDPI_ARGS = "byedpi_args"
+        private const val KEY_BYEDPI_DEBUG_LEVEL = "byedpi_debug_level"
     }
 }

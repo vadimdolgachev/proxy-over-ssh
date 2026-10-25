@@ -17,16 +17,19 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -38,6 +41,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+
+private const val CUSTOM_STRATEGY_LABEL = "Custom"
+private val BYE_DPI_DEBUG_LEVELS = listOf("Off" to 0, "Logs" to 1, "Verbose" to 2)
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -54,6 +60,7 @@ fun SettingsScreen(
     var includedPackages by rememberSaveable { mutableStateOf(settings.includedPackages) }
     var byeDpiEnabled by rememberSaveable { mutableStateOf(settings.byeDpiEnabled) }
     var byeDpiArgs by rememberSaveable { mutableStateOf(settings.byeDpiArgs) }
+    var byeDpiDebugLevel by rememberSaveable { mutableStateOf(settings.byeDpiDebugLevel) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
 
     val context = LocalContext.current
@@ -101,6 +108,7 @@ fun SettingsScreen(
         includedPackages = includedPackages,
         byeDpiEnabled = byeDpiEnabled,
         byeDpiArgs = byeDpiArgs,
+        byeDpiDebugLevel = byeDpiDebugLevel,
     )
     val hasChanges = editedSettings != settings
 
@@ -205,6 +213,17 @@ fun SettingsScreen(
                 modifier = Modifier.padding(horizontal = 16.dp),
             )
             if (byeDpiEnabled) {
+                SettingsDropdown(
+                    label = "ByeDPI strategy",
+                    options = ByeDpiPresets.ALL.map { it.name } + CUSTOM_STRATEGY_LABEL,
+                    selected = ByeDpiPresets.matchArgs(byeDpiArgs)?.name ?: CUSTOM_STRATEGY_LABEL,
+                    onSelect = { name ->
+                        ByeDpiPresets.ALL.firstOrNull { it.name == name }?.let { byeDpiArgs = it.args }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                )
                 OutlinedTextField(
                     value = byeDpiArgs,
                     onValueChange = { byeDpiArgs = it },
@@ -212,12 +231,27 @@ fun SettingsScreen(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
                     minLines = 2,
                 )
-                TextButton(
-                    onClick = { byeDpiArgs = DEFAULT_BYEDPI_ARGS },
+                val selectedDebugLabel = BYE_DPI_DEBUG_LEVELS
+                    .firstOrNull { it.second == byeDpiDebugLevel }?.first
+                SettingsDropdown(
+                    label = "ByeDPI debug level",
+                    options = BYE_DPI_DEBUG_LEVELS.map { it.first },
+                    selected = selectedDebugLabel ?: BYE_DPI_DEBUG_LEVELS.first().first,
+                    onSelect = { label ->
+                        BYE_DPI_DEBUG_LEVELS.firstOrNull { it.first == label }
+                            ?.let { byeDpiDebugLevel = it.second }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                )
+                Text(
+                    "Level 1 logs connections and strategies, level 2 adds verbose I/O. " +
+                        "Overrides -x in the arguments",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp),
-                ) {
-                    Text("Use default strategy")
-                }
+                )
             }
 
             if (vpnMode) {
@@ -340,6 +374,46 @@ fun SettingsScreen(
                 Text("Android app: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
                     style = MaterialTheme.typography.bodyMedium)
                 Text("proxy_over_ssh: $proxyVersion", style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsDropdown(
+    label: String,
+    options: List<String>,
+    selected: String,
+    onSelect: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { expanded = it },
+        modifier = modifier,
+    ) {
+        OutlinedTextField(
+            value = selected,
+            onValueChange = {},
+            readOnly = true,
+            label = { Text(label) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor(MenuAnchorType.PrimaryNotEditable),
+            singleLine = true,
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            options.forEach { option ->
+                DropdownMenuItem(
+                    text = { Text(option) },
+                    onClick = {
+                        onSelect(option)
+                        expanded = false
+                    },
+                )
             }
         }
     }
