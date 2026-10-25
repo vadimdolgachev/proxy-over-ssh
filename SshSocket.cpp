@@ -145,7 +145,7 @@ SshSocket::SshSocket(SSHConfig sshConfig_, const std::shared_ptr<SessionPool> &s
 }
 
 SshSocket::~SshSocket() {
-    close();
+    SshSocket::close();
 }
 
 ResultCode SshSocket::tryTcpConnect() {
@@ -298,7 +298,7 @@ ResultCode SshSocket::performHandshake() {
         log_d("SSH handshake starting for {}:{}\n", sshConfig.host, sshConfig.port);
         try {
             sessionHandle->sshSession = std::make_unique<SshSession>();
-        } catch (const std::exception &e) {
+        } catch (const std::exception &) {
             return ResultCode::ErrUnknown;
         }
     }
@@ -519,7 +519,7 @@ bool SshSocket::isEof() const noexcept {
 
 void SshSocket::close() noexcept {
     std::optional<SshSessionHandler> handleToRelease;
-    bool reusable = false;
+    bool reusable;
     try {
         std::lock_guard lock(sshMutex);
         reusable = connectionState == State::CHANNEL_CREATED;
@@ -573,22 +573,14 @@ void SshSocketAwaiterBase::onSuspend(const std::coroutine_handle<> h, uint32_t e
     assert(getScheduler() != nullptr);
     handle = h;
     events |= EpollScheduler::PollErr | EpollScheduler::PollHUp;
-    bool cancellationRegistered = false;
     if (cancellationToken && cancellationToken->isStopped()) {
         throw CancellationTokenException();
     }
+    const auto cancellationFd = cancellationToken ? std::optional{cancellationToken->getFd()} : std::nullopt;
     try {
-        if (cancellationToken) {
-            getScheduler()->add(EpollScheduler::PollIn, cancellationToken->getFd(), h);
-            cancellationRegistered = true;
-        }
-        getScheduler()->add(events, socket->fd(), h);
+        getScheduler()->addAwaiter(events, socket->fd(), h, cancellationFd);
     } catch (...) {
-        getScheduler()->rollbackAdd(socket->fd(), h);
-        if (cancellationRegistered) {
-            getScheduler()->rollbackAdd(cancellationToken->getFd(), h);
-        }
-        handle = nullptr;
+        if (cancellationToken && cancellationToken->isStopped()) throw CancellationTokenException{};
         throw;
     }
 }

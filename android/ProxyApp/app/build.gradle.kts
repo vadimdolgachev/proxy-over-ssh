@@ -44,14 +44,14 @@ android {
             signingConfig = signingConfigs.getByName("debug")
             externalNativeBuild {
                 cmake {
-                    arguments += "-DCMAKE_BUILD_TYPE=Release"
+                    arguments += listOf("-DCMAKE_BUILD_TYPE=Release", "-DCORO_LITE_VERBOSE_LOG=OFF")
                 }
             }
         }
         debug {
             externalNativeBuild {
                 cmake {
-                    arguments += "-DCMAKE_BUILD_TYPE=Release"
+                    arguments += listOf("-DCMAKE_BUILD_TYPE=Release", "-DCORO_LITE_VERBOSE_LOG=ON")
                 }
             }
         }

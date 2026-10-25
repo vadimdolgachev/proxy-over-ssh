@@ -10,6 +10,7 @@ get_filename_component(PROXY_OVER_SSH_DIR
 message(STATUS "PROXY_OVER_SSH_DIR = ${PROXY_OVER_SSH_DIR}")
 include(${PROXY_OVER_SSH_DIR}/cmake/ProxyVersion.cmake)
 
+set(CORO_LITE_LOG_TAG "SSHProxy")
 add_subdirectory(
         ${PROXY_OVER_SSH_DIR}/third_party/coro_lite
         ${CMAKE_CURRENT_BINARY_DIR}/coro_lite
