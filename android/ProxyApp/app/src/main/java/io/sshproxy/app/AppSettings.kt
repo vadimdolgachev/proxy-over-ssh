@@ -3,7 +3,7 @@ package io.sshproxy.app
 import android.content.Context
 import org.json.JSONArray
 
-const val DEFAULT_BYEDPI_ARGS = "--oob 1 -s 2 -M h,d -A torst -T 3 -f -1 -r 3+s -S --auto=none"
+const val DEFAULT_BYEDPI_ARGS = "-f -1 -t 8 -R 1"
 
 data class AppSettings(
     val dnsAddress: String = "1.1.1.1",

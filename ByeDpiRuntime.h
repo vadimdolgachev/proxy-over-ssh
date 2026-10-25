@@ -11,7 +11,11 @@
 
 struct byedpi_engine;
 
-inline constexpr std::string_view DefaultByeDpiArgs = "--oob 1 -s 2 -M h,d -A torst -T 3 -f -1 -r 3+s -S --auto=none";
+#if defined(__ANDROID__)
+inline constexpr std::string_view DefaultByeDpiArgs = "-f -1 -t 8 -R 1";
+#else
+inline constexpr std::string_view DefaultByeDpiArgs = "-f -1 -t 8 -S -R 1";
+#endif
 
 class ByeDpiRuntime final {
 public:

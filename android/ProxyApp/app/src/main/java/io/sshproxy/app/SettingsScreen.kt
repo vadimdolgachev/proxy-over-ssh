@@ -26,6 +26,7 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -211,6 +212,12 @@ fun SettingsScreen(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
                     minLines = 2,
                 )
+                TextButton(
+                    onClick = { byeDpiArgs = DEFAULT_BYEDPI_ARGS },
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                ) {
+                    Text("Use default strategy")
+                }
             }
 
             if (vpnMode) {

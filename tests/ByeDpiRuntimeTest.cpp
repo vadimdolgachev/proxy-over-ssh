@@ -7,13 +7,11 @@
 #include <fcntl.h>
 #include <future>
 #include <poll.h>
-#include <pthread.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
 #include <system_error>
-#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -28,7 +26,7 @@ namespace {
 
 extern "C" int __real_pthread_sigmask(int how, const sigset_t *set, sigset_t *oldSet);
 
-extern "C" int __wrap_pthread_sigmask(int how, const sigset_t *set, sigset_t *oldSet) {
+extern "C" int __wrap_pthread_sigmask(const int how, const sigset_t *set, sigset_t *oldSet) {
     if (how == SIG_BLOCK && set != nullptr && sigismember(set, SIGPIPE) == 1 && failNextSignalSetup.exchange(false)) {
         return EINVAL;
     }
@@ -38,7 +36,7 @@ extern "C" int __wrap_pthread_sigmask(int how, const sigset_t *set, sigset_t *ol
 namespace {
     class Fd {
     public:
-        explicit Fd(int value) :
+        explicit Fd(const int value) :
             descriptor(value) {
             assert(value >= 0);
         }
@@ -55,8 +53,8 @@ namespace {
         int descriptor;
     };
 
-    void waitFor(int fd, short events) {
-        pollfd descriptor{fd, events, 0};
+    void waitFor(const int fd, const short events) {
+        pollfd descriptor{.fd = fd, .events = events, .revents = 0};
         int result;
         do {
             result = poll(&descriptor, 1, 5000);
@@ -64,7 +62,7 @@ namespace {
         assert(result == 1);
     }
 
-    void sendAll(int fd, const std::string &data) {
+    void sendAll(const int fd, const std::string &data) {
         std::size_t offset = 0;
         while (offset < data.size()) {
             waitFor(fd, POLLOUT);
@@ -76,7 +74,7 @@ namespace {
         }
     }
 
-    std::string readExact(int fd, std::size_t size) {
+    std::string readExact(const int fd, const std::size_t size) {
         std::string result(size, '\0');
         std::size_t offset = 0;
         while (offset < size) {
@@ -90,7 +88,7 @@ namespace {
         return result;
     }
 
-    ResultCode negotiate(int fd, const Endpoint &target) {
+    ResultCode negotiate(const int fd, const Endpoint &target) {
         Socks5Client handshake(target);
         ResultCode result;
         while ((result = handshake.advance(fd)) == ResultCode::ErrAgain) {
@@ -99,7 +97,7 @@ namespace {
         return result;
     }
 
-    int connectLocal(std::uint16_t port) {
+    int connectLocal(const std::uint16_t port) {
         const int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         assert(fd >= 0);
         sockaddr_in address{};
@@ -115,8 +113,8 @@ namespace {
         return fd;
     }
 
-    void testTunnel(std::string_view options) {
-        Fd listener(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    void testTunnel(const std::string_view options) {
+        const Fd listener(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
         sockaddr_in address{};
         address.sin_family = AF_INET;
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -127,6 +125,7 @@ namespace {
 
         constexpr int Connections = 4;
         const std::string banner = "SSH-2.0-embedded-test\r\n";
+        const std::string clientBanner = "SSH-2.0-client-test\r\n";
         const std::string payload = std::string(40000, 'x') + std::string(40000, 'y');
         auto server = std::async(std::launch::async, [&] {
             std::vector<std::future<void>> workers;
@@ -135,8 +134,10 @@ namespace {
                 const int accepted = accept(listener.get(), nullptr, nullptr);
                 assert(accepted >= 0);
                 workers.push_back(std::async(std::launch::async, [&, accepted] {
-                    Fd connection(accepted);
+                    const Fd connection(accepted);
                     sendAll(connection.get(), banner); // SSH sends a banner before receiving application data.
+                    assert(readExact(connection.get(), clientBanner.size()) == clientBanner);
+                    sendAll(connection.get(), clientBanner);
                     assert(readExact(connection.get(), payload.size()) == payload);
                     sendAll(connection.get(), payload);
                 }));
@@ -144,9 +145,9 @@ namespace {
             for (auto &worker: workers)
                 worker.get();
         });
-        std::atomic_int protectedSockets = 0;
         {
-            ByeDpiRuntime runtime(options, [&](int fd) {
+            std::atomic_int protectedSockets = 0;
+            const ByeDpiRuntime runtime(options, [&](const int fd) {
                 sockaddr_storage peer{};
                 socklen_t peerLength = sizeof(peer);
                 assert(getpeername(fd, reinterpret_cast<sockaddr *>(&peer), &peerLength) < 0 && errno == ENOTCONN);
@@ -156,9 +157,11 @@ namespace {
             std::vector<std::future<void>> clients;
             for (int i = 0; i < Connections; ++i) {
                 clients.push_back(std::async(std::launch::async, [&] {
-                    Fd connection(connectLocal(runtime.port()));
+                    const Fd connection(connectLocal(runtime.port()));
                     assert(negotiate(connection.get(), Endpoint(address)) == ResultCode::Ok);
                     assert(readExact(connection.get(), banner.size()) == banner);
+                    sendAll(connection.get(), clientBanner);
+                    assert(readExact(connection.get(), clientBanner.size()) == clientBanner);
                     sendAll(connection.get(), payload);
                     assert(readExact(connection.get(), payload.size()) == payload);
                 }));
@@ -188,11 +191,11 @@ namespace {
 
     void testProtectionFailure() {
         std::atomic_int attempts = 0;
-        ByeDpiRuntime runtime("--split 2", [&](int) {
+        const ByeDpiRuntime runtime("--split 2", [&](int) {
             ++attempts;
             return false;
         });
-        Fd connection(connectLocal(runtime.port()));
+        const Fd connection(connectLocal(runtime.port()));
         sockaddr_in destination{};
         destination.sin_family = AF_INET;
         destination.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -203,7 +206,7 @@ namespace {
 
     void testStopWithPendingClient() {
         auto runtime = std::make_unique<ByeDpiRuntime>("--split 2");
-        Fd connection(connectLocal(runtime->port()));
+        const Fd connection(connectLocal(runtime->port()));
         runtime.reset();
         waitFor(connection.get(), POLLIN);
         char byte = 0;
@@ -255,12 +258,12 @@ namespace {
         assert(sigaddset(&signal, SIGPIPE) == 0);
         assert(pthread_sigmask(SIG_UNBLOCK, &signal, nullptr) == 0);
         const auto before = currentSignalMask();
-        std::atomic_bool exercised = false;
         {
-            ByeDpiRuntime runtime("--split 2", [&](int) {
+            std::atomic_bool exercised = false;
+            const ByeDpiRuntime runtime("--split 2", [&](int) {
                 const auto workerMask = currentSignalMask();
                 assert(sigismember(&workerMask, SIGPIPE) == 1);
-                Fd listener(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+                const Fd listener(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
                 sockaddr_in address{};
                 address.sin_family = AF_INET;
                 address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -268,15 +271,15 @@ namespace {
                 socklen_t length = sizeof(address);
                 assert(getsockname(listener.get(), reinterpret_cast<sockaddr *>(&address), &length) == 0);
                 assert(listen(listener.get(), 1) == 0);
-                Fd sender(connectLocal(ntohs(address.sin_port)));
+                const Fd sender(connectLocal(ntohs(address.sin_port)));
                 Fd peer(accept(listener.get(), nullptr, nullptr));
                 assert(shutdown(sender.get(), SHUT_WR) == 0);
                 // Deliberately omit MSG_NOSIGNAL: this also covers Android's fortified send path.
                 assert(send(sender.get(), "x", 1, 0) == -1 && errno == EPIPE);
                 int pipeFds[2];
                 assert(pipe(pipeFds) == 0);
-                Fd input(pipeFds[0]);
-                Fd output(pipeFds[1]);
+                const Fd input(pipeFds[0]);
+                const Fd output(pipeFds[1]);
                 assert(write(output.get(), "x", 1) == 1);
                 assert(splice(input.get(), nullptr, sender.get(), nullptr, 1, 0) == -1 && errno == EPIPE);
                 sigset_t pending;
@@ -287,7 +290,7 @@ namespace {
             });
             assert(runtime.isRunning());
             assertSignalMasksEqual(before, currentSignalMask());
-            Fd connection(connectLocal(runtime.port()));
+            const Fd connection(connectLocal(runtime.port()));
             sockaddr_in destination{};
             destination.sin_family = AF_INET;
             destination.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -325,7 +328,7 @@ int main(int argc, char **argv) {
         }
         assert(rejected && runtime.isRunning());
     }
-    testTunnel("--split 2");
+    testTunnel("--split 2 -R 1-2");
     testTunnel(DefaultByeDpiArgs);
     testProtectionFailure();
     testStopWithPendingClient();

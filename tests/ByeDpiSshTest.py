@@ -17,7 +17,7 @@ except ImportError:
     print("SKIP: install paramiko to run the local SSH integration test")
     sys.exit(77)
 
-BYEDPI_ARGS = "--oob 1 -s 2 -M h,d -A torst -T 3 -f -1 -r 3+s -S --auto=none"
+BYEDPI_ARGS = "-f -1 -t 8 -S -R 1"
 PAYLOAD = b"SSH through embedded ByeDPI\x00" * 300
 
 

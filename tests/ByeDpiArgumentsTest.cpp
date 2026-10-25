@@ -16,17 +16,18 @@ extern "C" ssize_t parse_cform(char *buffer, size_t capacity, const char *data, 
 extern "C" char *data_from_str(const char *data, ssize_t *size);
 
 namespace {
-    void expectArguments(std::string_view input, std::initializer_list<std::string_view> expected) {
+    void expectArguments(const std::string_view input, const std::initializer_list<std::string_view> expected) {
         const auto arguments = ByeDpi::Detail::splitArguments(input);
         assert(arguments.front() == "embedded-byedpi");
         assert(arguments.size() == expected.size() + 1);
         std::size_t index = 1;
         for (const auto argument: expected) {
-            assert(arguments[index++] == argument);
+            assert(arguments[index] == argument);
+            ++index;
         }
     }
 
-    void expectRejected(std::string_view input) {
+    void expectRejected(const std::string_view input) {
         bool rejected = false;
         try {
             (void) ByeDpi::Detail::splitArguments(input);
@@ -64,8 +65,7 @@ namespace {
 int main() {
     expectArguments("", {});
     expectArguments(" \t\r\n ", {});
-    expectArguments(DefaultByeDpiArgs, {"--oob", "1", "-s", "2", "-M", "h,d", "-A", "torst", "-T", "3", "-f", "-1",
-                                        "-r", "3+s", "-S", "--auto=none"});
+    expectArguments(DefaultByeDpiArgs, {"-f", "-1", "-t", "8", "-S", "-R", "1"});
     expectArguments(R"('one two' "three four" five\ six)", {"one two", "three four", "five six"});
     expectArguments(R"(ab"cd ef"'gh')", {"abcd efgh"});
     expectArguments(R"("" '' a""b'')", {"", "", "ab"});
@@ -80,7 +80,7 @@ int main() {
     expectArguments("\"ab\\\ncd\"", {"abcd"});
     expectArguments("'ab\\\ncd'", {"ab\\\ncd"});
     expectArguments("\"\\\n\"", {""});
-    for (const auto input: {"'unterminated", "\"unterminated", "trailing\\", "\"trailing\\", "\"escaped\\\""}) {
+    for (const auto input: {"'unterminated", R"("unterminated)", R"(trailing\)", R"("trailing\)", R"("escaped\")"}) {
         expectRejected(input);
     }
     expectRejected(std::string("--oob-data ") + '\0');
