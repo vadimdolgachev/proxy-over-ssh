@@ -3,6 +3,7 @@
 import base64
 import hashlib
 from pathlib import Path
+import re
 import socket
 import struct
 import subprocess
@@ -51,10 +52,11 @@ class Server(paramiko.ServerInterface):
 
 
 class SshFixture:
-    def __init__(self, host_key, client_key, disconnect_message=None):
+    def __init__(self, host_key, client_key, disconnect_message=None, response_delay=0):
         self.host_key = host_key
         self.client_key = client_key
         self.disconnect_message = disconnect_message
+        self.response_delay = response_delay
         self.authentications = []
         self.stopping = threading.Event()
         self.transports = []
@@ -100,6 +102,8 @@ class SshFixture:
                 channel.settimeout(5)
                 try:
                     payload = receive(channel, len(PAYLOAD))
+                    if self.response_delay:
+                        time.sleep(self.response_delay)
                     channel.sendall(payload)
                     channel.shutdown_write()
                     # Let the client consume EOF and close the channel normally.
@@ -120,6 +124,28 @@ class SshFixture:
         self.thread.join(2)
         for worker in self.workers:
             worker.join(2)
+
+
+def assert_setup_timer_cancelled(process):
+    if not Path(f"/proc/{process.pid}/fdinfo").is_dir():
+        return  # The FD inspection is Linux-specific.
+    deadline = time.monotonic() + 2
+    while True:
+        assert process.poll() is None, "Proxy stopped while cancelling setup timer"
+        pending_setup = False
+        for entry in Path(f"/proc/{process.pid}/fdinfo").iterdir():
+            try:
+                info = entry.read_text()
+            except FileNotFoundError:
+                continue
+            match = re.search(r"it_value:\s*\((\d+),", info)
+            # The idle deadline is 300s; the statistics timer is at most 1s.
+            if match and 2 <= int(match.group(1)) <= 30:
+                pending_setup = True
+        if not pending_setup:
+            return
+        assert time.monotonic() < deadline, "Setup timer remains armed after successful CONNECT"
+        time.sleep(0.01)
 
 
 def run_proxy(binary, fixture, key_path, fingerprint, options, workdir, reject=False, expected_diagnostic=None):
@@ -146,9 +172,9 @@ def run_proxy(binary, fixture, key_path, fingerprint, options, workdir, reject=F
                     assert time.monotonic() < deadline, "Proxy startup timed out"
                     time.sleep(0.02)
             authenticated_before = len(fixture.authentications)
-            protocols = ("socks",) if reject else ("socks", "http")
+            protocols = ("socks",) if reject or fixture.response_delay else ("socks", "http")
             for protocol in protocols:
-                with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+                with socket.create_connection(("127.0.0.1", port), timeout=5 + fixture.response_delay) as client:
                     if protocol == "socks":
                         client.sendall(b"\x05\x01\x00")
                         assert receive(client, 2) == b"\x05\x00"
@@ -168,8 +194,12 @@ def run_proxy(binary, fixture, key_path, fingerprint, options, workdir, reject=F
                             reply.extend(receive(client, 1))
                             assert len(reply) < 4096
                         assert reply.startswith(b"HTTP/1.1 200"), reply
+                    assert_setup_timer_cancelled(process)
+                    started = time.monotonic()
                     client.sendall(PAYLOAD)
                     assert receive(client, len(PAYLOAD)) == PAYLOAD
+                    if fixture.response_delay:
+                        assert time.monotonic() - started >= fixture.response_delay
             process.terminate()
             assert process.wait(timeout=5) == 0, "Proxy did not stop cleanly"
             log.seek(0)
@@ -216,6 +246,12 @@ def main():
                 print("PASS: SSH server disconnect reason is preserved in diagnostics")
             finally:
                 disconnect_fixture.close()
+            delayed_fixture = SshFixture(host_key, client_key, response_delay=31)
+            try:
+                run_proxy(binary, delayed_fixture, key_path, fingerprint, BYEDPI_ARGS, workdir)
+                print("PASS: forwarding remains functional beyond the cancelled 30s setup deadline")
+            finally:
+                delayed_fixture.close()
     finally:
         fixture.close()
 

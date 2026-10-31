@@ -122,18 +122,18 @@ namespace {
         }
 
         return AppConfig{
-            .ssh = {
-                .username = std::string(*sshUser),
-                .host = std::string(*sshHost),
-                .port = *sshPort,
-                .hostKeySha256 = std::string(*sshHostKeySha256),
-                .privateKeyPath = sshPrivateKeyPathOpt,
-                .privateKeyData = sshPrivateKeyOpt,
-            },
-            .listenPort = *listenPort,
-            .byeDpiArgs = args.contains("--byedpi-args")
-                                  ? std::optional<std::string>(args.at("--byedpi-args"))
-                                  : std::nullopt,
+                .ssh =
+                        {
+                                .username = std::string(*sshUser),
+                                .host = std::string(*sshHost),
+                                .port = *sshPort,
+                                .hostKeySha256 = std::string(*sshHostKeySha256),
+                                .privateKeyPath = sshPrivateKeyPathOpt,
+                                .privateKeyData = sshPrivateKeyOpt,
+                        },
+                .listenPort = *listenPort,
+                .byeDpiArgs = args.contains("--byedpi-args") ? std::optional<std::string>(args.at("--byedpi-args"))
+                                                             : std::nullopt,
         };
     }
 
@@ -152,7 +152,7 @@ int main(const int argc, char **argv) {
     }
     std::signal(SIGTERM, onSignalTerm);
     std::signal(SIGINT, onSignalTerm);
-    std::atomic_bool byeDpiFailed = false;
+    std::atomic_bool runtimeFailed = false;
     try {
         auto appConfig = parseConfig(argc, argv);
         if (!appConfig) {
@@ -160,9 +160,9 @@ int main(const int argc, char **argv) {
             return 1;
         }
         if (appConfig->byeDpiArgs) {
-            appConfig->ssh.byeDpi = std::make_shared<ByeDpiRuntime>(
-                    *appConfig->byeDpiArgs, ByeDpiRuntime::SocketProtector{}, [&](int) {
-                        byeDpiFailed.store(true);
+            appConfig->ssh.byeDpi =
+                    std::make_shared<ByeDpiRuntime>(*appConfig->byeDpiArgs, ByeDpiRuntime::SocketProtector{}, [&](int) {
+                        runtimeFailed.store(true);
                         cancellationTokenSource.requestStop();
                     });
         }
@@ -171,13 +171,14 @@ int main(const int argc, char **argv) {
             return std::make_shared<SshSocket>(sshConfig, sessionPool);
         };
 
-        const ProxyConfig proxyConfig {
-            .backendFactory = factory,
-            .listenPort = appConfig->listenPort,
+        const ProxyConfig proxyConfig{
+                .backendFactory = factory,
+                .listenPort = appConfig->listenPort,
         };
 
         const auto proxy = std::make_unique<SSHProxy>(cancellationTokenSource);
-        proxy->start(proxyConfig, std::nullopt, std::nullopt);
+        proxy->start(proxyConfig, std::nullopt, std::nullopt,
+                     [&](int, const std::string &) { runtimeFailed.store(true); });
         proxy->waitForFinish();
         if (appConfig->ssh.byeDpi) {
             appConfig->ssh.byeDpi->requestStop();
@@ -187,5 +188,5 @@ int main(const int argc, char **argv) {
         return 1;
     }
     log_d("Exit\n");
-    return byeDpiFailed.load() ? 1 : 0;
+    return runtimeFailed.load() ? 1 : 0;
 }

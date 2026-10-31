@@ -9,7 +9,9 @@
 #include <mutex>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -703,7 +705,15 @@ struct ClientSetupGuard final {
     explicit ClientSetupGuard(std::shared_ptr<ClientSetupState> state_) : state(std::move(state_)) {}
 
     ~ClientSetupGuard() {
-        state->finished.store(true);
+        finish();
+    }
+
+    void finish() noexcept {
+        if (state != nullptr) {
+            state->finished.store(true);
+            state->cts.requestStop();
+            state.reset();
+        }
     }
 
     std::shared_ptr<ClientSetupState> state;
@@ -711,7 +721,7 @@ struct ClientSetupGuard final {
 
 [[nodiscard]] CoroTask<> enforceClientSetupTimeout(const std::shared_ptr<ClientSetupState> state) {
     try {
-        co_await TimerAwaiter{Constants::CLIENT_SETUP_TIMEOUT, co_await GetCancellationToken{}};
+        co_await TimerAwaiter{Constants::CLIENT_SETUP_TIMEOUT, state->cts.getToken()};
     } catch (const CancellationTokenException &) {
         co_return;
     }
@@ -723,8 +733,8 @@ struct ClientSetupGuard final {
 [[nodiscard]] CoroTask<> handleClient(const BackendFactory backendFactory,
                                       const std::shared_ptr<ClientContextCoro> client,
                                       const std::shared_ptr<ProxyStats> &proxyStats) {
-    const auto setupState = std::make_shared<ClientSetupState>();
-    const ClientSetupGuard setupGuard(setupState);
+    auto setupState = std::make_shared<ClientSetupState>();
+    ClientSetupGuard setupGuard(setupState);
     auto setupTimeout = enforceClientSetupTimeout(setupState);
     setupTimeout.startDetached(*co_await GetScheduler{});
 
@@ -773,7 +783,8 @@ struct ClientSetupGuard final {
             co_await sendHttpConnectResponse(client, HttpConnect::Status::ConnectionEstablished,
                                              setupState->cts.getToken());
         }
-        setupState->finished.store(true);
+        setupGuard.finish();
+        setupState.reset();
         tunnelEstablished = true;
         co_await forwardData(client, backendSocket, CancellationTokenSource{}, proxyStats);
     } catch (...) {
@@ -809,6 +820,24 @@ CoroTask<> printProxyStats(const std::shared_ptr<const ProxyStats> stats,
     }
 }
 
+void startDetachedOrCancel(CoroTask<> task, EpollScheduler &scheduler) {
+    if (scheduler.getCancellationTokenSource().isStopped()) {
+        throw CancellationTokenException{};
+    }
+    try {
+        task.startDetached(scheduler);
+    } catch (const std::system_error &) {
+        // system_error derives from runtime_error, but must remain a failure even during shutdown.
+        throw;
+    } catch (const std::runtime_error &) {
+        // startDetached reports a racing scheduler shutdown as runtime_error.
+        if (scheduler.getCancellationTokenSource().isStopped()) {
+            throw CancellationTokenException{};
+        }
+        throw;
+    }
+}
+
 [[nodiscard]] CoroTask<> startServer(const ProxyConfig config,
                                      const std::shared_ptr<ProxyStats> proxyStats,
                                      std::atomic_bool &isStopRequested) {
@@ -826,21 +855,18 @@ CoroTask<> printProxyStats(const std::shared_ptr<const ProxyStats> stats,
 
     log_d("Server task started\n");
     auto *const scheduler = co_await GetScheduler{};
-    auto proxyStatsPrinter = printProxyStats(proxyStats, isStopRequested);
-    proxyStatsPrinter.startDetached(*scheduler);
-    while (true) {
-        try {
+    try {
+        auto proxyStatsPrinter = printProxyStats(proxyStats, isStopRequested);
+        startDetachedOrCancel(std::move(proxyStatsPrinter), *scheduler);
+        while (true) {
             auto [socket, endpoint] = co_await serverSocket.listen(scheduler->getCancellationTokenSource().getToken());
             log_d("Server: new connection port: {}\n", endpoint.port());
             auto handler = handleClient(config.backendFactory, std::make_shared<ClientContextCoro>(endpoint, socket), proxyStats);
-            handler.startDetached(*scheduler);
-        } catch (const CancellationTokenException &) {
-            isStopRequested.store(true);
-            log_d("Server task finished\n");
-            break;
-        } catch (const std::exception &) {
-            throw;
+            startDetachedOrCancel(std::move(handler), *scheduler);
         }
+    } catch (const CancellationTokenException &) {
+        isStopRequested.store(true);
+        log_d("Server task finished\n");
     }
 }
 
